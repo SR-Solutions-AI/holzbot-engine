@@ -1,0 +1,12 @@
+{
+  "schema": "v1",
+  "description": "Coeficienți pentru calculul prețului final al electricității",
+  "currency": "EUR",
+  "coefficient_electricity_per_m2": 60.0,
+  "energy_performance_modifiers": {
+    "Standard": 1.0,
+    "KfW 55": 0.9,
+    "KfW 40": 0.8,
+    "KfW 40+": 0.75
+  }
+}

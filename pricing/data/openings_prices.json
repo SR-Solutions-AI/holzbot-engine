@@ -1,0 +1,20 @@
+{
+  "windows_unit_prices_per_m2": {
+    "PVC": 550,
+    "Aluminiu": 700,
+    "Lemn": 450,
+    "Lemn-Aluminiu": 500
+  },
+  "doors_interior_unit_prices_per_m2": {
+    "PVC": 300,
+    "Aluminiu": 400,
+    "Lemn": 450,
+    "Lemn-Aluminiu": 500
+  },
+  "doors_exterior_unit_prices_per_m2": {
+    "PVC": 2700,
+    "Aluminiu": 3300,
+    "Lemn": 3500,
+    "Lemn-Aluminiu": 3800
+  }
+}
