@@ -9,22 +9,22 @@ import argparse
 import time
 from datetime import datetime
 
-from .config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT
-from .config.frontend_loader import load_frontend_data_for_run  # ✅ NOU
-from .segmenter import segment_document, classify_segmented_plans
-from .segmenter.classifier import ClassificationResult
-from .floor_classifier import run_floor_classification, FloorClassificationResult
-from .detections.jobs import run_detections_for_run
-from .scale import run_scale_detection_for_run
-from .count_objects import run_count_objects_for_run
-from .exterior_doors.jobs import run_exterior_doors_for_run
-from .measure_objects.jobs import run_measure_objects_for_run
-from .perimeter.jobs import run_perimeter_for_run
-from .area.jobs import run_area_for_run
-from .roof.jobs import run_roof_for_run
-from .pricing.jobs import run_pricing_for_run, PricingJobResult
-from .offer_builder import build_final_offer
-from .pdf_generator import generate_complete_offer_pdf
+from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT
+from config.frontend_loader import load_frontend_data_for_run  # ✅ NOU
+from segmenter import segment_document, classify_segmented_plans
+from segmenter.classifier import ClassificationResult
+from floor_classifier import run_floor_classification, FloorClassificationResult
+from detections.jobs import run_detections_for_run
+from scale import run_scale_detection_for_run
+from count_objects import run_count_objects_for_run
+from exterior_doors.jobs import run_exterior_doors_for_run
+from measure_objects.jobs import run_measure_objects_for_run
+from perimeter.jobs import run_perimeter_for_run
+from area.jobs import run_area_for_run
+from roof.jobs import run_roof_for_run
+from pricing.jobs import run_pricing_for_run, PricingJobResult
+from offer_builder import build_final_offer
+from pdf_generator import generate_complete_offer_pdf
 
 
 # =========================================================
