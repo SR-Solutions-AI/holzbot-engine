@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import json
 import io
@@ -54,7 +55,15 @@ STATIC_TRANSLATIONS = {
     "Mansarda": "Dachgeschoss",
     "Acoperis": "Dach",
     "Fundație": "Fundament",
+    "Fundament (Sockel)": "Fundament (Sockel)",
     "Placa": "Bodenplatte",
+    
+    # ELEMENTE SCAPATE ANTERIOR (FIX)
+    "Structură Tavan": "Deckenkonstruktion",
+    "Structura Tavan": "Deckenkonstruktion",
+    "Bodenstruktur": "Bodenaufbau",
+    "Deckenstruktur": "Deckenaufbau",
+    "Structura Podea": "Bodenkonstruktion",
     
     # Elemente Constructive
     "Pereti": "Wände",
@@ -92,6 +101,10 @@ STATIC_TRANSLATIONS = {
     "Fereastra": "Fenster",
     "Usa": "Tür",
     "Usa intrare": "Haustür",
+    "Dublu": "Zweiflügelig",
+    "Simplu": "Einflügelig",
+    "Double": "Zweiflügelig",
+    "Single": "Einflügelig",
     
     # Diverse
     "Total": "Gesamt",
@@ -158,7 +171,7 @@ class GermanEnforcer:
             prompt = (
                 "You are a professional technical translator for the German construction industry (Bauwesen). "
                 "Translate the following JSON list of terms from Romanian or English to German. "
-                "Keep technical precision (e.g. 'Parter' -> 'Erdgeschoss', 'Bucata' -> 'Stk.', 'Manopera' -> 'Montage/Arbeitsleistung'). "
+                "Keep technical precision (e.g. 'Parter' -> 'Erdgeschoss', 'Bucata' -> 'Stk.', 'Manopera' -> 'Montage/Arbeitsleistung', 'Structura Tavan' -> 'Deckenkonstruktion'). "
                 "Output ONLY a valid JSON object where keys are the input text and values are the German translation."
             )
 
@@ -429,33 +442,92 @@ def _table_global_openings(story, styles, all_openings: list):
     if not all_openings: return
     story.append(PageBreak())
     story.append(Paragraph("Zusammenfassung Fenster & Türen", styles["H1"]))
-    agg = {"windows": {"n": 0, "eur": 0.0}, "doors_int": {"n": 0, "eur": 0.0}, "doors_ext": {"n": 0, "eur": 0.0}}
     
-    # Keyword-urile sunt acum în germană sau engleză
-    keywords_window = ["fenster", "window", "glass"]
-    keywords_door = ["tür", "door"]
-    keywords_ext = ["aussen", "exterior", "entrance", "haustür"]
+    # Grouping logic for detailed rows
+    # Key: Label (e.g. "Fenster (Zweiflügelig)"), Value: {count, cost}
+    groups = {}
+    
+    # Keywords in GERMAN (since translation runs before this)
+    kw_window = ["fenster", "window", "glass", "fereastra"]
+    kw_door = ["tür", "door", "usa", "ușă"]
+    
+    kw_ext = ["aussen", "außen", "exterior", "entrance", "haustür", "main"]
+    # kw_int -> default if not ext
+    
+    kw_double = ["doppel", "double", "dublu", "zwei", "2-"]
+    # kw_single -> default if not double
     
     for it in all_openings:
-        full_text = (str(it.get("name", "")) + " " + str(it.get("type", "")) + " " + str(it.get("category", "")) + " " + str(it.get("location", ""))).lower()
+        # Combine all potentially relevant text fields
+        full_text = (
+            str(it.get("name", "")) + " " + 
+            str(it.get("type", "")) + " " + 
+            str(it.get("category", "")) + " " + 
+            str(it.get("location", "")) + " " +
+            str(it.get("details", ""))
+        ).lower()
+        
         cost = float(it.get("total_cost", 0))
-        if any(k in full_text for k in keywords_window):
-            agg["windows"]["n"] += 1; agg["windows"]["eur"] += cost
-        elif any(k in full_text for k in keywords_door):
-            if any(k in full_text for k in keywords_ext): agg["doors_ext"]["n"] += 1; agg["doors_ext"]["eur"] += cost
-            else: agg["doors_int"]["n"] += 1; agg["doors_int"]["eur"] += cost
+        
+        # 1. Detect Category
+        is_window = any(x in full_text for x in kw_window)
+        is_door = any(x in full_text for x in kw_door)
+        
+        if not (is_window or is_door):
+            continue # Skip non-openings
+            
+        # 2. Detect Location
+        is_ext = any(x in full_text for x in kw_ext)
+        loc_str = "Außen" if is_ext else "Innen"
+        
+        # 3. Detect Type (Single vs Double)
+        is_double = any(x in full_text for x in kw_double)
+        type_str = "Zweiflügelig" if is_double else "Einflügelig"
+        
+        # Construct Label
+        if is_window:
+            # Windows are typically just "Fenster" (exterior implied), differentiate by type
+            label = f"Fensterelement ({type_str})"
+        else:
+            # Doors need location AND type
+            label = f"{loc_str}tür ({type_str})"
+            
+        # Aggregate
+        if label not in groups:
+            groups[label] = {"n": 0, "eur": 0.0}
+        groups[label]["n"] += 1
+        groups[label]["eur"] += cost
 
     def avg(total, n): return total / n if n > 0 else 0.0
+    
     head = [P("Kategorie", "CellBold"), P("Stückzahl", "CellBold"), P("Ø Preis/Stk.", "CellBold"), P("Gesamt", "CellBold")]
     data = []
-    if agg["windows"]["n"]: data.append([P("Fensterelemente"), P(str(agg["windows"]["n"])), P(_money(avg(agg["windows"]["eur"], agg["windows"]["n"]))), P(_money(agg["windows"]["eur"]))])
-    if agg["doors_ext"]["n"]: data.append([P("Außentüren / Hauseingang"), P(str(agg["doors_ext"]["n"])), P(_money(avg(agg["doors_ext"]["eur"], agg["doors_ext"]["n"]))), P(_money(agg["doors_ext"]["eur"]))])
-    if agg["doors_int"]["n"]: data.append([P("Innentüren"), P(str(agg["doors_int"]["n"])), P(_money(avg(agg["doors_int"]["eur"], agg["doors_int"]["n"]))), P(_money(agg["doors_int"]["eur"]))])
-    total_eur = sum(x["eur"] for x in agg.values())
+    
+    # Convert groups to table rows, sorted alphabetically
+    total_eur = 0.0
+    for label in sorted(groups.keys()):
+        g = groups[label]
+        count = g["n"]
+        cost = g["eur"]
+        total_eur += cost
+        
+        data.append([
+            P(label),
+            P(str(count)),
+            P(_money(avg(cost, count))),
+            P(_money(cost))
+        ])
+
     if total_eur > 0:
         data.append([P("SUMME ÖFFNUNGEN", "CellBold"), "", "", P(_money(total_eur), "CellBold")])
+        
         tbl = Table([head] + data, colWidths=[68*mm, 26*mm, 34*mm, 40*mm])
-        tbl.setStyle(TableStyle([("GRID", (0,0), (-1,-1), 0.3, colors.black), ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")), ("ALIGN", (1,1), (-1,-1), "RIGHT"), ("VALIGN", (0,0), (-1,-1), "MIDDLE")]))
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+            ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE")
+        ]))
         story.append(tbl)
         story.append(Spacer(1, 8*mm))
 
