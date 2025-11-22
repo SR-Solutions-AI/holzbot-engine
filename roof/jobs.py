@@ -52,18 +52,14 @@ def _run_for_single_plan(
     job_root: Path,
 ) -> RoofJobResult:
     """
-    Calculează prețul acoperișului pentru un singur plan.
-    
-    IMPORTANT: 
-    - Doar planurile TOP FLOOR au acoperiș calculat
-    - Ground floor (dacă e singurul etaj) -> are acoperiș
-    - Ground floor (dacă există etaje) -> nu are acoperiș
+    Calculează prețul acoperișului.
+    FORCE UPDATE: Dacă total_floors == 1, se calculează OBLIGATORIU acoperișul.
     """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
     # ==========================================
-    # STEP 1: Verifică dacă e TOP FLOOR
+    # STEP 1: Determinare Tip Etaj (Blindată)
     # ==========================================
     
     original_name = plan.plan_image.stem
@@ -72,20 +68,23 @@ def _run_for_single_plan(
     is_top_floor = False
     floor_type = "unknown"
     
+    # 1. Citire Metadata (doar informativ inițial)
     if metadata:
         floor_class = metadata.get("floor_classification", {})
         floor_type = floor_class.get("floor_type", "unknown").lower()
         
-        # 1. Verifică cuvinte cheie explicite
+        # Detectare standard
         is_top_floor = any(keyword in floor_type for keyword in ["top", "roof", "attic", "mansarda"])
-        
-        # 2. ✅ MODIFICARE: Dacă e singurul etaj (casă parter), atunci e și ultimul etaj
-        if not is_top_floor and total_floors == 1:
-            if "ground" in floor_type or "parter" in floor_type or "unknown" in floor_type:
-                is_top_floor = True
-                print(f"       ℹ️  Single story house detected ({total_floors} floor). Calculating roof for {floor_type}.")
 
-    # Dacă nu e top floor → skip calculation
+    # 2. 🔥 REGULA DE AUR (FORCE SINGLE PLAN) 🔥
+    # Această verificare este scoasă în afara oricărui if anterior.
+    # Dacă e singurul plan din run, are acoperiș. Punct.
+    if total_floors == 1:
+        if not is_top_floor:
+            print(f"       🔥🔥 FORCE ROOF: Single plan detected (Type was '{floor_type}'). Forcing is_top_floor=True.")
+        is_top_floor = True
+
+    # Dacă TOT nu e top floor (caz multi-etaj unde e parter/inter), ieșim
     if not is_top_floor:
         result = {
             "plan_id": plan.plan_id,
@@ -93,7 +92,7 @@ def _run_for_single_plan(
             "is_top_floor": False,
             "roof_area_sqm": 0.0,
             "roof_final_total_eur": 0.0,
-            "note": "Not top floor - no roof calculated"
+            "note": f"Not top floor ({floor_type}) & total_floors={total_floors} -> no roof"
         }
         
         output_file = work_dir / "roof_estimation.json"
@@ -109,7 +108,7 @@ def _run_for_single_plan(
         )
     
     # ==========================================
-    # STEP 2: Încarcă date pentru TOP FLOOR
+    # STEP 2: Încarcă date pentru CALCUL
     # ==========================================
     
     # INPUT FILES
@@ -129,7 +128,7 @@ def _run_for_single_plan(
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → calculate roof price (TOP FLOOR/SINGLE FLOOR)",
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → calculate roof price...",
             flush=True
         )
         
@@ -138,37 +137,37 @@ def _run_for_single_plan(
         
         surfaces = area_data.get("surfaces", {})
         
-        # Aria acoperișului (calculată în area.py pentru top floor)
+        # Aria acoperișului
         roof_area_m2 = surfaces.get("roof_m2") 
-        
-        # Aria tavanului (pentru izolație)
         ceiling_area_m2 = surfaces.get("ceiling_m2")
         
-        # Fallback: dacă roof_area e None dar avem ceiling
-        # (Acest caz e comun la 'ground_floor' forced as 'top', unde area.py poate nu a calculat roof_m2)
-        if (roof_area_m2 is None or roof_area_m2 <= 0) and ceiling_area_m2:
-            roof_area_m2 = ceiling_area_m2 * 1.3  # Factor pentru pantă estimat
-            print(f"       ⚠️  roof_m2 lipsește (probabil parter forced) → estimez din ceiling: {roof_area_m2:.2f} m²")
-        
-        if roof_area_m2 is None or roof_area_m2 <= 0:
-            # Ultima încercare: folosim floor_gross_m2 dacă există
-            gross = surfaces.get("floor_gross_m2")
-            if gross and gross > 0:
-                 roof_area_m2 = gross * 1.35 # Factor pantă + streașină
-                 print(f"       ⚠️  roof_m2 & ceiling lipsă → estimez din gross area: {roof_area_m2:.2f} m²")
+        # Fallback logică agresivă pentru Single Plan / Unknown
+        if (roof_area_m2 is None or roof_area_m2 <= 0):
+            # Încercăm ceiling
+            if ceiling_area_m2 and ceiling_area_m2 > 0:
+                 roof_area_m2 = ceiling_area_m2 * 1.35 # Adăugăm pantă + streașină estimată
+                 print(f"       ⚠️  roof_m2 lipsă. Estimat din ceiling ({ceiling_area_m2}) * 1.35 = {roof_area_m2:.2f}")
             else:
-                return RoofJobResult(
-                    plan_id=plan.plan_id,
-                    work_dir=work_dir,
-                    success=False,
-                    message="roof_m2 = 0 sau None (verifică area calculation)"
-                )
+                # Încercăm gross area
+                gross = surfaces.get("floor_gross_m2") or area_data.get("house_area_m2")
+                if gross and gross > 0:
+                    roof_area_m2 = gross * 1.35
+                    ceiling_area_m2 = gross # Aproximare pentru tavan
+                    print(f"       ⚠️  roof_m2 & ceiling lipsă. Estimat din gross ({gross}) = {roof_area_m2:.2f}")
+
+        if roof_area_m2 is None or roof_area_m2 <= 0:
+             return RoofJobResult(
+                plan_id=plan.plan_id,
+                work_dir=work_dir,
+                success=False,
+                message="Eroare critică: Aria (roof_m2) este 0 chiar și după fallback."
+            )
         
-        # Fallback pentru ceiling
-        if ceiling_area_m2 is None or ceiling_area_m2 <= 0:
-            ceiling_area_m2 = roof_area_m2 / 1.3
-        
-        # Perimetrul (pentru calculul streașinii)
+        # Fallback final pentru ceiling (necesar la izolație)
+        if ceiling_area_m2 is None:
+            ceiling_area_m2 = roof_area_m2 / 1.35
+
+        # Perimetrul
         perimeter_m = None
         if perimeter_json.exists():
             with open(perimeter_json, "r", encoding="utf-8") as f:
@@ -202,7 +201,7 @@ def _run_for_single_plan(
         
         result["plan_id"] = plan.plan_id
         result["floor_type"] = floor_type
-        result["is_top_floor"] = True
+        result["is_top_floor"] = True # Confirmăm în output
         
         # ==========================================
         # STEP 5: Salvează rezultatul
@@ -232,7 +231,6 @@ def _run_for_single_plan(
             success=False,
             message=f"Eroare: {e}"
         )
-
 
 def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJobResult]:
     """

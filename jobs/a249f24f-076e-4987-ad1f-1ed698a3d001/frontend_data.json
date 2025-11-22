@@ -1,0 +1,36 @@
+{
+  "referinta": "eferger",
+  "client": {
+    "nume": "ty4y45",
+    "telefon": "0787340457",
+    "email": "paul.bradeanu@gmail.com",
+    "localitate": "Cojocnei 8"
+  },
+  "sistemConstructiv": {
+    "tipSistem": "Massivholz",
+    "gradPrefabricare": "Montaj pe șantier",
+    "tipFundatie": "Piloți",
+    "tipAcoperis": "Flachdach",
+    "materialPereti": ""
+  },
+  "materialeFinisaj": {
+    "nivelOferta": "Casă completă",
+    "finisajInterior": "Fibrociment",
+    "fatada": "Mix",
+    "tamplarie": "Aluminiu",
+    "materialAcoperis": "Tablă",
+    "tipTermoizolatie": "",
+    "grosimeTermoizolatie": 0,
+    "invelitoare": ""
+  },
+  "performanta": {
+    "nivelEnergetic": "KfW 40",
+    "incalzire": "Pompa de căldură",
+    "ventilatie": false
+  },
+  "logistica": {
+    "accesSantier": "Dificil",
+    "teren": "Pantă ușoară",
+    "utilitati": false
+  }
+}

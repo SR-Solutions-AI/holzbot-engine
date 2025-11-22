@@ -1,0 +1,52 @@
+{
+  "building_info": {
+    "total_plans": 2,
+    "floors_detected": 2,
+    "is_single_story": false,
+    "building_type": "residential"
+  },
+  "classifications": [
+    {
+      "plan_id": "cluster_5",
+      "floor_type": "ground_floor",
+      "confidence": "high",
+      "reasoning": "The plan is labeled 'Erdgeschoss', indicating it is the ground floor. It has a garage, multiple exterior doors, and a larger area with living and dining spaces.",
+      "indicators_found": [
+        "Text label: Erdgeschoss",
+        "Garage present",
+        "Multiple exterior doors",
+        "Larger area with living/dining spaces"
+      ],
+      "estimated_area_m2": 150.0,
+      "door_count_exterior": 3,
+      "stair_direction": "up"
+    },
+    {
+      "plan_id": "cluster_6",
+      "floor_type": "top_floor",
+      "confidence": "high",
+      "reasoning": "The plan is labeled 'Obergeschoss', indicating it is the top floor. It has fewer rooms, a balcony, and no garage.",
+      "indicators_found": [
+        "Text label: Obergeschoss",
+        "Balcony present",
+        "Fewer rooms",
+        "No garage"
+      ],
+      "estimated_area_m2": 120.0,
+      "door_count_exterior": 1,
+      "stair_direction": "down"
+    }
+  ],
+  "validation": {
+    "has_ground_floor": true,
+    "has_top_floor": true,
+    "ground_floor_plan_id": "cluster_5",
+    "top_floor_plan_id": "cluster_6",
+    "warnings": []
+  },
+  "metadata_files": [
+    "/Users/paulb/Documents/holzbot/engine/jobs/a249f24f-076e-4987-ad1f-1ed698a3d001/plan_metadata/cluster_5.json",
+    "/Users/paulb/Documents/holzbot/engine/jobs/a249f24f-076e-4987-ad1f-1ed698a3d001/plan_metadata/cluster_6.json"
+  ],
+  "generated_at": "2025-11-22T13:12:06.761922Z"
+}

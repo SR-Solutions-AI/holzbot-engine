@@ -1,0 +1,35 @@
+{
+  "building_info": {
+    "total_plans": 1,
+    "floors_detected": 1,
+    "is_single_story": true,
+    "building_type": "residential"
+  },
+  "classifications": [
+    {
+      "plan_id": "cluster_1",
+      "floor_type": "ground_floor",
+      "confidence": "high",
+      "reasoning": "Only one plan provided, default classification as ground floor. Presence of staircase indicates it could be a multi-story building.",
+      "indicators_found": [
+        "staircase present",
+        "multiple rooms",
+        "no exterior doors visible"
+      ],
+      "estimated_area_m2": 80.0,
+      "door_count_exterior": 0,
+      "stair_direction": "up"
+    }
+  ],
+  "validation": {
+    "has_ground_floor": true,
+    "has_top_floor": false,
+    "ground_floor_plan_id": "cluster_1",
+    "top_floor_plan_id": null,
+    "warnings": []
+  },
+  "metadata_files": [
+    "/Users/paulb/Documents/holzbot/engine/jobs/54e8ae94-2ed0-424f-8614-b006e7b94882/plan_metadata/cluster_1.json"
+  ],
+  "generated_at": "2025-11-22T13:04:02.919464Z"
+}

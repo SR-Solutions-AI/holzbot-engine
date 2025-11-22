@@ -1,0 +1,25 @@
+{
+  "plan_id": "cluster_5",
+  "plan_image": "/Users/paulb/Documents/holzbot/engine/jobs/a249f24f-076e-4987-ad1f-1ed698a3d001/segmentation/classified/blueprints/cluster_5.jpg",
+  "label": "house_blueprint",
+  "floor_classification": {
+    "floor_type": "ground_floor",
+    "confidence": "high",
+    "reasoning": "The plan is labeled 'Erdgeschoss', indicating it is the ground floor. It has a garage, multiple exterior doors, and a larger area with living and dining spaces.",
+    "indicators_found": [
+      "Text label: Erdgeschoss",
+      "Garage present",
+      "Multiple exterior doors",
+      "Larger area with living/dining spaces"
+    ],
+    "estimated_area_m2": 150.0,
+    "door_count_exterior": 3,
+    "stair_direction": "up",
+    "classified_at": "2025-11-22T13:12:06.760559Z"
+  },
+  "scale": null,
+  "detections": null,
+  "measurements": null,
+  "area": null,
+  "pricing": null
+}

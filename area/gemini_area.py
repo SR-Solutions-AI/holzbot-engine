@@ -1,4 +1,3 @@
-# new/runner/area/gemini_area.py
 from __future__ import annotations
 
 import os
@@ -48,27 +47,34 @@ def estimate_house_area_with_gemini(
     with open(image_path, "rb") as f:
         plan_bytes = f.read()
 
-    # 4. Prompt
+    # 4. Prompt Modificat cu Logica Strictă 30%
     prompt = f"""
 Imaginea atașată este un plan arhitectural de casă.
 Scopul tău este să estimezi **suprafața totală a casei în metri pătrați** (Amprenta construită desfășurată pentru acest nivel).
 
-Fă asta în două moduri independente:
+Te rog să efectuezi calculele în pași, apoi să aplici regula de decizie de la final.
 
-1️⃣ **Metoda bazată pe scară (geometrică)**:
+1️⃣ **Metoda 1: Bazată pe scară (Geometrică)**:
    - Folosește valoarea scării: **{meters_per_pixel:.6f} m/pixel**.
-   - Estimează dimensiunile exterioare ale clădirii și calculează aria totală (inclusiv camere, pereți, fără curte).
-   - Aceasta este aria brută (Gross Floor Area).
+   - Identifică conturul exterior al pereților (fără terase neacoperite/curte).
+   - Calculează aria brută (Gross Floor Area).
 
-2️⃣ **Metoda bazată pe etichete și legende (semantică)**:
-   - Caută texte cu valori de suprafețe: m², „Gesamtfläche”, „Wohnfläche”, „Essen/Wohnen”, etc.
-   - Adună toate valorile numerice care par a fi suprafețe de camere.
-   - Dacă există o valoare totală (Gesamtfläche / Total), folosește-o prioritar.
+2️⃣ **Metoda 2: Bazată pe etichete (Semantică)**:
+   - Caută texte cu valori de suprafețe (ex: "15.4 m²", "Wohnfläche", "Gesamt").
+   - Adună toate valorile camerelor.
+   - Dacă există un text explicit "Total" sau "Gesamtfläche", folosește-l ca valoare principală pentru această metodă.
 
-3️⃣ **Analiză comparativă și selecție inteligentă**:
-   - Dacă cele două metode diferă cu peste 25%, **NU face media**.
-   - În schimb, alege metoda mai plauzibilă și explică motivul în "verification_notes".
-   - Dacă diferența este rezonabilă (<25%), poți face media sau alege valoarea geometrică dacă planul e clar.
+3️⃣ **REGULĂ STRICTĂ DE DECIZIE (Algoritm)**:
+   Compare cele două rezultate:
+   - Dacă `Metoda 2 (Labels)` este 0 sau nu s-au găsit texte -> Alege `Metoda 1`.
+   - Altfel, calculează diferența procentuală dintre ele.
+   
+   **CONDITII:**
+   A. Dacă diferența este **<= 30%** (mai mică sau egală cu 30%):
+      -> `final_area_m2` TREBUIE să fie **MEDIA Aritmetică** dintre Metoda 1 și Metoda 2.
+      
+   B. Dacă diferența este **> 30%** (mai mare de 30%):
+      -> `final_area_m2` TREBUIE să fie valoarea de la **Metoda 2 (Labels)**.
 
 4️⃣ **Rezultat final**:
    - Returnează DOAR JSON, fără text suplimentar, cu această structură:
@@ -78,11 +84,12 @@ Fă asta în două moduri independente:
   "surface_estimation": {{
     "by_scale_m2": <float sau null>,
     "by_labels_m2": <float sau null>,
+    "diff_percentage": <float (ex: 15.5)>,
     "final_area_m2": <float>,
-    "method_used": "<string: 'scale', 'labels', 'average' sau 'hybrid'>"
+    "method_used": "<string: 'average_under_30', 'labels_over_30', 'scale_fallback'>"
   }},
   "confidence": "<string: 'high', 'medium', 'low'>",
-  "verification_notes": "<string>"
+  "verification_notes": "<string: explică scurt decizia luată>"
 }}
 """
 

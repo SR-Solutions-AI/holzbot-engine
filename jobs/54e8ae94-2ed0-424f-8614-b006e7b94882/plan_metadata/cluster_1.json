@@ -1,0 +1,24 @@
+{
+  "plan_id": "cluster_1",
+  "plan_image": "/Users/paulb/Documents/holzbot/engine/jobs/54e8ae94-2ed0-424f-8614-b006e7b94882/segmentation/classified/blueprints/cluster_1.jpg",
+  "label": "house_blueprint",
+  "floor_classification": {
+    "floor_type": "ground_floor",
+    "confidence": "high",
+    "reasoning": "Only one plan provided, default classification as ground floor. Presence of staircase indicates it could be a multi-story building.",
+    "indicators_found": [
+      "staircase present",
+      "multiple rooms",
+      "no exterior doors visible"
+    ],
+    "estimated_area_m2": 80.0,
+    "door_count_exterior": 0,
+    "stair_direction": "up",
+    "classified_at": "2025-11-22T13:04:02.919064Z"
+  },
+  "scale": null,
+  "detections": null,
+  "measurements": null,
+  "area": null,
+  "pricing": null
+}
