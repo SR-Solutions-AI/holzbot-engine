@@ -497,20 +497,45 @@ def _table_global_openings(story, styles, all_openings: list, translator: Techni
         "doors_ext": {"n": 0, "eur": 0.0}
     }
     
+    # Cuvinte cheie pentru detectare (EN, RO, DE)
+    keywords_window = ["window", "fereast", "fenster", "glass"]
+    keywords_door   = ["door", "uș", "us", "tür"] # 'us' fara diacritice pentru siguranta
+    keywords_ext    = ["exterior", "entrance", "outside", "intrare", "main", "aussen", "haustür", "principal"]
+
     for it in all_openings:
-        t = str(it.get("type", "")).lower()
+        # Concatenăm toate câmpurile relevante pentru a căuta cuvintele cheie
+        # Uneori informația e in 'name', alteori in 'type' sau 'category'
+        full_text = (
+            str(it.get("name", "")) + " " + 
+            str(it.get("type", "")) + " " + 
+            str(it.get("category", "")) + " " + 
+            str(it.get("location", "")) + " " +
+            str(it.get("details", ""))
+        ).lower()
+        
         cost = float(it.get("total_cost", 0))
         
-        if "window" in t:
+        # 1. Detectare Fereastră
+        if any(k in full_text for k in keywords_window):
             agg["windows"]["n"] += 1
             agg["windows"]["eur"] += cost
-        elif "door" in t:
-            if "exterior" in t or "entrance" in t or "outside" in str(it.get("location", "")).lower():
+            
+        # 2. Detectare Ușă
+        elif any(k in full_text for k in keywords_door):
+            # Verificăm dacă e exterioară
+            if any(k in full_text for k in keywords_ext):
                 agg["doors_ext"]["n"] += 1
                 agg["doors_ext"]["eur"] += cost
             else:
                 agg["doors_int"]["n"] += 1
                 agg["doors_int"]["eur"] += cost
+        
+        # 3. Fallback (dacă nu e nici ușă nici fereastră clară, dar e în listă)
+        else:
+            # O punem la ferestre sau uși generic, sau o ignorăm. 
+            # De obicei e sigur să presupunem fereastră dacă e generic "opening", 
+            # dar mai bine o lăsăm așa.
+            pass
 
     def avg(total, n): return total / n if n > 0 else 0.0
 
@@ -518,25 +543,46 @@ def _table_global_openings(story, styles, all_openings: list, translator: Techni
     head = [P("Kategorie", "CellBold"), P("Stückzahl", "CellBold"), P("Ø Preis/Stk.", "CellBold"), P("Gesamt", "CellBold")]
     data = []
     
+    # Construire rânduri tabel
     if agg["windows"]["n"] > 0:
-        data.append([P("Fensterelemente"), P(str(agg["windows"]["n"])), P(_money(avg(agg["windows"]["eur"], agg["windows"]["n"]))), P(_money(agg["windows"]["eur"]))])
+        data.append([
+            P("Fensterelemente"), 
+            P(str(agg["windows"]["n"])), 
+            P(_money(avg(agg["windows"]["eur"], agg["windows"]["n"]))), 
+            P(_money(agg["windows"]["eur"]))
+        ])
+        
     if agg["doors_ext"]["n"] > 0:
-        data.append([P("Außentüren / Hauseingang"), P(str(agg["doors_ext"]["n"])), P(_money(avg(agg["doors_ext"]["eur"], agg["doors_ext"]["n"]))), P(_money(agg["doors_ext"]["eur"]))])
+        data.append([
+            P("Außentüren / Hauseingang"), 
+            P(str(agg["doors_ext"]["n"])), 
+            P(_money(avg(agg["doors_ext"]["eur"], agg["doors_ext"]["n"]))), 
+            P(_money(agg["doors_ext"]["eur"]))
+        ])
+        
     if agg["doors_int"]["n"] > 0:
-        data.append([P("Innentüren"), P(str(agg["doors_int"]["n"])), P(_money(avg(agg["doors_int"]["eur"], agg["doors_int"]["n"]))), P(_money(agg["doors_int"]["eur"]))])
+        data.append([
+            P("Innentüren"), 
+            P(str(agg["doors_int"]["n"])), 
+            P(_money(avg(agg["doors_int"]["eur"], agg["doors_int"]["n"]))), 
+            P(_money(agg["doors_int"]["eur"]))
+        ])
     
     total_eur = agg["doors_int"]["eur"] + agg["doors_ext"]["eur"] + agg["windows"]["eur"]
-    data.append([P("SUMME ÖFFNUNGEN", "CellBold"), "", "", P(_money(total_eur), "CellBold")])
+    
+    if total_eur > 0:
+        data.append([P("SUMME ÖFFNUNGEN", "CellBold"), "", "", P(_money(total_eur), "CellBold")])
 
-    tbl = Table([head] + data, colWidths=[68*mm, 26*mm, 34*mm, 40*mm])
-    tbl.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.3, colors.black),
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-    ]))
-    story.append(tbl)
-    story.append(Spacer(1, 8*mm))
+        tbl = Table([head] + data, colWidths=[68*mm, 26*mm, 34*mm, 40*mm])
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+            ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 8*mm))
+        
     return total_eur
 
 def _table_global_utilities(story, styles, all_utilities: list, translator: TechnicalTranslator):
