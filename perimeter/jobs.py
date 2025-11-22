@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from ..config.settings import (
+from config.settings import (
     load_plan_infos,
     PlansListError,
     PlanInfo,

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import sys
+import os
+
+# --- FIX: Adăugăm directorul curent în sys.path pentru a permite importuri absolute ---
+# Acest lucru rezolvă problema când scriptul este rulat din NestJS sau din alt folder.
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
 from dataclasses import dataclass
 from pathlib import Path
 import json
 import shutil
-import os
 import argparse
 import time
 from datetime import datetime

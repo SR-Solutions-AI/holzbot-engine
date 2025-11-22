@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from ..config.settings import (
+from config.settings import (
     load_plan_infos,
     PlansListError,
     PlanInfo,
 )
-from ..config.frontend_loader import load_frontend_data_for_run
+from config.frontend_loader import load_frontend_data_for_run
 
 from .calculator import calculate_roof_price
 
@@ -254,7 +254,7 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
     total = len(plans)
     
     # Locația job_root pentru metadata
-    from ..config.settings import JOBS_ROOT
+    from config.settings import JOBS_ROOT
     job_root = None
     for jdir in JOBS_ROOT.glob("*"):
         if jdir.is_dir() and run_id in jdir.name:

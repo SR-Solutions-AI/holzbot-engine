@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from ..config.settings import load_plan_infos, PlansListError, PlanInfo
+from config.settings import load_plan_infos, PlansListError, PlanInfo
 from .calculator import calculate_pricing_for_plan
 
 STAGE_NAME = "pricing"

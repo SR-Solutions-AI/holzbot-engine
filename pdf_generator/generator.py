@@ -24,8 +24,8 @@ from reportlab.pdfgen.canvas import Canvas
 
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 
-from ..config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT
-from ..config.frontend_loader import load_frontend_data_for_run
+from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT
+from config.frontend_loader import load_frontend_data_for_run
 
 # ---------- AI TRANSLATION SERVICE ----------
 class TechnicalTranslator:

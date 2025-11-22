@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict
 
-from ..config.settings import (
+from config.settings import (
     load_plan_infos,
     PlansListError,
     PlanInfo,
