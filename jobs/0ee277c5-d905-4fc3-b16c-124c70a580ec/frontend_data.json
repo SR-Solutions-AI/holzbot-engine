@@ -1,0 +1,36 @@
+{
+  "referinta": "gergre",
+  "client": {
+    "nume": "greer",
+    "telefon": "0787340457",
+    "email": "paul.bradeanu@gmail.com",
+    "localitate": "Cojocnei 8"
+  },
+  "sistemConstructiv": {
+    "tipSistem": "Holzrahmen",
+    "gradPrefabricare": "Montaj pe șantier",
+    "tipFundatie": "Soclu",
+    "tipAcoperis": "Fußwalmdach",
+    "materialPereti": ""
+  },
+  "materialeFinisaj": {
+    "nivelOferta": "Casă completă",
+    "finisajInterior": "Lemn",
+    "fatada": "Fibrociment",
+    "tamplarie": "PVC",
+    "materialAcoperis": "Membrană",
+    "tipTermoizolatie": "",
+    "grosimeTermoizolatie": 0,
+    "invelitoare": ""
+  },
+  "performanta": {
+    "nivelEnergetic": "KfW 40+",
+    "incalzire": "Electric",
+    "ventilatie": false
+  },
+  "logistica": {
+    "accesSantier": "Dificil",
+    "teren": "Pantă mare",
+    "utilitati": false
+  }
+}

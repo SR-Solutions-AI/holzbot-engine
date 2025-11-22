@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Dict
 
 from .config import (
@@ -24,8 +23,8 @@ def calculate_areas_for_plan(
     is_single_plan: bool
 ) -> dict:
     """
-    Calculează toate ariile pentru UN singur plan, cu logică dependentă de etaj.
-    Scade amprenta pereților din suprafața utilă (podea/tavan).
+    Calculează toate ariile pentru UN singur plan.
+    Include logică specială pentru Single Plan (are și fundație și acoperiș).
     """
     
     # ==========================================
@@ -44,7 +43,6 @@ def calculate_areas_for_plan(
     # ==========================================
     # CALCUL AMPRENTĂ PEREȚI (Orizontal - Footprint)
     # ==========================================
-    # Aria ocupată fizic de pereți pe placă
     walls_footprint_m2 = (
         (interior_length_m * WALL_THICKNESS_INTERIOR_M) +
         (exterior_length_m * WALL_THICKNESS_EXTERIOR_M)
@@ -85,7 +83,7 @@ def calculate_areas_for_plan(
             if status == "exterior":
                 area_doors_exterior_m2 += area
                 counts["doors_exterior"] += 1
-            else:  # interior sau unknown
+            else:
                 area_doors_interior_m2 += area
                 counts["doors_interior"] += 1
     
@@ -99,26 +97,29 @@ def calculate_areas_for_plan(
     # LOGICA SUPRAFEȚE UTILE (PODEA / TAVAN)
     # ==========================================
     
-    # Aria brută a etajului (fără golul scării)
-    if floor_type == "ground_floor":
+    # Dacă e single plan, e logic "ground_floor", deci raw_floor_area = house_area_m2
+    # Dacă e multi-plan, la etaje se scade scara.
+    if floor_type == "ground_floor" or is_single_plan:
         raw_floor_area = house_area_m2
     else:
-        # La etaje scădem golul scării din aria totală a anvelopei
         raw_floor_area = house_area_m2 - (stairs_area_m2 or 0.0)
         
-    # Scădem amprenta pereților pentru a obține suprafața utilă (parchet, gresie)
-    # Aceasta va fi folosită și pentru IZOLAȚIA acoperișului (suprafața netă a tavanului)
     useful_floor_area = max(0.0, raw_floor_area - walls_footprint_m2)
     
     floor_m2 = useful_floor_area
-    ceiling_m2 = useful_floor_area  # Tavanul util = Podeaua utilă
+    ceiling_m2 = useful_floor_area
     
-    # FUNDAȚIE (doar pentru ground_floor - aria brută la sol)
-    foundation_m2 = house_area_m2 if floor_type == "ground_floor" else 0.0
+    # ==========================================
+    # LOGICA FUNDAȚIE & ACOPERIȘ (CORRECTED)
+    # ==========================================
     
-    # ACOPERIȘ (doar pentru top_floor - amprenta brută a casei)
-    # Modulul Roof va calcula aria extinsă pentru învelitoare
-    roof_m2 = house_area_m2 if floor_type == "top_floor" else 0.0
+    # Are fundație dacă e parter SAU dacă e singurul plan din proiect
+    has_foundation = (floor_type == "ground_floor") or is_single_plan
+    foundation_m2 = house_area_m2 if has_foundation else 0.0
+    
+    # Are acoperiș dacă e ultimul etaj SAU dacă e singurul plan din proiect
+    has_roof = (floor_type == "top_floor") or is_single_plan
+    roof_m2 = house_area_m2 if has_roof else 0.0
     
     # ==========================================
     # STRUCTURĂ REZULTAT
@@ -126,6 +127,7 @@ def calculate_areas_for_plan(
     result = {
         "plan_id": plan_id,
         "floor_type": floor_type,
+        "is_single_plan": is_single_plan,
         "house_area_m2": round(house_area_m2, 2),
         "walls_footprint_m2": round(walls_footprint_m2, 2),
         "stairs_area_m2": round(stairs_area_m2, 2) if stairs_area_m2 else None,
@@ -158,7 +160,8 @@ def calculate_areas_for_plan(
         
         "notes": {
             "floor_calculation": f"Area ({raw_floor_area:.1f}) - Walls Footprint ({walls_footprint_m2:.1f})",
-            "roof": "Calculată doar pentru top_floor" if floor_type == "top_floor" else "Nu se calculează"
+            "foundation": "Include (Single Plan / Ground)" if has_foundation else "N/A",
+            "roof": "Include (Single Plan / Top)" if has_roof else "N/A"
         }
     }
     

@@ -81,7 +81,7 @@ def _run_for_single_plan(
         
         # 2. ✅ MODIFICARE: Dacă e singurul etaj (casă parter), atunci e și ultimul etaj
         if not is_top_floor and total_floors == 1:
-            if "ground" in floor_type or "parter" in floor_type:
+            if "ground" in floor_type or "parter" in floor_type or "unknown" in floor_type:
                 is_top_floor = True
                 print(f"       ℹ️  Single story house detected ({total_floors} floor). Calculating roof for {floor_type}.")
 
