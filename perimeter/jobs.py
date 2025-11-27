@@ -2,96 +2,101 @@
 from __future__ import annotations
 
 import json
-import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from config.settings import (
-    load_plan_infos,
-    PlansListError,
-    PlanInfo,
-)
+# ✅ IMPORT CORECT
+from config.settings import load_plan_infos, PlanInfo, get_output_root_for_run
 
-from .gemini_measure import measure_perimeter_with_gemini
-from .config import (
-    MIN_INTERIOR_WALLS_M,
-    MAX_INTERIOR_WALLS_M,
-    MIN_EXTERIOR_WALLS_M,
-    MAX_EXTERIOR_WALLS_M,
-    MIN_PERIMETER_M,
-    MAX_PERIMETER_M
-)
-
+# ✅ IMPORT NOU: CubiCasa Detector
+from cubicasa_detector.jobs import run_cubicasa_for_plan
 
 STAGE_NAME = "perimeter"
 
 
 @dataclass
 class PerimeterJobResult:
+    """Rezultatul procesării unui plan în etapa de măsurare perimetru."""
     plan_id: str
     work_dir: Path
     success: bool
     message: str
+    exterior_meters: float | None = None
+    interior_meters: float | None = None
 
 
-def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) -> PerimeterJobResult:
+def _run_for_single_plan(
+    run_id: str, 
+    index: int, 
+    total: int, 
+    plan: PlanInfo
+) -> PerimeterJobResult:
     """
-    Măsoară lungimile pereților pentru un singur plan.
+    Rulează măsurarea perimetrului pentru un singur plan folosind CubiCasa.
+    
+    Încearcă mai întâi să refolosească rezultatul de la etapa 'scale' (cache).
+    Dacă nu există, rulează CubiCasa din nou.
     """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
-    # Input files
+    # Verifică dacă avem deja rezultatul CubiCasa de la scale
     scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
-    scale_json = scale_dir / "scale_result.json"
-    
-    # Verificări
-    if not scale_json.exists():
-        return PerimeterJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message=f"Nu găsesc {scale_json.name}"
-        )
+    cubicasa_cache = scale_dir / "cubicasa_result.json"
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → measure walls "
-            f"(cwd={work_dir})",
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → perimeter from CubiCasa",
             flush=True,
         )
         
-        # Load scale data
-        with open(scale_json, "r", encoding="utf-8") as f:
-            scale_data = json.load(f)
+        # Încercăm să refolosim rezultatul de la scale (dacă există)
+        if cubicasa_cache.exists():
+            print(f"       ♻️  Refolosesc rezultatul CubiCasa din cache", flush=True)
+            with open(cubicasa_cache, "r", encoding="utf-8") as f:
+                cubicasa_result = json.load(f)
+        else:
+            # Rulăm CubiCasa din nou
+            print(f"       🔄 Rulare CubiCasa (cache lipsește)", flush=True)
+            cubicasa_result = run_cubicasa_for_plan(
+                plan_image=plan.plan_image,
+                output_dir=work_dir
+            )
+            
+            # Salvăm pentru cache (pentru viitor)
+            cubicasa_cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(cubicasa_cache, "w", encoding="utf-8") as f:
+                json.dump(cubicasa_result, f, indent=2, ensure_ascii=False)
         
-        # Call GPT-4o
-        result = measure_perimeter_with_gemini(plan.plan_image, scale_data)
+        # Extragem măsurătorile
+        measurements = cubicasa_result["measurements"]["metrics"]
         
-        # Validare rezultate
-        avg = result["estimations"]["average_result"]
-        int_m = float(avg["interior_meters"])
-        ext_m = float(avg["exterior_meters"])
-        per_m = float(avg["total_perimeter_meters"])
+        # Adaptăm la formatul așteptat de pipeline
+        result = {
+            "scale_meters_per_pixel": measurements["scale_m_per_px"],
+            "estimations": {
+                "by_cubicasa": {
+                    "interior_meters": measurements["walls_int_m"],
+                    "exterior_meters": measurements["walls_ext_m"],
+                    "total_perimeter_meters": measurements["walls_ext_m"],
+                    "method_notes": "CubiCasa AI + Gemini optimization"
+                },
+                # average_result e folosit de pricing și alte module downstream
+                "average_result": {
+                    "interior_meters": measurements["walls_int_m"],
+                    "exterior_meters": measurements["walls_ext_m"],
+                    "total_perimeter_meters": measurements["walls_ext_m"]
+                }
+            },
+            "confidence": "high",
+            "verification_notes": f"Calculat cu CubiCasa. Indoor area: {measurements['area_indoor_m2']:.2f} m²"
+        }
         
-        warnings = []
-        
-        if not (MIN_INTERIOR_WALLS_M <= int_m <= MAX_INTERIOR_WALLS_M):
-            warnings.append(f"Pereți interiori în afara intervalului: {int_m:.1f}m")
-        
-        if not (MIN_EXTERIOR_WALLS_M <= ext_m <= MAX_EXTERIOR_WALLS_M):
-            warnings.append(f"Pereți exteriori în afara intervalului: {ext_m:.1f}m")
-        
-        if not (MIN_PERIMETER_M <= per_m <= MAX_PERIMETER_M):
-            warnings.append(f"Perimetru în afara intervalului: {per_m:.1f}m")
-        
-        if per_m > ext_m:
-            warnings.append(f"Perimetru ({per_m:.1f}m) > Pereți ext ({ext_m:.1f}m) - INVALID")
-        
-        # Add metadata + warnings
+        # Adaugă metadata
         result["meta"] = {
             "plan_id": plan.plan_id,
             "plan_image": str(plan.plan_image),
@@ -99,103 +104,98 @@ def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) ->
             "stage": STAGE_NAME
         }
         
-        if warnings:
-            result["warnings"] = warnings
-        
-        # Save result
+        # Salvează (ACELAȘI FORMAT ca înainte)
         output_file = work_dir / "walls_measurements_gemini.json"
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         
-        print(f"       📄 Salvat: {output_file.name}")
-        
-        # Summary message
         message = (
-            f"Interior: {int_m:.1f}m, Exterior: {ext_m:.1f}m, Perimetru: {per_m:.1f}m"
+            f"Interior: {measurements['walls_int_m']:.1f}m, "
+            f"Exterior: {measurements['walls_ext_m']:.1f}m"
         )
         
-        if warnings:
-            message += f" | ⚠️  {len(warnings)} warnings"
+        print(
+            f"✅ [{STAGE_NAME}] {plan.plan_id}: {message}",
+            flush=True
+        )
         
         return PerimeterJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
             success=True,
-            message=message
+            message=message,
+            exterior_meters=measurements["walls_ext_m"],
+            interior_meters=measurements["walls_int_m"]
         )
-    
+        
     except Exception as e:
-        import traceback
+        error_msg = f"Eroare CubiCasa pentru {plan.plan_id}: {e}"
+        print(f"❌ [{STAGE_NAME}] {error_msg}", flush=True)
         traceback.print_exc()
+        
         return PerimeterJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
             success=False,
-            message=f"Eroare: {e}"
+            message=error_msg,
+            exterior_meters=None,
+            interior_meters=None
         )
 
 
-def run_perimeter_for_run(run_id: str, max_parallel: int | None = None) -> List[PerimeterJobResult]:
+def run_perimeter_for_run(run_id: str, max_workers: int = 4) -> List[PerimeterJobResult]:
     """
-    Punct de intrare pentru etapa „perimeter" (măsurare lungimi pereți).
+    Rulează măsurarea perimetrului pentru toate planurile din run.
     
-    Output-uri:
-      new/runner/output/<RUN_ID>/perimeter/<plan_id>/walls_measurements_gemini.json
+    Folosește ThreadPoolExecutor pentru paralelizare.
     """
-    try:
-        plans: List[PlanInfo] = load_plan_infos(run_id, stage_name=STAGE_NAME)
-    except PlansListError as e:
-        print(f"❌ [{STAGE_NAME}] {e}")
+    print(f"\n{'='*60}")
+    print(f"[{STAGE_NAME}] Starting perimeter measurement for run: {run_id}")
+    print(f"{'='*60}\n")
+    
+    plans = load_plan_infos(run_id, STAGE_NAME)
+    
+    if not plans:
+        print(f"⚠️ [{STAGE_NAME}] No plans found for run {run_id}")
         return []
     
-    total = len(plans)
-    print(f"\n📌 [{STAGE_NAME}] {total} planuri găsite pentru RUN_ID={run_id}\n", flush=True)
-    
-    if max_parallel is None:
-        cpu_count = os.cpu_count() or 4
-        # Perimeter = API calls, limităm concurrent-ul
-        max_parallel = min(4, total)
-    
-    print(f"⚙️  [{STAGE_NAME}] rulez cu max_parallel = {max_parallel}\n", flush=True)
-    
     results: List[PerimeterJobResult] = []
+    total = len(plans)
     
-    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(
-                _run_for_single_plan,
-                run_id,
-                idx,
-                total,
-                plan,
-            ): plan
+            executor.submit(_run_for_single_plan, run_id, idx, total, plan): plan
             for idx, plan in enumerate(plans, start=1)
         }
         
-        for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            status = "✅" if res.success else "❌"
-            print(
-                f"{status} [{STAGE_NAME}] {res.plan_id} → {res.message[:250]}",
-                flush=True,
-            )
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                plan = futures[future]
+                print(f"❌ [{STAGE_NAME}] Unexpected error for {plan.plan_id}: {e}")
+                traceback.print_exc()
+                results.append(
+                    PerimeterJobResult(
+                        plan_id=plan.plan_id,
+                        work_dir=plan.stage_work_dir,
+                        success=False,
+                        message=f"Unexpected error: {e}",
+                        exterior_meters=None,
+                        interior_meters=None
+                    )
+                )
     
-    failed = [r for r in results if not r.success]
-    if failed:
-        print(f"\n⚠️ [{STAGE_NAME}] unele planuri au eșuat:")
-        for r in failed:
-            print(f"   - {r.plan_id}: {r.message[:300]}")
-    else:
-        print(f"\n✅ [{STAGE_NAME}] toate planurile au trecut etapa perimeter.")
+    # Summary
+    successful = sum(1 for r in results if r.success)
+    failed = total - successful
     
-    # Afișare rezumat
-    print(f"\n{'─'*70}")
-    print("📏 LUNGIMI PEREȚI MĂSURATE:")
-    print(f"{'─'*70}")
-    for r in results:
-        if r.success:
-            print(f"  {r.plan_id}: {r.message}")
-    print(f"{'─'*70}\n")
+    print(f"\n{'='*60}")
+    print(f"[{STAGE_NAME}] Perimeter Measurement Complete")
+    print(f"  ✅ Success: {successful}/{total}")
+    if failed > 0:
+        print(f"  ❌ Failed: {failed}/{total}")
+    print(f"{'='*60}\n")
     
     return results

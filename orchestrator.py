@@ -93,14 +93,9 @@ class PipelineTimer:
 
 pipeline_timer = PipelineTimer()
 
-
-@dataclass
-class PlanInfo:
-    job_root: Path
-    image_path: Path
-
 @dataclass
 class ClassifiedPlanInfo:
+    """Plan clasificat cu tip (house_blueprint, site_plan, etc.)"""
     job_root: Path
     image_path: Path
     label: str

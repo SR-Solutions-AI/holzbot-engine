@@ -2,52 +2,78 @@
 from __future__ import annotations
 
 import json
-import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from config.settings import (
-    load_plan_infos,
-    PlansListError,
-    PlanInfo,
-)
+# ✅ IMPORT CORECT
+from config.settings import load_plan_infos, PlanInfo, get_output_root_for_run
 
-from .openai_scale import detect_scale_with_openai
-
+# ✅ IMPORT CubiCasa
+from cubicasa_detector.jobs import run_cubicasa_for_plan
 
 STAGE_NAME = "scale"
 
 
+# ✅ CUSTOM JSON ENCODER pentru Path
+class PathEncoder(json.JSONEncoder):
+    """Convertește Path objects → string pentru JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        return super().default(obj)
+
+
 @dataclass
 class ScaleJobResult:
+    """Rezultatul procesării unui plan în etapa de detectare a scării."""
     plan_id: str
     work_dir: Path
     success: bool
     message: str
-    meters_per_pixel: float | None
+    meters_per_pixel: float | None = None
 
 
-def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) -> ScaleJobResult:
+def _run_for_single_plan(
+    run_id: str, 
+    index: int, 
+    total: int, 
+    plan: PlanInfo
+) -> ScaleJobResult:
     """
-    Detectează scala pentru un singur plan folosind GPT-4o.
+    Rulează detecția scării pentru un singur plan folosind CubiCasa + Gemini.
     """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
-    
     output_file = work_dir / "scale_result.json"
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → scale detection "
-            f"(cwd={work_dir})",
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → CubiCasa scale detection",
             flush=True,
         )
         
-        # Apel AI pentru detectare scară
-        result = detect_scale_with_openai(plan.plan_image)
+        # 🔥 FOLOSIM CUBICASA
+        cubicasa_result = run_cubicasa_for_plan(
+            plan_image=plan.plan_image,
+            output_dir=work_dir
+        )
+        
+        scale_info = cubicasa_result["scale_result"]
+        meters_per_pixel = float(scale_info["meters_per_pixel"])
+        
+        # Adaptăm output-ul la formatul așteptat de pipeline
+        result = {
+            "meters_per_pixel": meters_per_pixel,
+            "method": "cubicasa_gemini",
+            "confidence": "high" if scale_info["rooms_used"] >= 3 else "medium",
+            "rooms_analyzed": scale_info["rooms_used"],
+            "optimization_info": scale_info["optimization_info"],
+            "per_room_details": scale_info.get("per_room", [])
+        }
         
         # Adaugă metadata
         result["meta"] = {
@@ -57,92 +83,94 @@ def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) ->
             "stage": STAGE_NAME
         }
         
-        # Salvează rezultatul
+        # Salvează rezultatul (ACELAȘI FORMAT ca înainte)
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         
-        meters_per_pixel = float(result["meters_per_pixel"])
+        # ✅ Salvează și rezultatul complet CubiCasa pentru cache
+        # FOLOSEȘTE PathEncoder pentru a converti Path → string
+        cache_file = work_dir / "cubicasa_result.json"
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cubicasa_result, f, indent=2, ensure_ascii=False, cls=PathEncoder)
+        
+        print(
+            f"✅ [{STAGE_NAME}] {plan.plan_id}: "
+            f"{meters_per_pixel:.6f} m/px ({scale_info['rooms_used']} camere)",
+            flush=True
+        )
         
         return ScaleJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
             success=True,
-            message=f"Scară detectată: {meters_per_pixel:.6f} m/px",
+            message=f"Scară detectată: {meters_per_pixel:.6f} m/px ({scale_info['rooms_used']} camere)",
             meters_per_pixel=meters_per_pixel
         )
-    
+        
     except Exception as e:
+        error_msg = f"Eroare CubiCasa pentru {plan.plan_id}: {e}"
+        print(f"❌ [{STAGE_NAME}] {error_msg}", flush=True)
+        traceback.print_exc()
+        
         return ScaleJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
             success=False,
-            message=f"Eroare: {e}",
+            message=error_msg,
             meters_per_pixel=None
         )
 
 
-def run_scale_detection_for_run(run_id: str, max_parallel: int | None = None) -> List[ScaleJobResult]:
+def run_scale_detection_for_run(run_id: str, max_workers: int = 4) -> List[ScaleJobResult]:
     """
-    Punct de intrare pentru etapa „scale" (scale detection).
+    Rulează detecția scării pentru toate planurile din run.
+    """
+    print(f"\n{'='*60}")
+    print(f"[{STAGE_NAME}] Starting scale detection for run: {run_id}")
+    print(f"{'='*60}\n")
     
-    Toate output-urile se vor regăsi în:
-      new/runner/output/<RUN_ID>/scale/<plan_id>/scale_result.json
-    """
-    try:
-        plans: List[PlanInfo] = load_plan_infos(run_id, stage_name=STAGE_NAME)
-    except PlansListError as e:
-        print(f"❌ [{STAGE_NAME}] {e}")
+    plans = load_plan_infos(run_id, STAGE_NAME)
+    
+    if not plans:
+        print(f"⚠️ [{STAGE_NAME}] No plans found for run {run_id}")
         return []
     
-    total = len(plans)
-    print(f"\n📌 [{STAGE_NAME}] {total} planuri găsite pentru RUN_ID={run_id}\n", flush=True)
-    
-    if max_parallel is None:
-        cpu_count = os.cpu_count() or 4
-        # Scale detection e I/O bound (API calls), putem fi mai agresivi
-        max_parallel = min(cpu_count * 2, total, 10)  # max 10 concurrent
-    
-    print(f"⚙️  [{STAGE_NAME}] rulez cu max_parallel = {max_parallel}\n", flush=True)
-    
     results: List[ScaleJobResult] = []
+    total = len(plans)
     
-    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(
-                _run_for_single_plan,
-                run_id,
-                idx,
-                total,
-                plan,
-            ): plan
+            executor.submit(_run_for_single_plan, run_id, idx, total, plan): plan
             for idx, plan in enumerate(plans, start=1)
         }
         
-        for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            status = "✅" if res.success else "❌"
-            print(
-                f"{status} [{STAGE_NAME}] {res.plan_id} "
-                f"({res.work_dir}) → {res.message}",
-                flush=True,
-            )
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                plan = futures[future]
+                print(f"❌ [{STAGE_NAME}] Unexpected error for {plan.plan_id}: {e}")
+                traceback.print_exc()
+                results.append(
+                    ScaleJobResult(
+                        plan_id=plan.plan_id,
+                        work_dir=plan.stage_work_dir,
+                        success=False,
+                        message=f"Unexpected error: {e}",
+                        meters_per_pixel=None
+                    )
+                )
     
-    failed = [r for r in results if not r.success]
-    if failed:
-        print(f"\n⚠️ [{STAGE_NAME}] unele planuri au eșuat:")
-        for r in failed:
-            print(f"   - {r.plan_id}: {r.message[:300]}")
-    else:
-        print(f"\n✅ [{STAGE_NAME}] toate planurile au trecut etapa scale detection.")
+    # Summary
+    successful = sum(1 for r in results if r.success)
+    failed = total - successful
     
-    # Afișare rezumat scale-uri detectate
-    print(f"\n{'─'*70}")
-    print("📏 SCALE-URI DETECTATE:")
-    print(f"{'─'*70}")
-    for r in results:
-        if r.success and r.meters_per_pixel:
-            print(f"  {r.plan_id}: {r.meters_per_pixel:.6f} m/pixel")
-    print(f"{'─'*70}\n")
+    print(f"\n{'='*60}")
+    print(f"[{STAGE_NAME}] Scale Detection Complete")
+    print(f"  ✅ Success: {successful}/{total}")
+    if failed > 0:
+        print(f"  ❌ Failed: {failed}/{total}")
+    print(f"{'='*60}\n")
     
     return results

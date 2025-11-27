@@ -21,4 +21,5 @@ runs/
 test_out/
 ui_out/
 pdf_converted/
-
+CubiCasa5k/
+cubicasa_detector/model_weights.pth
