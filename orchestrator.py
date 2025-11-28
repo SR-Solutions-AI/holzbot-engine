@@ -275,13 +275,37 @@ def run_segmentation_and_classification_for_document(
         pipeline_timer.add_step("Perimeter", t.end_time - t.start_time)
 
         # =========================================================
-        # STEP 12: AREA (text 12)
+        # STEP 12: AREA (text 12 + imagini vizuale 3D pentru FIECARE plan)
         # =========================================================
         with Timer("STEP 12: Area") as t:
             run_area_for_run(run_id)
-            notify_ui("area")
-        pipeline_timer.add_step("Area", t.end_time - t.start_time)
+            
+            scale_out_dir = RUNNER_ROOT / "output" / run_id / "scale"
+            
+            found_any_image = False
+            if scale_out_dir.exists():
+                # ✅ Iterăm prin toate folderele de planuri (plan_01, plan_02...)
+                for plan_dir in scale_out_dir.iterdir():
+                    if plan_dir.is_dir():
+                        # 1. Căutăm imaginea 3D (Prioritate)
+                        img_3d = plan_dir / "walls_3d_view.png"
+                        if img_3d.exists():
+                            notify_ui("area", img_3d)
+                            found_any_image = True
+                            continue # Trecem la următorul plan
+                        
+                        # 2. Fallback: Imaginea 2D
+                        img_2d = plan_dir / "final_viz.png"
+                        if img_2d.exists():
+                            notify_ui("area", img_2d)
+                            found_any_image = True
 
+            # Dacă nu am găsit nicio imagine la niciun plan, trimitem doar textul
+            if not found_any_image:
+                notify_ui("area")
+                
+        pipeline_timer.add_step("Area", t.end_time - t.start_time)
+        
         # =========================================================
         # STEP 13: ROOF (text 13)
         # =========================================================

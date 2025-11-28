@@ -21,7 +21,6 @@ from google.genai.errors import APIError
 def _get_cubicasa_path():
     """Găsește automat CubiCasa5k relativ la acest fișier."""
     current_dir = Path(__file__).parent
-    # Căutăm CubiCasa5k în mai multe locații posibile
     candidates = [
         current_dir / "CubiCasa5k",
         current_dir.parent / "CubiCasa5k",
@@ -91,7 +90,6 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
     x0 = max(0, min(w - 1, x0))
     y0 = max(0, min(h - 1, y0))
 
-    # Căutare punct valid
     if indoor_mask[y0, x0] == 0:
         found = False
         for dy in range(-search_radius, search_radius + 1):
@@ -109,7 +107,6 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
         if not found:
             return np.zeros_like(indoor_mask), 0, seed_pt
 
-    # Flood fill
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
     temp = indoor_mask.copy()
     try:
@@ -124,6 +121,126 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
     room_mask = (mask[1:-1, 1:-1] != 0).astype(np.uint8) * 255
     area_px = int(np.count_nonzero(room_mask))
     return room_mask, area_px, (x0, y0)
+
+
+# ============================================
+# 3D RENDERER (Adăugat din codul vechi)
+# ============================================
+
+def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, height=1024):
+    """Randează o previzualizare 3D simplă a modelului OBJ."""
+    if not vertices_raw or not faces_raw: return
+    print("   📸 Randez previzualizarea 3D...")
+    
+    verts = []
+    faces = []
+    for v_line in vertices_raw: 
+        parts = v_line.split()
+        verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    verts = np.array(verts)
+    
+    for f_line in faces_raw: 
+        parts = f_line.split()
+        # OBJ faces are 1-indexed
+        faces.append([int(parts[1])-1, int(parts[2])-1, int(parts[3])-1, int(parts[4])-1])
+
+    # Rotație izometrică-ish
+    angle_y = np.radians(45)
+    angle_x = np.radians(30)
+    
+    Ry = np.array([[np.cos(angle_y), 0, np.sin(angle_y)], [0, 1, 0], [-np.sin(angle_y), 0, np.cos(angle_y)]])
+    Rx = np.array([[1, 0, 0], [0, np.cos(angle_x), -np.sin(angle_x)], [0, np.sin(angle_x), np.cos(angle_x)]])
+    
+    center = verts.mean(axis=0)
+    verts_centered = verts - center
+    rotated_verts = verts_centered @ Ry.T @ Rx.T
+    
+    range_val = np.max(rotated_verts) - np.min(rotated_verts)
+    if range_val == 0: range_val = 1
+    
+    scale = min(width, height) / range_val * 0.7
+    
+    projected_2d = rotated_verts[:, :2] * scale
+    projected_2d[:, 0] += width / 2
+    projected_2d[:, 1] += height / 2
+    
+    # Flip Y pentru coordonate imagine
+    projected_2d[:, 1] = height - projected_2d[:, 1]
+
+    # Sortare fețe după adâncime (Painter's algorithm simplificat)
+    face_depths = []
+    for idx, face in enumerate(faces): 
+        face_depths.append((np.mean(rotated_verts[face, 2]), idx))
+    face_depths.sort(key=lambda x: x[0])
+
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    wall_color = (200, 200, 200)
+    edge_color = (50, 50, 50)
+    
+    for _, face_idx in face_depths:
+        pts = projected_2d[faces[face_idx]].astype(np.int32)
+        cv2.fillPoly(canvas, [pts], wall_color)
+        cv2.polylines(canvas, [pts], True, edge_color, 1, cv2.LINE_AA)
+        
+    cv2.imwrite(str(output_image_path), canvas)
+
+
+def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, image_output_path=None):
+    """Exportă masca pereților într-un fișier .OBJ 3D."""
+    print("   🏗️  Generez model 3D (Smoothed)...")
+    contours, _ = cv2.findContours(walls_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    vertices_str_list = []
+    faces_str_list = []
+    vertex_count = 0
+    h_img, w_img = walls_mask.shape[:2]
+
+    for cnt in contours:
+        epsilon = 0.001 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+
+        if len(approx) < 3: continue
+        
+        base_idx = vertex_count + 1
+        num_pts = len(approx)
+        
+        # Generăm vertecșii (jos și sus)
+        for pt in approx:
+            px, py = pt[0]
+            # Centrare pe (0,0) pentru model
+            x = (px - w_img/2) * scale_m_px
+            z = (h_img - py - h_img/2) * scale_m_px 
+            
+            # Vertecs jos (y=0) și sus (y=height)
+            vertices_str_list.append(f"v {x:.4f} 0.0000 {-z:.4f}")
+            vertices_str_list.append(f"v {x:.4f} {wall_height_m:.4f} {-z:.4f}")
+            
+        # Generăm fețele (quads)
+        for k in range(num_pts):
+            curr = k
+            next_p = (k + 1) % num_pts
+            
+            # Indici vertecși (1-based în OBJ)
+            v_bl = base_idx + 2*curr
+            v_tl = base_idx + 2*curr + 1
+            v_br = base_idx + 2*next_p
+            v_tr = base_idx + 2*next_p + 1
+            
+            faces_str_list.append(f"f {v_bl} {v_br} {v_tr} {v_tl}")
+            
+        vertex_count += 2 * num_pts
+
+    # Scriere fișier OBJ
+    with open(output_path, "w") as f:
+        f.write(f"# Scale: {scale_m_px} m/px\n")
+        f.write(f"# Holzbot Auto-Generated 3D Model\n")
+        for v in vertices_str_list: f.write(v + "\n")
+        for face in faces_str_list: f.write(face + "\n")
+        
+    print(f"   ✅ 3D Salvat: {output_path.name}")
+    
+    # Generare imagine preview
+    if image_output_path:
+        render_obj_to_image(vertices_str_list, faces_str_list, image_output_path)
 
 
 # ============================================
@@ -158,11 +275,9 @@ def call_gemini(image_path, prompt, api_key):
         )
         reply = response.text.strip()
         
-        # Curățare JSON
         if reply.startswith("```"):
             reply = reply[reply.find('{'):reply.rfind('}') + 1]
         
-        # Validare lungime răspuns
         if len(prompt) == len(GEMINI_PROMPT_CROP):
             if reply.count('\n') > 3 or len(reply) > 250:
                 return None
@@ -188,13 +303,6 @@ def detect_scale_from_room_labels(
 ):
     """
     Detectează scala din label-uri de camere.
-    
-    Returns:
-        dict cu:
-        - meters_per_pixel: float
-        - rooms_used: int
-        - optimization_info: dict
-        - per_room: list
     """
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
@@ -356,10 +464,7 @@ def run_cubicasa_detection(
     save_debug_steps: bool = True
 ) -> dict:
     """
-    Rulează detecția CubiCasa + măsurări.
-    
-    Returns:
-        dict cu scale_result, measurements, masks (toate Path → string)
+    Rulează detecția CubiCasa + măsurări + 3D Generation.
     """
     image_path = Path(image_path)
     output_dir = Path(output_dir)
@@ -511,8 +616,22 @@ def run_cubicasa_detection(
     print(f"   🧱 Pereți Ext: {walls_ext_m:.2f} m")
     print(f"   🧱 Pereți Int: {walls_int_m:.2f} m")
     print(f"   🏠 Arie Indoor: {area_indoor_m2:.2f} m²")
+    
+    # ============================================
+    # 9. GENERARE 3D (NOU)
+    # ============================================
+    print("   🏗️  Pornesc generarea 3D...")
+    
+    # Generăm modelul OBJ și imaginea de previzualizare
+    # Imaginea se salvează ca 'walls_3d_view.png'
+    export_walls_to_obj(
+        ai_walls_smoothed, 
+        output_dir / "walls_3d.obj", 
+        m_px, 
+        image_output_path=output_dir / "walls_3d_view.png"
+    )
 
-    # 9. SALVARE VIZUALIZĂRI
+    # 10. SALVARE VIZUALIZĂRI 2D
     black_vis = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
     black_vis[outline_ext_mask > 0] = [255, 0, 0]  # Roșu = exterior
     black_vis[outline_int_mask > 0] = [0, 255, 0]  # Verde = interior
@@ -527,7 +646,7 @@ def run_cubicasa_detection(
     clean_overlay[ai_walls_straight > 0] = [0, 255, 0]
     cv2.imwrite(str(output_dir / "final_viz.png"), clean_overlay)
 
-    # ✅ RETURN rezultate (toate Path → string)
+    # ✅ RETURN rezultate (Path-uri actualizate)
     return {
         "scale_result": scale_result,
         "measurements": measurements,
@@ -537,6 +656,7 @@ def run_cubicasa_detection(
             "indoor_mask": str(steps_dir / "debug_zone_interior.png"),
             "outdoor_mask": str(steps_dir / "debug_zone_exterior.png"),
             "segmentation": str(steps_dir / "debug_segmentation_final.png"),
-            "visualization": str(output_dir / "visualization_overlay.png")
+            "visualization": str(output_dir / "visualization_overlay.png"),
+            "visualization_3d": str(output_dir / "walls_3d_view.png") # <--- Aici e imaginea 3D
         }
     }

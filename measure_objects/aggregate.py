@@ -1,113 +1,121 @@
 # new/runner/measure_objects/aggregate.py
 from __future__ import annotations
-
 import json
 from pathlib import Path
 
-
 def create_openings_all(
-    detections_all_json: Path,
-    measurements_json: Path,
-    exterior_doors_json: Path,
+    detections_path: Path, 
+    measurements_path: Path, 
+    exterior_doors_path: Path,
     output_path: Path
 ) -> int:
     """
-    Combină detecții + măsurări + exterior_doors în openings_all.json
-    
-    Returns:
-        Numărul de obiecte în lista finală (fără scări)
+    Agregă informațiile despre deschideri (uși/ferestre) din mai multe surse:
+    1. detections_all.json (Tip, Poziție, Scor)
+    2. openings_measurements_gemini.json (Lățimi reale calculate)
+    3. exterior_doors.json (Status Exterior/Interior)
     """
-    # Load inputs
-    with open(detections_all_json, "r", encoding="utf-8") as f:
-        detections = json.load(f)
     
-    with open(measurements_json, "r", encoding="utf-8") as f:
-        meas_data = json.load(f)
+    # 1. Încărcăm datele de bază
+    objects = []
+    if detections_path.exists():
+        with open(detections_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Suportă listă sau dict cu cheia 'predictions'
+            if isinstance(data, list):
+                objects = data
+            else:
+                objects = data.get("predictions", [])
+
+    # 2. Încărcăm măsurătorile (lățimi reale)
+    # Structura: { "measurements": { "door": { "real_width_meters": 0.9, ... } } }
+    type_widths = {}
+    if measurements_path.exists():
+        with open(measurements_path, "r", encoding="utf-8") as f:
+            meas_data = json.load(f)
+            m_root = meas_data.get("measurements", {})
+            for k, v in m_root.items():
+                if "real_width_meters" in v:
+                    type_widths[k] = v["real_width_meters"]
+
+    # 3. Încărcăm statusul Exterior/Interior
+    # Structura: { "exterior_doors": [...], "interior_doors": [...] }
+    ext_doors_map = {} # Cheie: tuple(box) -> "exterior"
     
-    measurements = meas_data.get("measurements", {})
-    
-    # exterior_doors.json e opțional
-    if exterior_doors_json.exists():
-        with open(exterior_doors_json, "r", encoding="utf-8") as f:
-            exterior_data = json.load(f)
-        
-        door_status_map = {}
-        for d in exterior_data:
-            bbox = tuple(map(int, d["bbox"]))
-            door_status_map[bbox] = d["status"]
-    else:
-        print("       ℹ️  Lipsă exterior_doors.json — toate ușile vor fi 'unknown'")
-        door_status_map = {}
-    
-    # Helper: extrage lățime pentru un tip
-    def get_width_for_type(obj_type: str) -> float | None:
-        normalized = obj_type.lower().replace("-", "_")
-        meas = measurements.get(normalized)
-        if not meas:
-            return None
-        return float(meas.get("real_width_meters", 0.0))
-    
-    # Construiește lista finală
-    openings = []
-    id_counter = 1
-    
-    for det in detections:
-        obj_type = det.get("type", "").lower()
-        status_det = det.get("status", "").lower()
-        
-        # Skip obiecte respinse
-        if status_det == "rejected":
-            continue
-        
-        # Skip scările (nu intră în openings_all.json)
-        if "stair" in obj_type:
-            continue
-        
-        # Filtrează doar uși/ferestre
-        if not any(k in obj_type for k in ["door", "window"]):
-            continue
-        
-        # Mapare tip standard
-        if "double" in obj_type and "door" in obj_type:
-            standard_type = "double_door"
-        elif "double" in obj_type and "window" in obj_type:
-            standard_type = "double_window"
-        elif "door" in obj_type:
-            standard_type = "door"
-        elif "window" in obj_type:
-            standard_type = "window"
-        else:
-            continue
-        
-        # Extrage lățime
-        width_m = get_width_for_type(standard_type)
-        if width_m is None or width_m <= 0:
-            print(f"       ⚠️  Tip fără măsurare validă: {standard_type} (skip)")
-            continue
-        
-        # Determină status (interior/exterior) doar pentru uși
-        status = "exterior" if "window" in standard_type else "unknown"
-        
-        if "door" in standard_type:
-            bbox = tuple(map(int, [det["x1"], det["y1"], det["x2"], det["y2"]]))
+    if exterior_doors_path.exists():
+        try:
+            with open(exterior_doors_path, "r", encoding="utf-8") as f:
+                ext_data = json.load(f)
+                
+            # Extragem listele
+            ext_list = ext_data.get("exterior_doors", [])
+            int_list = ext_data.get("interior_doors", [])
             
-            # Căutăm match în exterior_doors.json (cu toleranță ±15px)
-            for door_bbox, door_status in door_status_map.items():
-                if all(abs(a - b) < 15 for a, b in zip(door_bbox, bbox)):
-                    status = door_status
-                    break
+            # Mapăm coordonatele la status pentru lookup rapid
+            # Folosim coordonatele cutiei ca identificator unic
+            for d in ext_list:
+                if "box_2d" in d:
+                    # Convertim la tuple pentru a fi cheie de dict
+                    box_key = tuple(map(int, d["box_2d"]))
+                    ext_doors_map[box_key] = "exterior"
+            
+            for d in int_list:
+                if "box_2d" in d:
+                    box_key = tuple(map(int, d["box_2d"]))
+                    ext_doors_map[box_key] = "interior"
+                    
+        except Exception as e:
+            print(f"⚠️ Warning loading exterior_doors.json: {e}")
+
+    # 4. Construim lista finală
+    final_list = []
+    
+    for obj in objects:
+        cls = obj.get("class", "unknown")
+        # Ignorăm scările aici (sunt tratate separat la arii)
+        if cls == "stairs":
+            continue
+            
+        # Determină lățimea
+        width = type_widths.get(cls, 0.0)
         
-        openings.append({
-            "id": id_counter,
-            "type": standard_type,
+        # Determină status (doar pentru uși)
+        status = "unknown"
+        
+        # Încercăm să găsim statusul în maparea de uși exterioare
+        # Roboflow dă coordonatele în 'x','y','width','height' sau 'box_2d'?
+        # Codul de detecție salvează "box_2d": [x1, y1, x2, y2]
+        
+        # Verificăm cheile disponibile
+        bbox = None
+        if "box_2d" in obj:
+            bbox = tuple(map(int, obj["box_2d"]))
+        elif "x" in obj and "y" in obj:
+            # Reconstruim box-ul aproximativ dacă lipsește box_2d (fallback)
+            x, y, w, h = obj["x"], obj["y"], obj["width"], obj["height"]
+            bbox = (int(x - w/2), int(y - h/2), int(x + w/2), int(y + h/2))
+            
+        if bbox and bbox in ext_doors_map:
+            status = ext_doors_map[bbox]
+        
+        # Fallback simplu pe bază de nume clasă dacă nu avem potrivire geometrică
+        if status == "unknown":
+            if "window" in cls:
+                status = "exterior" # Ferestrele sunt implicit exterioare
+            elif "door" in cls:
+                status = "interior" # Ușile default interior
+        
+        item = {
+            "type": cls,
+            "width_m": width,
             "status": status,
-            "width_m": round(width_m, 3)
-        })
-        id_counter += 1
-    
-    # Salvează
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+            "confidence": obj.get("confidence", 0.0),
+            "bbox": list(bbox) if bbox else []
+        }
+        final_list.append(item)
+
+    # 5. Salvare
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(openings, f, indent=2, ensure_ascii=False)
-    
-    return len(openings)
+        json.dump(final_list, f, indent=2)
+        
+    return len(final_list)

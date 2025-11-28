@@ -1,43 +1,15 @@
-# new/runner/exterior_doors/classify.py (VERSIUNEA CORECTĂ - CU OVERLAY)
+# new/runner/exterior_doors/classify.py
 from __future__ import annotations
 from pathlib import Path
 import json
 import cv2
 import numpy as np
 
-
-def _load_gray(path: Path) -> np.ndarray:
-    m = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if m is None:
-        raise FileNotFoundError(f"Lipsește/invalid: {path}")
-    return m
-
-
-def _extract_blue_mask_from_overlay(overlay_path: Path) -> np.ndarray:
-    """
-    Extrage masca binară a zonelor ALBASTRE din blue_overlay.jpg.
-    
-    Blue overlay = planul original + overlay ALBASTRU (BGR: 255,0,0) pe exterior
-    
-    Returns:
-        Mască binară: 255 = ALBASTRU (exterior), 0 = REST
-    """
-    overlay = cv2.imread(str(overlay_path))
-    if overlay is None:
-        raise FileNotFoundError(f"Lipsește/invalid: {overlay_path}")
-    
-    # Extragem canalul ALBASTRU (BGR: B=255, G=0, R=0)
-    # Pixelii albaștri pur au B=255, G=0, R=0
-    
-    b_channel = overlay[:, :, 0]  # Blue channel
-    g_channel = overlay[:, :, 1]  # Green channel
-    r_channel = overlay[:, :, 2]  # Red channel
-    
-    # Mască: ALBASTRU pur (B=255 și G<50 și R<50)
-    blue_mask = ((b_channel > 200) & (g_channel < 50) & (r_channel < 50)).astype(np.uint8) * 255
-    
-    return blue_mask
-
+from .config import (
+    COLOR_DARK_BLUE, COLOR_YELLOW, 
+    COLOR_RED, COLOR_GREEN,
+    MAX_DISTANCE_RATIO
+)
 
 def _bbox_diagonal(bbox: tuple[int, int, int, int]) -> float:
     """Calculează lungimea diagonalei bbox."""
@@ -46,217 +18,157 @@ def _bbox_diagonal(bbox: tuple[int, int, int, int]) -> float:
     h = y2 - y1
     return np.sqrt(w**2 + h**2)
 
-
-def _distance_to_blue(mask_blue: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
+def _distance_to_outdoor(mask_outdoor: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
     """
-    Calculează distanța minimă de la bbox la cea mai apropiată zonă ALBASTRĂ.
-    
-    Args:
-        mask_blue: Mască binară (255 = albastru/exterior, 0 = rest)
-        bbox: (x1, y1, x2, y2)
-    
-    Returns:
-        Distanța în pixeli (inf dacă nu găsește albastru)
+    Calculează distanța minimă de la bbox la zona de EXTERIOR (valoare 255 în mască).
     """
-    H, W = mask_blue.shape[:2]
+    H, W = mask_outdoor.shape[:2]
     x1, y1, x2, y2 = map(int, bbox)
     
-    # Verifică dacă bbox e valid
-    if x1 >= W or x2 <= 0 or y1 >= H or y2 <= 0:
-        return float('inf')
+    # Validare și Clamp
+    if x1 >= W or x2 <= 0 or y1 >= H or y2 <= 0: return float('inf')
+    x1, x2 = max(0, x1), min(W-1, x2)
+    y1, y2 = max(0, y1), min(H-1, y2)
     
-    # Clamp bbox
-    x1 = max(0, min(x1, W-1))
-    x2 = max(0, min(x2, W-1))
-    y1 = max(0, min(y1, H-1))
-    y2 = max(0, min(y2, H-1))
+    # Verificăm întâi dacă atinge direct (intersecție)
+    bbox_region = mask_outdoor[y1:y2, x1:x2]
+    if cv2.countNonZero(bbox_region) > 0:
+        return 0.0 
+        
+    # Dacă nu atinge, calculăm distanța
+    margin = 100
+    x1_exp, x2_exp = max(0, x1 - margin), min(W - 1, x2 + margin)
+    y1_exp, y2_exp = max(0, y1 - margin), min(H - 1, y2 + margin)
     
-    if x2 <= x1 or y2 <= y1:
-        return float('inf')
+    region = mask_outdoor[y1_exp:y2_exp, x1_exp:x2_exp]
     
-    # Expandăm bbox pentru căutare
-    margin = 50
-    x1_exp = max(0, x1 - margin)
-    x2_exp = min(W - 1, x2 + margin)
-    y1_exp = max(0, y1 - margin)
-    y2_exp = min(H - 1, y2 + margin)
-    
-    # Extragem regiunea
-    region = mask_blue[y1_exp:y2_exp+1, x1_exp:x2_exp+1]
-    
-    if region.size == 0:
-        return float('inf')
-    
-    # Verificăm dacă există albastru în regiune
-    if cv2.countNonZero(region) == 0:
-        return float('inf')
-    
-    # Distance transform
-    # mask_blue are 255 = ALBASTRU (destinație)
-    # Inversăm: 0 = destinație, 255 = obstacol
+    # Inversăm: 0=exterior, 255=interior
     inv_region = cv2.bitwise_not(region)
-    
     dist_transform = cv2.distanceTransform(inv_region, cv2.DIST_L2, 5)
     
-    # Extragem zona bbox-ului ORIGINAL (fără margin)
-    y_start = y1 - y1_exp
-    y_end = y2 - y1_exp
-    x_start = x1 - x1_exp
-    x_end = x2 - x1_exp
+    # Coordonate relative
+    y_rel_1, y_rel_2 = y1 - y1_exp, y2 - y1_exp
+    x_rel_1, x_rel_2 = x1 - x1_exp, x2 - x1_exp
     
-    y_start = max(0, y_start)
-    y_end = min(dist_transform.shape[0], y_end)
-    x_start = max(0, x_start)
-    x_end = min(dist_transform.shape[1], x_end)
+    dist_slice = dist_transform[y_rel_1:y_rel_2, x_rel_1:x_rel_2]
     
-    bbox_region = dist_transform[y_start:y_end, x_start:x_end]
+    if dist_slice.size == 0: return float('inf')
     
-    if bbox_region.size == 0:
-        return float('inf')
-    
-    return float(np.min(bbox_region))
-
+    return float(np.min(dist_slice))
 
 def classify_exterior_doors(
     plan_image: Path,
-    blue_mask_path: Path,
+    outdoor_mask_path: Path,
     detections_all_json: Path,
-    out_dir: Path,
-    job_root: Path | None = None,
-    original_plan_name: str | None = None
-) -> tuple[Path, Path, Path]:
-    """
-    Clasifică ușile ca exterior/interior.
+    out_dir: Path
+) -> tuple[Path, Path]:
     
-    REGULA:
-    Pentru fiecare ușă:
-      - distanță ≤ diagonală/2 → EXTERIOR
-      - distanță > diagonală/2 → INTERIOR
-    """
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_json = out_dir / "exterior_doors.json"
-        out_overlay = out_dir / "exterior_doors_detected.jpg"
-        out_flood_marked = out_dir / "exterior_doors_flood_marked.jpg"
-        
-        # Load plan
-        plan = cv2.imread(str(plan_image))
-        if plan is None:
-            raise RuntimeError(f"plan.jpg invalid: {plan_image}")
-        
-        H, W = plan.shape[:2]
-        
-        # ==========================================
-        # IMPORTANT: EXTRAGEM MASCA DIN BLUE_OVERLAY.JPG
-        # ==========================================
-        blue_overlay_path = out_dir / "blue_overlay.jpg"
-        
-        if not blue_overlay_path.exists():
-            raise FileNotFoundError(f"Nu găsesc blue_overlay.jpg: {blue_overlay_path}")
-        
-        print(f"       📐 Extrag mască ALBASTRĂ din blue_overlay.jpg...")
-        mask_blue = _extract_blue_mask_from_overlay(blue_overlay_path)
-        
-        # Verifică câte pixeli albastre sunt
-        total_blue = cv2.countNonZero(mask_blue)
-        blue_percent = (total_blue / (mask_blue.shape[0] * mask_blue.shape[1])) * 100
-        print(f"       📐 Pixeli albaștri: {total_blue:,} ({blue_percent:.1f}%)")
-        
-        if total_blue == 0:
-            print(f"       ❌ ATENȚIE: Nu există zone albastre în overlay!")
-        
-        dets = json.loads(detections_all_json.read_text(encoding="utf-8"))
-        
-        # Prepare overlays
-        overlay_doors = plan.copy()
-        overlay_flood = cv2.imread(str(blue_overlay_path))  # Pornim de la blue_overlay
-        
-        # ==========================================
-        # PROCESEAZĂ FIECARE UȘĂ
-        # ==========================================
-        
-        results = []
-        idx = 0
-        
-        for d in dets:
-            typ = (d.get("type") or "").lower()
-            status_det = (d.get("status") or "").lower()
-            
-            if "door" not in typ:
-                continue
-            if status_det == "rejected":
-                continue
-            
-            idx += 1
-            
-            x1, y1, x2, y2 = int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"])
-            bbox = (x1, y1, x2, y2)
-            
-            # Calculează distanță și diagonală
-            diagonal = _bbox_diagonal(bbox)
-            distance = _distance_to_blue(mask_blue, bbox)
-            
-            # REGULA:
-            max_allowed_distance = diagonal / 2.0
-            is_exterior = (distance <= max_allowed_distance)
-            
-            status = "exterior" if is_exterior else "interior"
-            color = (0, 0, 255) if is_exterior else (0, 200, 0)
-            
-            # Desenează
-            cv2.rectangle(overlay_doors, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(
-                overlay_doors,
-                f"#{idx} {status[:3].upper()} d={distance:.1f}px",
-                (x1, max(15, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-                cv2.LINE_AA
-            )
-            
-            cv2.rectangle(overlay_flood, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(
-                overlay_flood,
-                f"#{idx}",
-                (x1 + 5, y1 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA
-            )
-            
-            results.append({
-                "id": idx,
-                "type": typ,
-                "status": status,
-                "bbox": [x1, y1, x2, y2],
-                "distance_to_blue_px": round(float(distance), 2) if distance != float('inf') else "infinity",
-                "diagonal_px": round(float(diagonal), 2),
-                "max_allowed_distance_px": round(float(max_allowed_distance), 2),
-                "rule": f"distance ({distance:.1f}) {'<=' if is_exterior else '>'} diagonal/2 ({max_allowed_distance:.1f})"
-            })
-        
-        # Salvează
-        cv2.imwrite(str(out_overlay), overlay_doors)
-        cv2.imwrite(str(out_flood_marked), overlay_flood)
-        out_json.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-        
-        ext_count = sum(1 for r in results if r['status']=='exterior')
-        int_count = len(results) - ext_count
-        
-        print(f"       ✅ Exterior doors: {ext_count}/{len(results)}")
-        print(f"       🏠 Interior doors: {int_count}/{len(results)}")
-        print(f"       📄 {out_json.name}")
-        print(f"       🖼️  {out_overlay.name}")
-        print(f"       🔵 {out_flood_marked.name}")
-        
-        return out_json, out_overlay, out_flood_marked
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json = out_dir / "exterior_doors.json"
+    out_overlay = out_dir / "blue_overlay.jpg"
     
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"       ❌ Eroare: {e}")
-        return None, None, None
+    # 1. Load Resources
+    plan = cv2.imread(str(plan_image))
+    if plan is None: raise RuntimeError(f"Plan invalid: {plan_image}")
+    
+    mask_outdoor = cv2.imread(str(outdoor_mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask_outdoor is None: raise RuntimeError(f"Mască invalidă: {outdoor_mask_path}")
+    
+    if mask_outdoor.shape[:2] != plan.shape[:2]:
+        print(f"       ⚠️ Resize mask {mask_outdoor.shape} -> {plan.shape}")
+        mask_outdoor = cv2.resize(mask_outdoor, (plan.shape[1], plan.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    # --- FIX CRITIC: Citire Robustă JSON (List vs Dict) ---
+    raw_dets = json.loads(detections_all_json.read_text(encoding="utf-8"))
+    
+    if isinstance(raw_dets, list):
+        dets_list = raw_dets
+    else:
+        dets_list = raw_dets.get("predictions", [])
+    
+    # Normalizare coordonate (Roboflow center -> Corner)
+    normalized_dets = []
+    for d in dets_list:
+        if "box_2d" not in d:
+            if "x" in d and "width" in d:
+                # Format Roboflow
+                x, y, w, h = d["x"], d["y"], d["width"], d["height"]
+                d["box_2d"] = [int(x - w/2), int(y - h/2), int(x + w/2), int(y + h/2)]
+            elif "x1" in d and "y1" in d:
+                # Format Count Objects
+                d["box_2d"] = [int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"])]
+        
+        normalized_dets.append(d)
+
+    # 2. Visualization Layers
+    vis_img = plan.copy()
+    overlay_mask = vis_img.copy()
+    
+    # Overlay Măști
+    overlay_mask[mask_outdoor > 127] = COLOR_DARK_BLUE
+    overlay_mask[mask_outdoor <= 127] = COLOR_YELLOW
+    cv2.addWeighted(overlay_mask, 0.4, vis_img, 0.6, 0, vis_img)
+    
+    # 3. Clasificare
+    results = []
+    idx = 0
+    
+    # Filtrăm doar ușile
+    doors = [d for d in normalized_dets if "door" in str(d.get("class", d.get("type", ""))).lower()]
+    
+    print(f"       Found {len(doors)} doors to classify (Distance Method).")
+
+    for d in doors:
+        idx += 1
+        box = d.get("box_2d")
+        if not box: continue
+        
+        diagonal = _bbox_diagonal(box)
+        dist = _distance_to_outdoor(mask_outdoor, box)
+        
+        limit = diagonal * MAX_DISTANCE_RATIO
+        is_exterior = (dist <= limit)
+        
+        status = "exterior" if is_exterior else "interior"
+        color = COLOR_RED if is_exterior else COLOR_GREEN
+        
+        res_entry = {
+            "id": idx,
+            "type": d.get("class", d.get("type", "door")),
+            "status": status,
+            "bbox": box,
+            "box_2d": box,
+            "metrics": {
+                "distance_px": round(dist, 1),
+                "limit_px": round(limit, 1)
+            }
+        }
+        results.append(res_entry)
+        
+        # Desenare Box SOLID
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 4)
+        
+        # Etichetă
+        label_txt = "EXT" if is_exterior else "INT"
+        (w_txt, h_txt), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(vis_img, (x1, y1 - 25), (x1 + w_txt + 10, y1), color, -1)
+        cv2.putText(vis_img, label_txt, (x1 + 5, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+    # 4. Salvare
+    final_output = {
+        "summary": {
+            "total": len(results),
+            "exterior_count": sum(1 for r in results if r["status"] == "exterior"),
+            "interior_count": sum(1 for r in results if r["status"] == "interior")
+        },
+        "exterior_doors": [r for r in results if r["status"] == "exterior"],
+        "interior_doors": [r for r in results if r["status"] == "interior"]
+    }
+    
+    out_json.write_text(json.dumps(final_output, indent=2), encoding="utf-8")
+    cv2.imwrite(str(out_overlay), vis_img)
+    
+    print(f"       ✅ Classified: {final_output['summary']['exterior_count']} Ext, {final_output['summary']['interior_count']} Int")
+    
+    return out_json, out_overlay
