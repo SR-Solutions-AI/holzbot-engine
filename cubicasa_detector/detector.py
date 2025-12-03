@@ -519,7 +519,9 @@ def run_cubicasa_detection(
     if not model_weights_path.exists():
         raise FileNotFoundError(f"Lipsesc weights: {model_weights_path}")
     
-    checkpoint = torch.load(str(model_weights_path), map_location=device)
+    # FIX: Adaugam weights_only=False pentru a permite incarcarea modelelor mai vechi/complexe
+    checkpoint = torch.load(str(model_weights_path), map_location=device, weights_only=False)
+    
     model.load_state_dict(checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint)
     model.to(device)
     model.eval()
