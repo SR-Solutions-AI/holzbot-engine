@@ -1,4 +1,4 @@
-# file: engine/runner/segmenter/pdf_utils.py
+# file: engine/segmenter/pdf_utils.py
 from __future__ import annotations
 
 import math
@@ -22,10 +22,35 @@ def _which(x: str) -> bool:
 
 
 def _safe_dpi_for_page(w_pt: float, h_pt: float, req_dpi: int) -> int:
-    max_dpi_w = MAX_RENDER_DIM * 72.0 / max(w_pt, 1e-6)
-    max_dpi_h = MAX_RENDER_DIM * 72.0 / max(h_pt, 1e-6)
-    safe = min(req_dpi, math.floor(max_dpi_w), math.floor(max_dpi_h))
-    return max(200, int(safe))
+    """
+    Calculează DPI optim: Calitate MAXIMĂ (300 DPI), dar fără a ucide serverul.
+    Returnează un DPI care garantează detalii clare (print quality),
+    dar limitează rezoluția totală la ~8000px pe latura lungă.
+    """
+    # 300 DPI este standardul de aur pentru print și OCR.
+    # Orice este peste 300 DPI pe un plan arhitectural este risipă de RAM (invizibil pentru AI).
+    MAX_SAFE_DPI = 300
+    
+    # Punem o limită de siguranță în pixeli (8000px pe latura lungă)
+    # 8000px este imens (aproape 8K). Detaliile sunt păstrate perfect.
+    HARD_LIMIT_PX = 8000.0
+    
+    w_pt = max(w_pt, 1.0)
+    h_pt = max(h_pt, 1.0)
+
+    # Calculăm DPI-ul care ar rezulta în HARD_LIMIT_PX
+    max_dpi_w = (HARD_LIMIT_PX / w_pt) * 72.0
+    max_dpi_h = (HARD_LIMIT_PX / h_pt) * 72.0
+    px_limit_dpi = min(max_dpi_w, max_dpi_h)
+    
+    # Alegem minimul dintre:
+    # 1. Ce a cerut sistemul (req_dpi - de obicei 900)
+    # 2. Limita de 300 DPI (calitate print)
+    # 3. Limita de pixeli (să nu depășim 8000px și să crăpăm RAM-ul)
+    safe_dpi = min(req_dpi, MAX_SAFE_DPI, int(px_limit_dpi))
+    
+    # Minim 72 DPI ca să se vadă ceva
+    return max(72, safe_dpi)
 
 
 def _verify_png(path: Path) -> None:
@@ -38,14 +63,20 @@ def _verify_png(path: Path) -> None:
 
 
 def _downsample_and_sharpen(src_path: Path, target_path: Path, scale_factor: float | None) -> None:
-    im = Image.open(src_path).convert("RGB")
-    if scale_factor is not None and scale_factor < 1.0:
-        new_w = max(1, int(im.width * scale_factor))
-        new_h = max(1, int(im.height * scale_factor))
-        im = im.resize((new_w, new_h), Image.LANCZOS)
-        im = im.filter(ImageFilter.UnsharpMask(radius=0.75, percent=120, threshold=2))
-    im.save(target_path, "PNG")
-    _verify_png(target_path)
+    # Folosim un bloc try-except pentru a gestiona erorile de memorie la resize (PIL)
+    try:
+        im = Image.open(src_path).convert("RGB")
+        if scale_factor is not None and scale_factor < 1.0:
+            new_w = max(1, int(im.width * scale_factor))
+            new_h = max(1, int(im.height * scale_factor))
+            im = im.resize((new_w, new_h), Image.LANCZOS)
+            im = im.filter(ImageFilter.UnsharpMask(radius=0.75, percent=120, threshold=2))
+        im.save(target_path, "PNG")
+        _verify_png(target_path)
+    except OSError:
+        # Fallback: Dacă nu avem RAM de resize, copiem fișierul original așa cum e
+        debug_print(f"⚠️ Eroare memorie la _downsample_and_sharpen. Copiez fisierul original.")
+        _shutil.copy(src_path, target_path)
 
 
 def _render_with_mutool(pdf_path: Path, page_idx: int, dpi: int, out_png: Path) -> None:
@@ -156,7 +187,9 @@ def convert_pdf_to_png(pdf_path: str | Path, output_dir: str | Path) -> list[Pat
         last_error: Exception | None = None
 
         for req in REQUESTED_DPI:
+            # AICI APELĂM NOUA LOGICĂ DE SIGURANȚĂ
             dpi = _safe_dpi_for_page(w_pt, h_pt, req)
+            
             with tempfile.TemporaryDirectory() as tmpd_str:
                 tmpd = Path(tmpd_str)
                 raw_png = tmpd / f"page_{page_idx:03d}.png"
