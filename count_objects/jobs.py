@@ -15,6 +15,10 @@ from config.settings import (
 
 from .detector import run_hybrid_detection
 
+# ✅ IMPORTĂM MODULUL DE SLICING (pe care l-am modificat anterior)
+# Asigură-te că fișierul detections/roboflow_import.py este cel actualizat!
+from detections.roboflow_import import run_roboflow_import
+
 
 STAGE_NAME = "count_objects"
 
@@ -32,12 +36,13 @@ def _run_for_single_plan(
     index: int, 
     total: int, 
     plan: PlanInfo,
-    total_plans: int  # NOU
+    total_plans: int
 ) -> CountObjectsJobResult:
-    """Rulează hybrid detection pentru un singur plan."""
+    """Rulează Slicing + Hybrid Detection pentru un singur plan."""
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
+    # Directorul unde se află imaginea originală plan.jpg
     detections_dir = work_dir.parent.parent / "detections" / plan.plan_id
     plan_jpg = detections_dir / "plan.jpg"
     
@@ -59,34 +64,75 @@ def _run_for_single_plan(
             message=f"Nu găsesc exports_dir în {exports_dir}"
         )
     
-    roboflow_config = {
-        "api_key": os.getenv("ROBOFLOW_API_KEY", ""),
-        "workspace": os.getenv("ROBOFLOW_WORKSPACE", "blueprint-recognition"),
-        "project": os.getenv("ROBOFLOW_PROJECT", "house-plan-uwkew"),
-        "version": int(os.getenv("ROBOFLOW_VERSION", "5"))
-    }
+    # Configurare Roboflow
+    api_key = os.getenv("ROBOFLOW_API_KEY", "")
+    workspace = os.getenv("ROBOFLOW_WORKSPACE", "blueprint-recognition")
+    project = os.getenv("ROBOFLOW_PROJECT", "house-plan-uwkew")
+    version_str = os.getenv("ROBOFLOW_VERSION", "5")
     
-    if not roboflow_config["api_key"]:
+    if not api_key:
         return CountObjectsJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
             success=False,
             message="ROBOFLOW_API_KEY lipsește"
         )
+
+    roboflow_config = {
+        "api_key": api_key,
+        "workspace": workspace,
+        "project": project,
+        "version": int(version_str)
+    }
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → hybrid detection "
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → Processing... "
             f"(total_plans={total_plans}, cwd={work_dir})",
             flush=True,
         )
+        
+        # =========================================================================
+        # PASUL 1: RULARE SLICING (Pentru a prinde obiecte mici/multe)
+        # =========================================================================
+        print(f"       🚀 [SLICING] Running Roboflow Slicing first...", flush=True)
+        
+        # Configurare env pentru slicing
+        slicing_env = {
+            "ROBOFLOW_API_KEY": api_key,
+            "ROBOFLOW_PROJECT": project,
+            "ROBOFLOW_VERSION": version_str,
+            # Setăm confidence mic ca să luăm tot, detectorul va filtra ulterior
+            "ROBOFLOW_CONFIDENCE": "15" 
+        }
+        
+        # Apelăm funcția de import (modificată să returneze lista)
+        # Atenție: folderul de lucru pentru slicing este cel unde e plan.jpg (detections_dir)
+        slicing_success, slicing_predictions = run_roboflow_import(
+            env=slicing_env, 
+            work_dir=detections_dir 
+        )
+        
+        external_preds = None
+        if slicing_success and isinstance(slicing_predictions, list):
+            print(f"       ✅ [SLICING] Success! Found {len(slicing_predictions)} raw candidates.", flush=True)
+            external_preds = slicing_predictions
+        else:
+            print(f"       ⚠️ [SLICING] Failed or no data. Falling back to standard detection.", flush=True)
+
+        # =========================================================================
+        # PASUL 2: RULARE HYBRID DETECTION (Validare + Scări + Gemini)
+        # =========================================================================
+        print(f"       🧠 [HYBRID] validating candidates...", flush=True)
         
         success, message = run_hybrid_detection(
             plan_image=plan_jpg,
             exports_dir=exports_dir,
             output_dir=work_dir,
             roboflow_config=roboflow_config,
-            total_plans=total_plans  # NOU
+            total_plans=total_plans,
+            # Trimitem predicțiile din slicing către detector
+            external_predictions=external_preds 
         )
         
         return CountObjectsJobResult(
@@ -97,6 +143,8 @@ def _run_for_single_plan(
         )
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return CountObjectsJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,

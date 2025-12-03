@@ -33,7 +33,7 @@ def _norm_class(c: str) -> str:
 
 
 def _fetch_roboflow_data(plan_image: Path, roboflow_config: dict):
-    """Fetch Roboflow data în paralel: scări + uși/ferestre simultan."""
+    """(Legacy) Fetch Roboflow data în paralel: scări + uși/ferestre simultan."""
     def get_stairs():
         return process_stairs(plan_image, roboflow_config["api_key"])
     
@@ -48,17 +48,10 @@ def _fetch_roboflow_data(plan_image: Path, roboflow_config: dict):
             overlap=OVERLAP
         )
     
-    stairs_result = None
-    main_result = None
-    
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_stairs = executor.submit(get_stairs)
         future_main = executor.submit(get_main)
-        
-        stairs_result = future_stairs.result()
-        main_result = future_main.result()
-    
-    return stairs_result, main_result
+        return future_stairs.result(), future_main.result()
 
 
 def _process_object_type(
@@ -72,7 +65,7 @@ def _process_object_type(
     temp_dir: Path,
     has_stairs: bool = False
 ) -> dict:
-    """Procesează un tip de obiect (door/window/etc) complet."""
+    """Procesează un tip de obiect (door/window/etc) complet (Template + Gemini)."""
     print(f"\n       {'='*50}")
     print(f"       {label.upper()}")
     print(f"       {'='*50}")
@@ -84,7 +77,7 @@ def _process_object_type(
     
     print(f"       Loaded {len(templates)} template variations")
     
-    # Filtrează predicții relevante
+    # Filtrează predicții relevante pentru acest tip (ex: doar 'door')
     relevant = []
     for p in preds_filtered:
         cls = _norm_class(str(p.get("class", "")))
@@ -97,7 +90,7 @@ def _process_object_type(
         elif label == "double-window" and ("double" in cls and "window" in cls):
             relevant.append(p)
     
-    print(f"       Found {len(relevant)} relevant predictions")
+    print(f"       Found {len(relevant)} relevant predictions for {label}")
     
     if not relevant:
         return {"confirm": [], "oblique": [], "reject": []}
@@ -124,23 +117,24 @@ def _process_object_type(
     
     for res in processed:
         if res["skip"]:
-            skip_reason = res.get("skip_reason", "unknown")
-            print(f"       #{res['idx']} skip → {skip_reason}")
             continue
         
+        # Scoruri: Best Similarity (Pixel) + Confidence (Roboflow)
         print(f"       #{res['idx']} conf={res['conf']:.2f}, sim={res['best_sim']:.3f}, combined={res['combined']:.3f}")
         
+        # 1. Confirmare puternică prin Template Matching
         if res["combined"] >= GEMINI_THRESHOLD_MAX and res["best_sim"] > TEMPLATE_SIMILARITY:
             results["confirm"].append(res["bbox"])
             used_boxes.append(res["bbox"])
             print(f"       ✅ CONFIRMED (template)")
         
+        # 2. Respingere clară
         elif res["combined"] < GEMINI_THRESHOLD_MIN:
             results["reject"].append(res["bbox"])
             print(f"       ❌ REJECTED (low score)")
         
+        # 3. Zona gri -> Gemini
         else:
-            # Salvează crop pentru Gemini
             x1, y1, x2, y2 = res["bbox"]
             crop = gray_image[y1:y2, x1:x2]
             tmp_path = temp_dir / f"maybe_{label}_{res['idx']}.jpg"
@@ -157,32 +151,24 @@ def _process_object_type(
     # Verificare Gemini PARALELIZAT
     if candidates_for_gemini:
         print(f"\n       🧠 Gemini verification ({len(candidates_for_gemini)} candidates)...")
-        
         try:
             sample_template = next(folder.glob("*.png"))
-        except StopIteration:
-            print(f"       [WARN] No templates for Gemini verification")
+            t0 = time.time()
+            gemini_results = verify_candidates_parallel(candidates_for_gemini, sample_template, temp_dir)
+            print(f"       ✅ Gemini done in {time.time()-t0:.2f}s")
+            
+            for cand in candidates_for_gemini:
+                if gemini_results.get(cand["idx"], False):
+                    results["oblique"].append(cand["bbox"])
+                    used_boxes.append(cand["bbox"])
+                    print(f"       #{cand['idx']} 🔄 GEMINI CONFIRMED")
+                else:
+                    results["reject"].append(cand["bbox"])
+                    print(f"       #{cand['idx']} ❌ REJECTED (Gemini)")
+        except Exception as e:
+            print(f"       [WARN] Gemini skip: {e}")
             for cand in candidates_for_gemini:
                 results["reject"].append(cand["bbox"])
-            return results
-        
-        t0 = time.time()
-        gemini_results = verify_candidates_parallel(
-            candidates_for_gemini,
-            sample_template,
-            temp_dir
-        )
-        print(f"       ✅ Gemini done in {time.time()-t0:.2f}s")
-        
-        for cand in candidates_for_gemini:
-            is_valid = gemini_results.get(cand["idx"], False)
-            if is_valid:
-                results["oblique"].append(cand["bbox"])
-                used_boxes.append(cand["bbox"])
-                print(f"       #{cand['idx']} 🔄 GEMINI CONFIRMED")
-            else:
-                results["reject"].append(cand["bbox"])
-                print(f"       #{cand['idx']} ❌ REJECTED (Gemini)")
     
     return results
 
@@ -193,9 +179,11 @@ def run_hybrid_detection(
     output_dir: Path,
     roboflow_config: dict,
     total_plans: int = 1,
+    external_predictions: list = None # <--- ARGUMENT NOU
 ) -> Tuple[bool, str]:
     """
-    Rulează detecția hybrid cu PARALELIZARE MAXIMĂ + excludere zone scări.
+    Rulează pipeline-ul de validare. 
+    Integrează Slicing Results (Doors/Windows) cu modelul specializat de Scări.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = output_dir / "temp"
@@ -208,18 +196,35 @@ def run_hybrid_detection(
     
     try:
         # ==========================================
-        # STEP 1: ROBOFLOW (SCĂRI + UȘI/FERESTRE) - PARALEL
+        # STEP 1: OBȚINERE DETECȚII (EXTERN + SCĂRI)
         # ==========================================
+        
+        all_detections = []
+        stairs_bbox = None
+        stairs_export = {}
 
-        # DECIZIE SCĂRI: Skip dacă avem doar 1 plan
-        if total_plans == 1:
-            print(f"       [STAIRS] Skipping stairs detection (only 1 plan in run)")
-            stairs_bbox = None
-            stairs_export = {}
-            
-            # Doar detecția principală
-            print(f"       [STEP] Fetching Roboflow main detections...")
-            t0 = time.time()
+        # 1.A. DETECTARE SCĂRI (OBLIGATORIU)
+        # Rulăm detectia de scări separat pentru că modelul de slicing 
+        # (house-plan) poate să nu aibă scări bune.
+        print(f"       [STAIRS] Running specialized stairs detection...")
+        try:
+            # Folosim funcția dedicată din stairs_detection.py
+            stairs_bbox, stairs_export = process_stairs(plan_image, roboflow_config["api_key"])
+            if stairs_bbox:
+                print(f"       [STAIRS] ✅ Found stairs at {stairs_bbox}")
+            else:
+                print(f"       [STAIRS] No stairs found.")
+        except Exception as e:
+            print(f"       [STAIRS] ⚠️ Error detecting stairs: {e}")
+
+        # 1.B. DETECȚII PRINCIPALE (Doors/Windows)
+        if external_predictions is not None:
+            print(f"       🚀 USING EXTERNAL DETECTIONS (Slicing input: {len(external_predictions)} objects)")
+            # Folosim ce a venit din slicing
+            all_detections = external_predictions
+        else:
+            # Fallback la metoda veche (Inferență pe toată imaginea)
+            print(f"       [FALLBACK] Using standard full-image inference...")
             rf_result = infer_roboflow(
                 plan_image,
                 roboflow_config["api_key"],
@@ -229,19 +234,12 @@ def run_hybrid_detection(
                 confidence=CONF_THRESHOLD,
                 overlap=OVERLAP
             )
-            print(f"       [DONE] Main detections in {time.time()-t0:.2f}s")
-        else:
+            all_detections = rf_result.get("predictions", [])
 
-            print(f"       [STEP] Fetching Roboflow data (parallel: stairs + main)...")
-            t0 = time.time()
-            
-            (stairs_bbox, stairs_export), rf_result = _fetch_roboflow_data(plan_image, roboflow_config)
-            
-            print(f"       [DONE] Roboflow data in {time.time()-t0:.2f}s")
-            
-        preds = rf_result.get("predictions", []) or []
-        preds_filtered = [p for p in preds if float(p.get("confidence", 0.0)) >= CONF_THRESHOLD]
-        print(f"       Found {len(preds_filtered)} detections (doors/windows)")
+        # Filtrare sumară (eliminăm erorile grosolane, sub 10%)
+        # Notă: Slicing-ul ne poate da obiecte cu 15-20% pe care vrem să le verificăm
+        preds_filtered = [p for p in all_detections if float(p.get("confidence", 0.0)) >= 0.10]
+        print(f"       Processing {len(preds_filtered)} potential objects through Pipeline...")
         
         # ==========================================
         # STEP 2: PREPROCESARE IMAGINE
@@ -261,7 +259,7 @@ def run_hybrid_detection(
         }
         
         # ==========================================
-        # IMPORTANT: Marchează zona scării ca ocupată
+        # STEP 3: EXCLUDERE ZONA SCĂRILOR
         # ==========================================
         used_boxes = []
         has_stairs = False
@@ -275,10 +273,9 @@ def run_hybrid_detection(
             )
             used_boxes.append(stairs_box)
             has_stairs = True
-            print(f"       [STAIRS] Zona scării marcată ca exclusă: {stairs_box}")
         
         # ==========================================
-        # STEP 3: PROCESARE TIPURI OBIECTE - PARALEL
+        # STEP 4: PROCESARE TIPURI OBIECTE - PARALEL
         # ==========================================
         print(f"\n       [STEP] Processing object types (parallel: {len(EXPORTS)} types)...")
         t0 = time.time()
@@ -286,7 +283,6 @@ def run_hybrid_detection(
         all_results = {}
         
         def process_type(label_folder_pair):
-            """Helper pentru procesare paralelă."""
             label, folder = label_folder_pair
             return label, _process_object_type(
                 label,
@@ -300,7 +296,6 @@ def run_hybrid_detection(
                 has_stairs=has_stairs
             )
         
-        # Procesează toate tipurile în paralel
         with ThreadPoolExecutor(max_workers=MAX_TYPE_WORKERS) as executor:
             futures = {
                 executor.submit(process_type, (label, folder)): label
@@ -314,7 +309,7 @@ def run_hybrid_detection(
         print(f"\n       ✅ All types processed in {time.time()-t0:.2f}s")
         
         # ==========================================
-        # STEP 4: VIZUALIZARE + EXPORT
+        # STEP 5: VIZUALIZARE + EXPORT FINAL
         # ==========================================
         out_img = draw_results(img, all_results, stairs_bbox)
         detections_export = export_to_json(all_results, stairs_export)
@@ -327,21 +322,14 @@ def run_hybrid_detection(
         with open(out_json_path, "w", encoding="utf-8") as f:
             json.dump(detections_export, f, indent=2, ensure_ascii=False)
         
-        # Rezumat
+        # Rezumat la consolă
         print(f"\n       ✅ Image saved: {out_image_path}")
-        print(f"       📄 JSON saved: {out_json_path}")
-        print(f"       Total: {len(detections_export)} detections")
-        
         if stairs_export:
             conf = stairs_export.get("confidence", 0)
-            print(f"       🟢 Stairs: 1 detected (conf: {conf:.2f})")
-        
-        for cls in all_results:
-            conf = len(all_results[cls]["confirm"])
-            gem = len(all_results[cls]["oblique"])
-            rej = len(all_results[cls]["reject"])
-            print(f"       🔹 {cls}: {conf} confirmed | {gem} Gemini | {rej} rejected")
-        
+            print(f"       🟢 Stairs: DETECTED (conf: {conf:.2f})")
+        else:
+            print(f"       ⚪ Stairs: None")
+
         summary = f"{len(detections_export)} detections"
         return True, summary
     
