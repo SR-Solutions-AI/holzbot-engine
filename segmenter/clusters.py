@@ -214,19 +214,27 @@ def expand_cluster(mask: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> list
     return [x1, y1, x2, y2]
 
 
-def _bgr_to_base64_png(bgr_img: np.ndarray, max_size: int = 1280) -> str:
+def _bgr_to_base64_png(bgr_img: np.ndarray, max_size: int = 2000) -> str: 
+    # Notă: max_size aici e doar pentru preview-ul rapid la AI, nu pentru crop-ul final
+    # Putem lăsa max_size mai mic pentru viteza de clasificare, 
+    # DAR pentru citirea cotelor (dacă folosești funcția asta și acolo) trebuie mai mare.
+    
     h, w = bgr_img.shape[:2]
+    
+    # Logică de resize (păstrăm existing logic dar folosim Lanczos)
     if max(h, w) > max_size:
         scale = max_size / max(h, w)
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
-        bgr_img = cv2.resize(bgr_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        bgr_img = cv2.resize(bgr_img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
     
     rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb_img)
     
     buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
+    # 🟢 SCHIMBARE: Folosim JPEG quality 95 în loc de PNG. 
+    # PNG la rezoluții mari e imens. JPEG e mult mai eficient pentru Vision AI.
+    pil_img.save(buf, format="JPEG", quality=95) 
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 

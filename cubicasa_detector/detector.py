@@ -1,4 +1,5 @@
-# new/runner/cubicasa_detector/detector.py
+
+# file: engine/cubicasa_detector/detector.py
 from __future__ import annotations
 
 import sys
@@ -6,13 +7,14 @@ import os
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F  # Necesar pentru softmax în tiling
 import json
 import math
+import requests
+import base64
 from pathlib import Path
 from PIL import Image
-
-from google import genai
-from google.genai.errors import APIError
+from io import BytesIO
 
 # ============================================
 # CONFIGURARE PATHS
@@ -46,7 +48,7 @@ except ImportError as e:
 
 
 # ============================================
-# HELPERS
+# HELPERS GENERALE
 # ============================================
 
 def ensure_dir(path):
@@ -124,11 +126,74 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
 
 
 # ============================================
-# 3D RENDERER (Adăugat din codul vechi)
+# HIGH-RES INFERENCE (TILING)
+# ============================================
+
+def predict_large_image_tiled(model, img_bgr, device, tile_size=512, stride=384, n_classes=12):
+    """
+    Rulează inferența pe bucăți (tiles) cu suprapunere și reconstruiește rezultatul.
+    Esențial pentru planuri mari unde resize-ul distruge detaliile pereților.
+    """
+    h_orig, w_orig = img_bgr.shape[:2]
+    
+    # 1. PADDING (Reflection pentru a evita margini negre dure)
+    pad_h = (tile_size - h_orig % tile_size) % tile_size
+    pad_w = (tile_size - w_orig % tile_size) % tile_size
+    
+    # Adăugăm extra bordură pentru context mai bun la margini
+    img_padded = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+    h_pad, w_pad = img_padded.shape[:2]
+    
+    # 2. CONTAINERE REZULTATE
+    # Stocăm suma probabilităților pentru cele 12 clase de structură (index 21-33 în model original)
+    accumulated_probs = torch.zeros((n_classes, h_pad, w_pad), device=device, dtype=torch.float16)
+    count_map = torch.zeros((1, h_pad, w_pad), device=device, dtype=torch.float16)
+    
+    model.eval()
+    
+    # 3. SLIDING WINDOW
+    # Stride mai mic = mai mult overlap = calitate mai bună (dar mai lent)
+    # Stride 384 la tile 512 = 25% overlap
+    
+    with torch.no_grad():
+        for y in range(0, h_pad - tile_size + 1, stride):
+            for x in range(0, w_pad - tile_size + 1, stride):
+                # Extrage crop
+                crop = img_padded[y : y+tile_size, x : x+tile_size]
+                
+                # Preprocesare identică cu resize mode
+                norm_crop = 2 * (crop.astype(np.float32) / 255.0) - 1
+                tensor = torch.from_numpy(norm_crop).float().permute(2, 0, 1).unsqueeze(0).to(device)
+                
+                # Inferență
+                output = model(tensor)
+                
+                # Extragem DOAR canalele de structură (21:33) și aplicăm Softmax
+                # Softmax e crucial pentru a media probabilitățile, nu valorile raw
+                probs = F.softmax(output[:, 21:33, :, :], dim=1)
+                
+                # Adăugăm la harta globală
+                accumulated_probs[:, y:y+tile_size, x:x+tile_size] += probs.squeeze(0)
+                count_map[:, y:y+tile_size, x:x+tile_size] += 1.0
+
+    # 4. RECONSTRUCȚIE
+    avg_probs = accumulated_probs / count_map
+    
+    # Eliminăm padding-ul
+    avg_probs = avg_probs[:, :h_orig, :w_orig]
+    
+    # Alegem clasa câștigătoare pentru fiecare pixel
+    final_pred_mask = torch.argmax(avg_probs, dim=0).cpu().numpy().astype(np.uint8)
+    
+    return final_pred_mask
+
+
+# ============================================
+# 3D RENDERER
 # ============================================
 
 def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, height=1024):
-    """Randează o previzualizare 3D simplă a modelului OBJ."""
+    """Randează o previzualizare 3D simplă."""
     if not vertices_raw or not faces_raw: return
     print("   📸 Randez previzualizarea 3D...")
     
@@ -141,10 +206,8 @@ def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, 
     
     for f_line in faces_raw: 
         parts = f_line.split()
-        # OBJ faces are 1-indexed
         faces.append([int(parts[1])-1, int(parts[2])-1, int(parts[3])-1, int(parts[4])-1])
 
-    # Rotație izometrică-ish
     angle_y = np.radians(45)
     angle_x = np.radians(30)
     
@@ -163,11 +226,8 @@ def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, 
     projected_2d = rotated_verts[:, :2] * scale
     projected_2d[:, 0] += width / 2
     projected_2d[:, 1] += height / 2
-    
-    # Flip Y pentru coordonate imagine
     projected_2d[:, 1] = height - projected_2d[:, 1]
 
-    # Sortare fețe după adâncime (Painter's algorithm simplificat)
     face_depths = []
     for idx, face in enumerate(faces): 
         face_depths.append((np.mean(rotated_verts[face, 2]), idx))
@@ -203,23 +263,18 @@ def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, 
         base_idx = vertex_count + 1
         num_pts = len(approx)
         
-        # Generăm vertecșii (jos și sus)
         for pt in approx:
             px, py = pt[0]
-            # Centrare pe (0,0) pentru model
             x = (px - w_img/2) * scale_m_px
             z = (h_img - py - h_img/2) * scale_m_px 
             
-            # Vertecs jos (y=0) și sus (y=height)
             vertices_str_list.append(f"v {x:.4f} 0.0000 {-z:.4f}")
             vertices_str_list.append(f"v {x:.4f} {wall_height_m:.4f} {-z:.4f}")
             
-        # Generăm fețele (quads)
         for k in range(num_pts):
             curr = k
             next_p = (k + 1) % num_pts
             
-            # Indici vertecși (1-based în OBJ)
             v_bl = base_idx + 2*curr
             v_tl = base_idx + 2*curr + 1
             v_br = base_idx + 2*next_p
@@ -229,7 +284,6 @@ def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, 
             
         vertex_count += 2 * num_pts
 
-    # Scriere fișier OBJ
     with open(output_path, "w") as f:
         f.write(f"# Scale: {scale_m_px} m/px\n")
         f.write(f"# Holzbot Auto-Generated 3D Model\n")
@@ -238,13 +292,12 @@ def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, 
         
     print(f"   ✅ 3D Salvat: {output_path.name}")
     
-    # Generare imagine preview
     if image_output_path:
         render_obj_to_image(vertices_str_list, faces_str_list, image_output_path)
 
 
 # ============================================
-# GEMINI API
+# GEMINI API (DIRECT REST)
 # ============================================
 
 GEMINI_PROMPT_CROP = """
@@ -265,24 +318,47 @@ Returnează DOAR JSON.
 """
 
 def call_gemini(image_path, prompt, api_key):
-    """Apel Gemini cu handling robust."""
+    """API REST Direct (v1beta)."""
     try:
-        client = genai.Client(api_key=api_key)
-        img_pil = Image.open(image_path)
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-exp',
-            contents=[prompt, img_pil]
-        )
-        reply = response.text.strip()
+        with open(image_path, 'rb') as f:
+            image_data = base64.b64encode(f.read()).decode('utf-8')
         
-        if reply.startswith("```"):
-            reply = reply[reply.find('{'):reply.rfind('}') + 1]
+        ext = Path(image_path).suffix.lower()
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
+        mime_type = mime_map.get(ext, 'image/jpeg')
         
-        if len(prompt) == len(GEMINI_PROMPT_CROP):
-            if reply.count('\n') > 3 or len(reply) > 250:
-                return None
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         
-        return json.loads(reply)
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": image_data}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1000}
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            print(f"⚠️  Gemini HTTP {response.status_code}")
+            return None
+        
+        result = response.json()
+        if 'candidates' not in result or not result['candidates']: return None
+        
+        text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
+        if not text: return None
+        
+        if text.startswith("```"):
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            if start != -1 and end > start: text = text[start:end]
+        
+        return json.loads(text)
+        
     except Exception as e:
         print(f"⚠️  Gemini error: {e}")
         return None
@@ -292,21 +368,10 @@ def call_gemini(image_path, prompt, api_key):
 # SCALE DETECTION
 # ============================================
 
-def detect_scale_from_room_labels(
-    image_path, 
-    indoor_mask, 
-    walls_mask, 
-    steps_dir,
-    min_room_area=1.0, 
-    max_room_area=300.0, 
-    api_key=None
-):
-    """
-    Detectează scala din label-uri de camere.
-    """
+def detect_scale_from_room_labels(image_path, indoor_mask, walls_mask, steps_dir, min_room_area=1.0, max_room_area=300.0, api_key=None):
+    """Detectează scala din label-uri de camere."""
     img_bgr = cv2.imread(str(image_path))
-    if img_bgr is None:
-        return None
+    if img_bgr is None: return None
     
     h, w = img_bgr.shape[:2]
 
@@ -314,8 +379,7 @@ def detect_scale_from_room_labels(
     room_candidates = []
     min_dim = min(h, w)
     kernel_size = max(3, int(min_dim / 100))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
+    if kernel_size % 2 == 0: kernel_size += 1
     
     kernel_dynamic = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     walls_dilated = cv2.dilate(walls_mask, kernel_dynamic, iterations=1)
@@ -340,38 +404,37 @@ def detect_scale_from_room_labels(
                 
                 room_idx += 1
                 coords = np.where(room_mask > 0)
-                
-                if not coords[0].size:
-                    continue
+                if not coords[0].size: continue
                 
                 y_min, y_max = coords[0].min(), coords[0].max()
                 x_min, x_max = coords[1].min(), coords[1].max()
                 
                 padding = max(5, int(min_dim / 100))
-                y_s = max(0, y_min - padding)
-                y_e = min(h, y_max + 1 + padding)
-                x_s = max(0, x_min - padding)
-                x_e = min(w, x_max + 1 + padding)
+                y_s, y_e = max(0, y_min - padding), min(h, y_max + 1 + padding)
+                x_s, x_e = max(0, x_min - padding), min(w, x_max + 1 + padding)
                 
                 crop_path = Path(steps_dir) / f"crop_{room_idx}.png"
                 cv2.imwrite(str(crop_path), img_bgr[y_s:y_e, x_s:x_e])
                 
                 print(f"      ⏳ Segment {room_idx} ({area_px} px)...")
+                
                 res = call_gemini(crop_path, GEMINI_PROMPT_CROP, api_key)
                 
                 if res and 'area_m2' in res:
-                    area_m2 = float(res['area_m2'])
-                    if min_room_area <= area_m2 <= max_room_area:
-                        room_candidates.append({
-                            "index": room_idx,
-                            "area_m2_label": area_m2,
-                            "area_px": int(area_px),
-                            "room_name": res.get('room_name', 'Unknown')
-                        })
-                        print(f"         ✅ {res.get('room_name')} -> {area_m2} m²")
-                        cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                    else:
-                        cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 0, 255), 1)
+                    try:
+                        area_m2 = float(res['area_m2'])
+                        if min_room_area <= area_m2 <= max_room_area:
+                            room_candidates.append({
+                                "index": room_idx,
+                                "area_m2_label": area_m2,
+                                "area_px": int(area_px),
+                                "room_name": res.get('room_name', 'Unknown')
+                            })
+                            print(f"         ✅ {res.get('room_name')} -> {area_m2} m²")
+                            cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                        else:
+                            cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 0, 255), 1)
+                    except ValueError: pass
                 else:
                     cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 0, 255), 1)
                 
@@ -383,70 +446,43 @@ def detect_scale_from_room_labels(
         print("      ❌ Nu s-au găsit camere valide")
         return None
 
-    # B. CALCUL SCARĂ LOCALĂ
+    # B. CALCUL SCARĂ
     area_labels = np.array([r["area_m2_label"] for r in room_candidates])
     area_pixels = np.array([r["area_px"] for r in room_candidates])
     
     num = np.sum(area_pixels * area_labels)
     den = np.sum(area_pixels ** 2)
     
-    if den == 0:
-        return None
+    if den == 0: return None
     
     m_px_local = float(np.sqrt(num / den))
     print(f"   📊 Scara Locală: {m_px_local:.9f} m/px")
 
-    # C. CALCUL SCARĂ GLOBALĂ
-    print("   🔍 Calcul Scară Globală (Suma Totală)...")
     total_indoor_px = int(np.count_nonzero(indoor_mask))
-    
     gemini_total = call_gemini(image_path, GEMINI_PROMPT_TOTAL_SUM, api_key)
     
+    sum_labels_m2 = sum(area_labels)
     if gemini_total and 'total_sum_m2' in gemini_total:
-        sum_labels_m2 = float(gemini_total['total_sum_m2'])
-        print(f"      ℹ️  Suma Gemini: {sum_labels_m2:.2f} m²")
-    else:
-        sum_labels_m2 = sum(area_labels)
-        print(f"      ℹ️  Suma Segmente: {sum_labels_m2:.2f} m²")
+        try: sum_labels_m2 = float(gemini_total['total_sum_m2'])
+        except: pass
 
-    m_px_target = math.sqrt(sum_labels_m2 / float(total_indoor_px))
+    m_px_target = math.sqrt(sum_labels_m2 / float(total_indoor_px)) if total_indoor_px > 0 else m_px_local
     suprafata_cu_camere = total_indoor_px * (m_px_local ** 2)
     
-    # D. DECIZIE FINALĂ
     final_m_px = m_px_local
     method_note = "Scară Locală"
     
     if suprafata_cu_camere < sum_labels_m2:
-        print("      ⚠️  Aria Calculată < Aria Etichetelor! Recalculez.")
         final_m_px = m_px_target
         method_note = "Forțat pe Suma Totală"
-    elif suprafata_cu_camere > sum_labels_m2 * 1.20:
-        print("      ℹ️  Aria Calculată > Aria Etichetelor. Păstrez scara locală.")
-    else:
-        print("      ✅ Valorile sunt consistente.")
     
     print(f"   ✅ Scară Finală: {final_m_px:.9f} m/px")
 
-    # E. CALCUL ERORI PER CAMERĂ
-    m_px_sq = final_m_px ** 2
-    
-    for r in room_candidates:
-        est = r["area_px"] * m_px_sq
-        err = abs(r["area_m2_label"] - est) / r["area_m2_label"] * 100
-        r["error_percent"] = round(err, 4)
-        r["area_est"] = round(est, 2)
-    
     return {
         "method": "cubicasa_gemini",
-        "meters_per_pixel": float(final_m_px),  # ✅ Explicit float
+        "meters_per_pixel": float(final_m_px),
         "rooms_used": len(room_candidates),
-        "optimization_info": {
-            "m_px_local": float(m_px_local),
-            "m_px_target": float(m_px_target),
-            "sum_labels": float(sum_labels_m2),
-            "calc_area_local": float(suprafata_cu_camere),
-            "method_note": method_note
-        },
+        "optimization_info": {"method_note": method_note},
         "per_room": room_candidates
     }
 
@@ -465,6 +501,7 @@ def run_cubicasa_detection(
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
+    Detectează automat planuri mari și aplică Tiled Inference.
     """
     image_path = Path(image_path)
     output_dir = Path(output_dir)
@@ -483,9 +520,7 @@ def run_cubicasa_detection(
         raise FileNotFoundError(f"Lipsesc weights: {model_weights_path}")
     
     checkpoint = torch.load(str(model_weights_path), map_location=device)
-    model.load_state_dict(
-        checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint
-    )
+    model.load_state_dict(checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint)
     model.to(device)
     model.eval()
 
@@ -494,34 +529,47 @@ def run_cubicasa_detection(
     h_orig, w_orig = img.shape[:2]
     save_step("00_original", img, str(steps_dir))
     
-    input_img = cv2.resize(img, (512, 512))
-    norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
-    tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
+    # DECIDEM MODUL DE DETECȚIE: RESIZE vs TILING
+    # Dacă o latură e mai mare de 1200px, trecem pe tiling pentru a nu pierde pereții subțiri
+    USE_TILING = max(h_orig, w_orig) > 1200
     
-    with torch.no_grad():
-        output = model(tensor)
-        pred_mask = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
+    if USE_TILING:
+        print(f"   🚀 Detectez plan mare (Tiled Mode 512px / Stride 384px)...")
+        # Stride 384 = overlap moderat, bun compromis viteză/calitate
+        pred_mask = predict_large_image_tiled(model, img, device, tile_size=512, stride=384)
+    else:
+        print(f"   🚀 Detectez plan standard (Resize Mode 512px)...")
+        input_img = cv2.resize(img, (512, 512))
+        norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
+        tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            output = model(tensor)
+            # Extragem structura (21-33)
+            pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
+            
+        pred_mask = cv2.resize(
+            pred_mask_small.astype('uint8'),
+            (w_orig, h_orig),
+            interpolation=cv2.INTER_NEAREST
+        )
     
-    ai_walls_raw = cv2.resize(
-        (pred_mask == 2).astype('uint8') * 255,
-        (w_orig, h_orig),
-        interpolation=cv2.INTER_NEAREST
-    )
+    # Extragem clasa perete (index 2 în structura 21:33, deci 21+2=23 în original, dar aici e mapat local)
+    # În CubiCasa original: 2 = Wall
+    ai_walls_raw = (pred_mask == 2).astype('uint8') * 255
     save_step("01_ai_walls_raw", ai_walls_raw, str(steps_dir))
 
     # 3. REPARARE PEREȚI
     print("   📐 Repar pereții...")
     min_dim = min(h_orig, w_orig)
     rep_k = max(3, int(min_dim * 0.005))
-    if rep_k % 2 == 0:
-        rep_k += 1
+    if rep_k % 2 == 0: rep_k += 1
     
     kernel_repair = cv2.getStructuringElement(cv2.MORPH_RECT, (rep_k, rep_k))
     ai_walls_closed = cv2.morphologyEx(ai_walls_raw, cv2.MORPH_CLOSE, kernel_repair, iterations=1)
     save_step("01b_ai_walls_closed", ai_walls_closed, str(steps_dir))
     
     # 4. NETEZIRE
-    print("   📐 Aplic smoothing...")
     ai_walls_smoothed = smooth_walls_mask(ai_walls_closed)
     save_step("02_ai_walls_smoothed", ai_walls_smoothed, str(steps_dir))
     
@@ -529,7 +577,7 @@ def run_cubicasa_detection(
     ai_walls_straight = straighten_mask(ai_walls_closed, 0.003)
     save_step("02_ai_walls_straight", ai_walls_straight, str(steps_dir))
 
-    # 6. ZONE (INDOOR/OUTDOOR)
+    # 6. ZONE
     print("   🌊 Analizez zonele...")
     walls_thick = cv2.dilate(ai_walls_closed, kernel_repair, iterations=3)
     h_pad, w_pad = h_orig + 2, w_orig + 2
@@ -553,11 +601,6 @@ def run_cubicasa_detection(
     total_space = np.ones_like(outdoor_mask) * 255
     occupied = cv2.bitwise_or(outdoor_mask, ai_walls_closed)
     indoor_mask = cv2.subtract(total_space, occupied)
-    
-    # Debug visualizations
-    vis_outdoor = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-    vis_outdoor[outdoor_mask > 0] = [0, 0, 255]
-    save_step("debug_zone_exterior", vis_outdoor, str(steps_dir))
     
     vis_indoor = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
     vis_indoor[indoor_mask > 0] = [0, 255, 255]
@@ -613,17 +656,9 @@ def run_cubicasa_detection(
     }
 
     print(f"   ✅ Scară: {m_px:.9f} m/px")
-    print(f"   🧱 Pereți Ext: {walls_ext_m:.2f} m")
-    print(f"   🧱 Pereți Int: {walls_int_m:.2f} m")
     print(f"   🏠 Arie Indoor: {area_indoor_m2:.2f} m²")
     
-    # ============================================
-    # 9. GENERARE 3D (NOU)
-    # ============================================
-    print("   🏗️  Pornesc generarea 3D...")
-    
-    # Generăm modelul OBJ și imaginea de previzualizare
-    # Imaginea se salvează ca 'walls_3d_view.png'
+    # 9. GENERARE 3D
     export_walls_to_obj(
         ai_walls_smoothed, 
         output_dir / "walls_3d.obj", 
@@ -631,32 +666,17 @@ def run_cubicasa_detection(
         image_output_path=output_dir / "walls_3d_view.png"
     )
 
-    # 10. SALVARE VIZUALIZĂRI 2D
-    black_vis = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-    black_vis[outline_ext_mask > 0] = [255, 0, 0]  # Roșu = exterior
-    black_vis[outline_int_mask > 0] = [0, 255, 0]  # Verde = interior
-    cv2.imwrite(str(output_dir / "final_colored_lines.png"), black_vis)
-
+    # 10. VIZUALIZĂRI
     overlay = img.copy()
     overlay[outline_ext_mask > 0] = [255, 0, 0]
     overlay[outline_int_mask > 0] = [0, 255, 0]
     cv2.imwrite(str(output_dir / "visualization_overlay.png"), overlay)
     
-    clean_overlay = img.copy()
-    clean_overlay[ai_walls_straight > 0] = [0, 255, 0]
-    cv2.imwrite(str(output_dir / "final_viz.png"), clean_overlay)
-
-    # ✅ RETURN rezultate (Path-uri actualizate)
     return {
         "scale_result": scale_result,
         "measurements": measurements,
         "masks": {
-            "walls_closed": str(steps_dir / "01b_ai_walls_closed.png"),
-            "walls_smoothed": str(steps_dir / "02_ai_walls_smoothed.png"),
-            "indoor_mask": str(steps_dir / "debug_zone_interior.png"),
-            "outdoor_mask": str(steps_dir / "debug_zone_exterior.png"),
-            "segmentation": str(steps_dir / "debug_segmentation_final.png"),
             "visualization": str(output_dir / "visualization_overlay.png"),
-            "visualization_3d": str(output_dir / "walls_3d_view.png") # <--- Aici e imaginea 3D
+            "visualization_3d": str(output_dir / "walls_3d_view.png")
         }
     }

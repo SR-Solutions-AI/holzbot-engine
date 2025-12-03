@@ -29,7 +29,7 @@ DOWNSAMPLE_TARGET_DPI = 450
 MAX_RENDER_DIM = 32750
 
 # Latura maximă a planurilor exportate (crop-uri)
-MAX_PLAN_EXPORT_LONG_EDGE = 2800  # px
+MAX_PLAN_EXPORT_LONG_EDGE = 4500  # px
 
 # ======================================================
 # Structură foldere – nume mai sugestive, fără "stepX"
@@ -150,10 +150,6 @@ def safe_imread(path: str | Path) -> np.ndarray:
 
 
 def resize_bgr_max_side(bgr: np.ndarray, max_side: int = MAX_PLAN_EXPORT_LONG_EDGE) -> np.ndarray:
-    """
-    Redimensionează imaginea BGR astfel încât latura maximă să fie <= max_side.
-    Păstrează aspect ratio. Folosește INTER_AREA (bun pentru downscale).
-    """
     h, w = bgr.shape[:2]
     long_side = max(h, w)
     if long_side <= max_side:
@@ -161,5 +157,7 @@ def resize_bgr_max_side(bgr: np.ndarray, max_side: int = MAX_PLAN_EXPORT_LONG_ED
     scale = max_side / float(long_side)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
+    
+    # 🟢 MODIFICARE: Folosim INTER_LANCZOS4 pentru a păstra detaliile fine (scrisul)
     debug_print(f"🔻 Resize plan: {(w, h)} -> {(new_w, new_h)} (max_side={max_side})")
-    return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
