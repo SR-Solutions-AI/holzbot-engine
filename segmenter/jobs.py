@@ -1,7 +1,7 @@
-# file: engine/runner/segmenter/jobs.py
+# file: engine/segmenter/jobs.py
 """
 Job runner pentru segmentare și clasificare paralelă a documentelor.
-Fiecare document primește propriul OUTPUT_DIR unic pentru thread-safety.
+✅ THREAD-SAFE: Fiecare document primește propriul OUTPUT_DIR izolat prin thread-local storage.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _segment_single_document(
     total_docs: int
 ) -> SegmentationJobResult:
     """
-    Procesează UN singur document (PDF sau imagine) în propriul OUTPUT_DIR.
+    ✅ THREAD-SAFE: Procesează UN singur document în propriul OUTPUT_DIR izolat.
     
     Args:
         doc_path: Path către document (PDF sau imagine)
@@ -62,7 +62,7 @@ def _segment_single_document(
     try:
         print(f"\n[Segmenter] ({doc_idx}/{total_docs}) Processing: {doc_path.name}", flush=True)
         
-        # ✅ CRITICAL FIX: Set OUTPUT_DIR unic pentru acest thread la început
+        # ✅ CRITICAL: Set OUTPUT_DIR thread-local IMEDIAT
         reset_output_folders(work_dir)
         set_output_dir(work_dir)
         
@@ -81,8 +81,7 @@ def _segment_single_document(
         for page_path in page_paths:
             print(f"  [Segmenter] Processing page: {page_path.name}", flush=True)
             
-            # ✅ CRITICAL FIX: Re-set OUTPUT_DIR înainte de procesarea fiecărei pagini
-            # (pentru cazul în care alt thread l-a schimbat între timp)
+            # ✅ Re-confirm OUTPUT_DIR pentru siguranță (deși e thread-local)
             set_output_dir(work_dir)
             
             # Încarcă imaginea
@@ -95,10 +94,6 @@ def _segment_single_document(
             edges = detect_outlines(no_hatch)
             thick = filter_thick_lines(edges)
             solid = solidify_walls(thick)
-            
-            # ✅ CRITICAL FIX: Re-set OUTPUT_DIR chiar înainte de detect_wall_zones
-            # Deoarece detect_wall_zones apelează 'save_debug', care depinde de global
-            set_output_dir(work_dir)
             
             # Detectează clustere (planuri)
             crops = detect_wall_zones(img, solid)
@@ -114,7 +109,7 @@ def _segment_single_document(
         
         print(f"  [Segmenter] Total clusters detected: {len(all_crops)}", flush=True)
         
-        # ✅ CRITICAL FIX: Re-set OUTPUT_DIR înainte de clasificare
+        # Clasificare (thread-safe prin work_dir)
         set_output_dir(work_dir)
         classification_results = classify_segmented_plans(work_dir)
         
@@ -162,7 +157,7 @@ def run_segmentation_for_documents(
     max_workers: int | None = None
 ) -> List[SegmentationJobResult]:
     """
-    Procesează multiple documente (PDF/imagini) în paralel.
+    ✅ THREAD-SAFE: Procesează multiple documente în paralel cu OUTPUT_DIR izolat per thread.
     
     Args:
         input_path: Path către un document sau folder cu documente
@@ -202,7 +197,7 @@ def run_segmentation_for_documents(
     results: List[SegmentationJobResult] = []
     total = len(files_to_process)
     
-    # Procesare paralelă
+    # Procesare paralelă cu thread-local storage
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         

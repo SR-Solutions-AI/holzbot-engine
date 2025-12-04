@@ -1,8 +1,9 @@
-# file: engine/runner/segmenter/common.py
+# file: engine/segmenter/common.py
 from __future__ import annotations
 
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import cv2
@@ -48,7 +49,7 @@ STEP_DIRS = {
     # masca liniilor groase
     "thick": "thick_lines",
 
-    # pereți „solidificați”
+    # pereți „solidificați"
     "solid": "solid_walls",
 
     # zone de pereți / interior-exterior
@@ -82,27 +83,34 @@ STEP_DIRS = {
     },
 }
 
-# OUTPUT_DIR global al segmenter-ului (setat de reset_output_folders)
-OUTPUT_DIR: Path = Path("segmenter_out")
+# ✅ FIX: Thread-local storage pentru OUTPUT_DIR
+_thread_local = threading.local()
 
 
 def debug_print(msg: str) -> None:
     if DEBUG:
-        print(msg)
+        print(msg, flush=True)
 
 
 def set_output_dir(output_dir: str | Path) -> None:
-    global OUTPUT_DIR
-    OUTPUT_DIR = Path(output_dir)
+    """
+    ✅ THREAD-SAFE: Setează OUTPUT_DIR specific pentru thread-ul curent
+    """
+    _thread_local.output_dir = Path(output_dir)
+    debug_print(f"[Thread {threading.current_thread().name}] OUTPUT_DIR set to: {output_dir}")
 
 
 def get_output_dir() -> Path:
-    return OUTPUT_DIR
+    """
+    ✅ THREAD-SAFE: Returnează OUTPUT_DIR specific thread-ului curent
+    """
+    return getattr(_thread_local, 'output_dir', Path("segmenter_out"))
 
 
 def reset_output_folders(output_dir: str | Path) -> None:
     """
     Resetează complet structura de foldere pentru segmentare.
+    ✅ THREAD-SAFE: Operează pe directorul specific thread-ului
     """
     set_output_dir(output_dir)
     root = get_output_dir()
@@ -124,7 +132,7 @@ def reset_output_folders(output_dir: str | Path) -> None:
 def save_debug(img: np.ndarray, subfolder: str, name: str) -> None:
     """
     Salvează imagini de debug în subfolder relativ la OUTPUT_DIR.
-    E folosit peste tot unde aveai save_debug înainte.
+    ✅ THREAD-SAFE: Folosește get_output_dir() care e thread-local
     """
     if not DEBUG:
         return
