@@ -6,49 +6,42 @@ import os
 import time
 import cv2
 import shutil
+import requests
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Dict, List, Any
 
-# Încercăm să importăm bibliotecile necesare
+# Încercăm să importăm supervision (inference_sdk nu mai e necesar critic, folosim requests)
 try:
-    from inference_sdk import InferenceHTTPClient
     import supervision as sv
 except ImportError:
-    InferenceHTTPClient = None
     sv = None
 
 def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List[Dict[str, Any]]]:
     print("\n\n" + "="*50)
-    print("🕵️  ROBOFLOW IMPORT: SMART MODE (Modified)")
+    print("🕵️  ROBOFLOW IMPORT: REQUESTS MODE (Fix)")
     print("="*50 + "\n\n")
     
-    """
-    Importă detecții de la Roboflow folosind 'supervision.InferenceSlicer'.
-    Returnează lista de predicții pentru a fi procesată ulterior.
-    """
     # 1. Verificări preliminare
-    if InferenceHTTPClient is None or sv is None:
-        print("❌ Lipsesc bibliotecile 'inference-sdk' sau 'supervision'.")
+    if sv is None:
+        print("❌ Lipsește biblioteca 'supervision'.")
         return False, []
 
     API_KEY = env.get("ROBOFLOW_API_KEY", os.getenv("ROBOFLOW_API_KEY", "")).strip()
     PROJECT = env.get("ROBOFLOW_PROJECT", os.getenv("ROBOFLOW_PROJECT", "house-plan-uwkew")).strip()
     VERSION = env.get("ROBOFLOW_VERSION", os.getenv("ROBOFLOW_VERSION", "5")).strip()
     
-    # Configurare parametri
-    raw_conf = env.get("ROBOFLOW_CONFIDENCE", "40")
-    CONFIDENCE_GLOBAL = float(raw_conf) / 100.0 if float(raw_conf) > 1.0 else float(raw_conf)
-    
-    # Prag mic pentru ferestre ca să prindem tot (se filtrează ulterior)
-    CONFIDENCE_WINDOW = 0.15  
+    # Configurare parametri - FORȚĂM CONFIDENCE MIC PENTRU A ADUCE TOT
+    # Filtrarea o vom face noi ulterior, dar vrem ca API-ul să trimită tot ce vede.
+    CONFIDENCE_REQUEST = 5 # Trimitem 5 (adică 5%) către API
+    OVERLAP_REQUEST = 50   # 50% overlap permis la server
 
     # --- CONFIGURARE SLICING ---
-    SLICING_THRESHOLD_PX = 3000  # Doar dacă e mai mare de 3000px
-    SLICE_SIZE = 2000            # Slice-uri de 2000px
-    OVERLAP_PERCENT = 0.15       # 15% Overlap
+    SLICING_THRESHOLD_PX = 3000  
+    SLICE_SIZE = 2000            
+    OVERLAP_PERCENT = 0.20       # 20% Overlap
     
-    # Calculăm overlap-ul în pixeli
+    # Calculăm overlap-ul în pixeli pentru supervision (fix warning)
     overlap_px_val = int(SLICE_SIZE * OVERLAP_PERCENT)
     SLICE_WH = (SLICE_SIZE, SLICE_SIZE)
     OVERLAP_PX = (overlap_px_val, overlap_px_val)
@@ -83,83 +76,133 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
     print(f"  🔍 Input: {plan_jpg.name} ({w_img}x{h_img} px)")
     print(f"     Project: {PROJECT}/{VERSION}")
 
-    # DECIDEM STRATEGIA: Doar dacă depășește pragul pe oricare axă
-    use_slicing = (w_img > SLICING_THRESHOLD_PX) or (h_img > SLICING_THRESHOLD_PX)
-    
-    client = InferenceHTTPClient(
-        api_url="https://detect.roboflow.com",
-        api_key=API_KEY
-    )
-    
-    detections = None
+    # URL API Roboflow
+    infer_url = f"https://detect.roboflow.com/{PROJECT}/{VERSION}"
+
+    # Helper function: Inference via Requests
+    def infer_via_requests(img_array: np.ndarray) -> sv.Detections:
+        # Codificare imagine
+        _, img_encoded = cv2.imencode('.jpg', img_array)
+        img_bytes = img_encoded.tobytes()
+        
+        params = {
+            "api_key": API_KEY,
+            "confidence": CONFIDENCE_REQUEST, 
+            "overlap": OVERLAP_REQUEST
+        }
+        
+        files = {
+            'file': ('slice.jpg', img_bytes, 'image/jpeg')
+        }
+        
+        try:
+            resp = requests.post(infer_url, params=params, files=files)
+            if resp.status_code != 200:
+                print(f"⚠️ API Error ({resp.status_code}): {resp.text}")
+                return sv.Detections.empty()
+            
+            result = resp.json()
+            
+            # --- PARSARE MANUALĂ ROBOFLOW JSON ---
+            predictions = result.get("predictions", [])
+            if not predictions:
+                return sv.Detections.empty()
+
+            xyxy = []
+            confidences = []
+            class_names = []
+            
+            for pred in predictions:
+                x, y, w, h = pred['x'], pred['y'], pred['width'], pred['height']
+                x1 = x - w / 2
+                y1 = y - h / 2
+                x2 = x + w / 2
+                y2 = y + h / 2
+                
+                xyxy.append([x1, y1, x2, y2])
+                confidences.append(pred['confidence'])
+                class_names.append(pred['class'])
+
+            if not xyxy:
+                 return sv.Detections.empty()
+
+            xyxy = np.array(xyxy)
+            confidence = np.array(confidences)
+            
+            # Generăm ID-uri numerice pentru clase
+            unique_classes = list(set(class_names))
+            class_map = {name: i for i, name in enumerate(unique_classes)}
+            class_id = np.array([class_map[name] for name in class_names])
+
+            return sv.Detections(
+                xyxy=xyxy,
+                confidence=confidence,
+                class_id=class_id,
+                data={"class_name": np.array(class_names)}
+            )
+            
+        except Exception as e:
+            print(f"❌ Exception in request: {e}")
+            return sv.Detections.empty()
+
+    # --- LOGICA DE DETECȚIE ---
     start = time.time()
-    
+    detections = None
+
     # Debug helpers
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
+    slice_counter = 0
 
-    try:
-        slice_counter = 0
+    # Funcție debug slice (salvează fiecare bucată procesată)
+    def debug_save_slice(image_slice: np.ndarray, slice_dets: sv.Detections):
+        nonlocal slice_counter
+        slice_counter += 1
+        
+        labels = []
+        if slice_dets.class_id is not None and 'class_name' in slice_dets.data:
+             for i, _ in enumerate(slice_dets.class_id):
+                conf = slice_dets.confidence[i]
+                name = slice_dets.data['class_name'][i]
+                labels.append(f"{name} {conf:.2f}")
 
-        # Funcție comună pentru desenat debug pe slices (dacă se folosește slicing)
-        def debug_callback(image_slice: np.ndarray, slice_dets: sv.Detections) -> None:
-            nonlocal slice_counter
-            slice_counter += 1
-            labels = []
-            if slice_dets.class_id is not None:
-                # Obținem numele claselor dacă sunt disponibile
-                cls_names = []
-                if slice_dets.data and 'class_name' in slice_dets.data:
-                    cls_names = slice_dets.data['class_name']
-                else:
-                    cls_names = [str(i) for i in slice_dets.class_id]
+        annotated = box_annotator.annotate(scene=image_slice.copy(), detections=slice_dets)
+        annotated = label_annotator.annotate(scene=annotated, detections=slice_dets, labels=labels)
+        cv2.imwrite(str(slices_dir / f"slice_{slice_counter}.jpg"), annotated)
 
-                for i, cls_name in enumerate(cls_names):
-                    conf = slice_dets.confidence[i]
-                    labels.append(f"{cls_name} {conf:.2f}")
+    # Decidem dacă facem Slicing sau nu
+    use_slicing = (w_img > SLICING_THRESHOLD_PX) or (h_img > SLICING_THRESHOLD_PX)
 
-            annotated = box_annotator.annotate(scene=image_slice.copy(), detections=slice_dets)
-            annotated = label_annotator.annotate(scene=annotated, detections=slice_dets, labels=labels)
-            cv2.imwrite(str(slices_dir / f"slice_{slice_counter}.jpg"), annotated)
+    if use_slicing:
+        print(f"  ✂️  Mode: SLICING ACTIVE (Imagine > {SLICING_THRESHOLD_PX}px)")
+        print(f"      Size: {SLICE_SIZE}x{SLICE_SIZE}, Overlap: {int(SLICE_SIZE * OVERLAP_PERCENT)}px")
+        
+        def callback(image_slice: np.ndarray) -> sv.Detections:
+            # Încercăm de 3 ori în caz de eroare de rețea
+            for _ in range(3):
+                dets = infer_via_requests(image_slice)
+                if len(dets) > 0: # Dacă am găsit ceva, salvăm debug
+                     debug_save_slice(image_slice, dets)
+                return dets # Returnăm rezultatul (chiar și gol)
+            return sv.Detections.empty()
 
-        if use_slicing:
-            print(f"  ✂️  Mode: SLICING ACTIVE (Imagine > {SLICING_THRESHOLD_PX}px)")
-            print(f"      Size: {SLICE_SIZE}x{SLICE_SIZE}, Overlap: {overlap_px_val}px ({int(OVERLAP_PERCENT*100)}%)")
-            
-            def callback(image_slice: np.ndarray) -> sv.Detections:
-                for _ in range(3):
-                    try:
-                        res = client.infer(image_slice, model_id=f"{PROJECT}/{VERSION}")
-                        dets = sv.Detections.from_inference(res)
-                        # Salvăm debug slice
-                        debug_callback(image_slice, dets)
-                        return dets
-                    except Exception as e:
-                        time.sleep(0.5)
-                return sv.Detections.empty()
-
-            slicer = sv.InferenceSlicer(
-                callback=callback,
-                slice_wh=SLICE_WH,
-                overlap_wh=OVERLAP_PX,
-                iou_threshold=0.5,
-                thread_workers=1
-            )
-            detections = slicer(image)
-            
-        else:
-            print(f"  📸 Mode: FULL INFERENCE (Imagine < {SLICING_THRESHOLD_PX}px)")
-            # Logica Standard
-            result = client.infer(image, model_id=f"{PROJECT}/{VERSION}")
-            detections = sv.Detections.from_inference(result)
-
-    except Exception as e:
-        print(f"❌ Eroare Inferență: {e}")
-        return False, []
+        slicer = sv.InferenceSlicer(
+            callback=callback,
+            slice_wh=SLICE_WH,
+            overlap_ratio_wh=None,       # Dezactivăm parametrul vechi
+            overlap_wh=OVERLAP_PX,       # Folosim parametrul nou (pixeli)
+            iou_threshold=0.5,           # Filtrare NMS locală între slice-uri
+            thread_workers=2             # Paralelism
+        )
+        detections = slicer(image)
+        
+    else:
+        print(f"  📸 Mode: FULL INFERENCE (Imagine < {SLICING_THRESHOLD_PX}px)")
+        detections = infer_via_requests(image)
 
     elapsed = time.time() - start
 
-    # 6. Conversie rezultat final + Filtrare Flexibilă
+    # --- POST-PROCESARE ȘI EXPORT ---
     final_predictions = []
     
     # Desenăm rezultatul pe imaginea full pentru debug final
@@ -169,29 +212,23 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
         keep_mask = []
         labels_debug = []
         
-        # Extragem clasele
-        class_names = []
-        if detections.data and 'class_name' in detections.data:
-            class_names = detections.data['class_name']
+        # Extragem numele claselor
+        class_names_list = []
+        if 'class_name' in detections.data:
+            class_names_list = detections.data['class_name']
         elif detections.class_id is not None:
-            class_names = [str(i) for i in detections.class_id]
+             class_names_list = [str(i) for i in detections.class_id]
             
-        for i, cls_raw in enumerate(class_names):
+        for i, cls_raw in enumerate(class_names_list):
             cls = str(cls_raw).lower()
             conf = detections.confidence[i]
             
-            # FILTRARE FLEXIBILĂ (conține cuvântul)
-            is_window = "window" in cls
-            is_door = "door" in cls
-            
-            is_accepted = False
-            if is_window and conf >= CONFIDENCE_WINDOW: is_accepted = True
-            elif is_door and conf >= CONFIDENCE_GLOBAL: is_accepted = True
-            elif conf >= CONFIDENCE_GLOBAL: is_accepted = True
+            # Păstrăm TOT ce vine de la API pentru a fi filtrat de detectorul hibrid
+            # Singurul filtru minim este pentru a elimina gunoaie absolute (< 5%)
+            is_accepted = conf >= 0.05
             
             keep_mask.append(is_accepted)
             
-            # Adăugăm în lista finală doar ce e acceptat
             if is_accepted:
                 bbox = detections.xyxy[i]
                 x1, y1, x2, y2 = bbox
@@ -207,9 +244,8 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
                     "confidence": float(conf)
                 })
                 
-                # Salvează crop debug
+                # Salvează crop debug (opțional)
                 try:
-                    # Asigură coordonate valide
                     y1c, y2c = max(0, int(y1)), min(h_img, int(y2))
                     x1c, x2c = max(0, int(x1)), min(w_img, int(x2))
                     if x2c > x1c and y2c > y1c:
@@ -229,7 +265,6 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
             debug_img = box_annotator.annotate(scene=debug_img, detections=detections_filtered)
             debug_img = label_annotator.annotate(scene=debug_img, detections=detections_filtered, labels=labels_filtered)
 
-    # Salvează imaginea de ansamblu cu detecții
     cv2.imwrite(str(debug_dir / "full_debug.jpg"), debug_img)
 
     print(f"  ✅ {len(final_predictions)} detecții în {elapsed:.2f}s")
