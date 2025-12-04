@@ -20,8 +20,7 @@ except ImportError:
 
 def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List[Dict[str, Any]]]:
     print("\n\n" + "="*50)
-    print("🕵️  DEBUG MODE ACTIVAT: SLICING & CROPS")
-    print("Se vor salva poze în folderul 'debug_roboflow'")
+    print("🕵️  ROBOFLOW IMPORT: SMART MODE (Modified)")
     print("="*50 + "\n\n")
     
     """
@@ -41,11 +40,18 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
     raw_conf = env.get("ROBOFLOW_CONFIDENCE", "40")
     CONFIDENCE_GLOBAL = float(raw_conf) / 100.0 if float(raw_conf) > 1.0 else float(raw_conf)
     
-    # IMPORTANT: Setăm praguri mai mici aici pentru a lăsa 'detector.py' să decidă via Template/Gemini
-    # Vrem să "prindem" tot ce ar putea fi fereastră.
+    # Prag mic pentru ferestre ca să prindem tot (se filtrează ulterior)
     CONFIDENCE_WINDOW = 0.15  
-    SLICE_WH = (1280, 1280)
-    OVERLAP_PX = (int(SLICE_WH[0] * 0.25), int(SLICE_WH[1] * 0.25))
+
+    # --- CONFIGURARE SLICING ---
+    SLICING_THRESHOLD_PX = 3000  # Doar dacă e mai mare de 3000px
+    SLICE_SIZE = 2000            # Slice-uri de 2000px
+    OVERLAP_PERCENT = 0.15       # 15% Overlap
+    
+    # Calculăm overlap-ul în pixeli
+    overlap_px_val = int(SLICE_SIZE * OVERLAP_PERCENT)
+    SLICE_WH = (SLICE_SIZE, SLICE_SIZE)
+    OVERLAP_PX = (overlap_px_val, overlap_px_val)
 
     if not API_KEY:
         print("❌ ROBOFLOW_API_KEY lipsește din environment")
@@ -62,18 +68,30 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
     crops_dir = debug_dir / "crops"
     
     if debug_dir.exists():
-        try:
-            shutil.rmtree(debug_dir)
-        except Exception:
-            pass
+        try: shutil.rmtree(debug_dir)
+        except: pass
     
     slices_dir.mkdir(parents=True, exist_ok=True)
     crops_dir.mkdir(parents=True, exist_ok=True)
     # ---------------------------
 
-    print(f"  🔍 Roboflow Slicing: {plan_jpg.name}")
-    print(f"     Global Conf: {CONFIDENCE_GLOBAL}, Window Conf: {CONFIDENCE_WINDOW}")
+    # Citire imagine
+    image = cv2.imread(str(plan_jpg))
+    if image is None: return False, []
+    h_img, w_img = image.shape[:2]
     
+    print(f"  🔍 Input: {plan_jpg.name} ({w_img}x{h_img} px)")
+    print(f"     Project: {PROJECT}/{VERSION}")
+
+    # DECIDEM STRATEGIA: Doar dacă depășește pragul pe oricare axă
+    use_slicing = (w_img > SLICING_THRESHOLD_PX) or (h_img > SLICING_THRESHOLD_PX)
+    
+    client = InferenceHTTPClient(
+        api_url="https://detect.roboflow.com",
+        api_key=API_KEY
+    )
+    
+    detections = None
     start = time.time()
     
     # Debug helpers
@@ -81,148 +99,149 @@ def run_roboflow_import(env: Dict[str, str], work_dir: Path) -> Tuple[bool, List
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
 
     try:
-        # 2. Inițializare Client
-        client = InferenceHTTPClient(
-            api_url="https://detect.roboflow.com",
-            api_key=API_KEY
-        )
-
         slice_counter = 0
 
-        # 3. Definire funcție de callback
-        def callback(image_slice: np.ndarray) -> sv.Detections:
+        # Funcție comună pentru desenat debug pe slices (dacă se folosește slicing)
+        def debug_callback(image_slice: np.ndarray, slice_dets: sv.Detections) -> None:
             nonlocal slice_counter
             slice_counter += 1
+            labels = []
+            if slice_dets.class_id is not None:
+                # Obținem numele claselor dacă sunt disponibile
+                cls_names = []
+                if slice_dets.data and 'class_name' in slice_dets.data:
+                    cls_names = slice_dets.data['class_name']
+                else:
+                    cls_names = [str(i) for i in slice_dets.class_id]
+
+                for i, cls_name in enumerate(cls_names):
+                    conf = slice_dets.confidence[i]
+                    labels.append(f"{cls_name} {conf:.2f}")
+
+            annotated = box_annotator.annotate(scene=image_slice.copy(), detections=slice_dets)
+            annotated = label_annotator.annotate(scene=annotated, detections=slice_dets, labels=labels)
+            cv2.imwrite(str(slices_dir / f"slice_{slice_counter}.jpg"), annotated)
+
+        if use_slicing:
+            print(f"  ✂️  Mode: SLICING ACTIVE (Imagine > {SLICING_THRESHOLD_PX}px)")
+            print(f"      Size: {SLICE_SIZE}x{SLICE_SIZE}, Overlap: {overlap_px_val}px ({int(OVERLAP_PERCENT*100)}%)")
             
-            max_retries = 3
-            last_err = None
-            detections = None
+            def callback(image_slice: np.ndarray) -> sv.Detections:
+                for _ in range(3):
+                    try:
+                        res = client.infer(image_slice, model_id=f"{PROJECT}/{VERSION}")
+                        dets = sv.Detections.from_inference(res)
+                        # Salvăm debug slice
+                        debug_callback(image_slice, dets)
+                        return dets
+                    except Exception as e:
+                        time.sleep(0.5)
+                return sv.Detections.empty()
+
+            slicer = sv.InferenceSlicer(
+                callback=callback,
+                slice_wh=SLICE_WH,
+                overlap_wh=OVERLAP_PX,
+                iou_threshold=0.5,
+                thread_workers=1
+            )
+            detections = slicer(image)
             
-            # A. Retry Logic
-            for attempt in range(max_retries):
-                try:
-                    result = client.infer(image_slice, model_id=f"{PROJECT}/{VERSION}")
-                    detections = sv.Detections.from_inference(result)
-                    break
-                except Exception as e:
-                    last_err = e
-                    time.sleep((attempt + 1) * 1.5)
-            
-            if detections is None:
-                print(f"    ⚠️ Slice {slice_counter} failed: {last_err}")
-                raise last_err
-
-            # B. Procesare și Salvare Debug
-            status_labels = []
-            
-            # Facem o copie pentru debug
-            debug_slice = image_slice.copy()
-            h_img, w_img = image_slice.shape[:2]
-
-            if detections.data is not None and 'class_name' in detections.data:
-                class_names = detections.data['class_name']
-                
-                for i, cls in enumerate(class_names):
-                    conf = detections.confidence[i]
-                    bbox = detections.xyxy[i].astype(int)
-                    x1, y1, x2, y2 = bbox
-                    
-                    # Decidem culoarea (doar vizual, aici păstrăm tot ce vine de la API)
-                    # Verde daca e peste prag, Rosu daca e sub (dar tot il pastram pentru downstream)
-                    is_strong = conf >= CONFIDENCE_WINDOW
-                    color = (0, 255, 0) if is_strong else (0, 0, 255)
-                    
-                    status_text = "STRONG" if is_strong else "WEAK"
-                    status_labels.append(f"{cls} {conf:.2f}")
-
-                    # --- SALVARE CROP (Zoom In) ---
-                    # Asigurăm coordonate valide
-                    x1_c, y1_c = max(0, x1), max(0, y1)
-                    x2_c, y2_c = min(w_img, x2), min(h_img, y2)
-                    
-                    if x2_c > x1_c and y2_c > y1_c:
-                        crop = image_slice[y1_c:y2_c, x1_c:x2_c].copy()
-                        
-                        # Adăugăm bordură colorată
-                        crop = cv2.copyMakeBorder(crop, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=color)
-                        
-                        # Nume fișier
-                        safe_cls = cls.replace(" ", "_")
-                        filename = f"{status_text}_{safe_cls}_{conf:.2f}_s{slice_counter}_id{i}.jpg"
-                        cv2.imwrite(str(crops_dir / filename), crop)
-
-            # Salvăm Slice-ul desenat
-            annotated_slice = box_annotator.annotate(scene=debug_slice, detections=detections)
-            annotated_slice = label_annotator.annotate(scene=annotated_slice, detections=detections, labels=status_labels)
-            cv2.imwrite(str(slices_dir / f"slice_{slice_counter}.jpg"), annotated_slice)
-
-            # C. Returnăm TOATE detecțiile găsite de Roboflow
-            # Nu filtram aici drastic, lăsăm 'detector.py' să facă validarea fină
-            return detections
-
-        # 4. Citire imagine
-        image = cv2.imread(str(plan_jpg))
-        if image is None:
-            return False, []
-
-        # 5. Rulare Slicer
-        slicer = sv.InferenceSlicer(
-            callback=callback,
-            slice_wh=SLICE_WH,
-            overlap_wh=OVERLAP_PX, 
-            overlap_ratio_wh=None,
-            iou_threshold=0.5,
-            thread_workers=1 # Un singur worker pentru a nu bloca salvarea debug
-        )
-        
-        detections = slicer(image)
+        else:
+            print(f"  📸 Mode: FULL INFERENCE (Imagine < {SLICING_THRESHOLD_PX}px)")
+            # Logica Standard
+            result = client.infer(image, model_id=f"{PROJECT}/{VERSION}")
+            detections = sv.Detections.from_inference(result)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Eroare Inferență: {e}")
         return False, []
 
     elapsed = time.time() - start
 
-    # 6. Conversie rezultat
+    # 6. Conversie rezultat final + Filtrare Flexibilă
     final_predictions = []
     
-    for i in range(len(detections)):
-        bbox = detections.xyxy[i]
-        conf = detections.confidence[i]
-        cls_id = detections.class_id[i]
-        
-        cls_name = str(cls_id)
-        if detections.data is not None and 'class_name' in detections.data:
-             cls_name = detections.data['class_name'][i]
-
-        x1, y1, x2, y2 = bbox
-        width = x2 - x1
-        height = y2 - y1
-        x = x1 + width / 2
-        y = y1 + height / 2
-
-        final_predictions.append({
-            "x": float(x),
-            "y": float(y),
-            "width": float(width),
-            "height": float(height),
-            "class": cls_name,
-            "class_id": int(cls_id),
-            "confidence": float(conf)
-        })
-
-    print(f"  ✅ {len(final_predictions)} detecții brute (Slicing) în {elapsed:.2f}s")
+    # Desenăm rezultatul pe imaginea full pentru debug final
+    debug_img = image.copy()
     
-    # 7. Salvare JSON (pentru referință)
+    if detections:
+        keep_mask = []
+        labels_debug = []
+        
+        # Extragem clasele
+        class_names = []
+        if detections.data and 'class_name' in detections.data:
+            class_names = detections.data['class_name']
+        elif detections.class_id is not None:
+            class_names = [str(i) for i in detections.class_id]
+            
+        for i, cls_raw in enumerate(class_names):
+            cls = str(cls_raw).lower()
+            conf = detections.confidence[i]
+            
+            # FILTRARE FLEXIBILĂ (conține cuvântul)
+            is_window = "window" in cls
+            is_door = "door" in cls
+            
+            is_accepted = False
+            if is_window and conf >= CONFIDENCE_WINDOW: is_accepted = True
+            elif is_door and conf >= CONFIDENCE_GLOBAL: is_accepted = True
+            elif conf >= CONFIDENCE_GLOBAL: is_accepted = True
+            
+            keep_mask.append(is_accepted)
+            
+            # Adăugăm în lista finală doar ce e acceptat
+            if is_accepted:
+                bbox = detections.xyxy[i]
+                x1, y1, x2, y2 = bbox
+                w = x2 - x1
+                h = y2 - y1
+                cx = x1 + w / 2
+                cy = y1 + h / 2
+                
+                final_predictions.append({
+                    "x": float(cx), "y": float(cy), 
+                    "width": float(w), "height": float(h),
+                    "class": cls,
+                    "confidence": float(conf)
+                })
+                
+                # Salvează crop debug
+                try:
+                    # Asigură coordonate valide
+                    y1c, y2c = max(0, int(y1)), min(h_img, int(y2))
+                    x1c, x2c = max(0, int(x1)), min(w_img, int(x2))
+                    if x2c > x1c and y2c > y1c:
+                        crop = image[y1c:y2c, x1c:x2c]
+                        safe_name = cls.replace(" ", "_").replace("/", "-")
+                        cv2.imwrite(str(crops_dir / f"{safe_name}_{i}_{conf:.2f}.jpg"), crop)
+                except: pass
+
+            labels_debug.append(f"{cls} {conf:.2f}")
+
+        # Desenare Debug Final
+        mask_arr = np.array(keep_mask, dtype=bool)
+        if len(mask_arr) > 0 and mask_arr.any():
+            detections_filtered = detections[mask_arr]
+            labels_filtered = np.array(labels_debug)[mask_arr]
+            
+            debug_img = box_annotator.annotate(scene=debug_img, detections=detections_filtered)
+            debug_img = label_annotator.annotate(scene=debug_img, detections=detections_filtered, labels=labels_filtered)
+
+    # Salvează imaginea de ansamblu cu detecții
+    cv2.imwrite(str(debug_dir / "full_debug.jpg"), debug_img)
+
+    print(f"  ✅ {len(final_predictions)} detecții în {elapsed:.2f}s")
+    
+    # Salvare JSON
     final_json = {
         "predictions": final_predictions,
-        "image": {"width": image.shape[1], "height": image.shape[0]}
+        "image": {"width": w_img, "height": h_img}
     }
     
     detections_dir = work_dir / "export_objects"
     detections_dir.mkdir(parents=True, exist_ok=True)
     (detections_dir / "detections.json").write_text(json.dumps(final_json), encoding="utf-8")
 
-    # RETURNĂM LISTA, nu doar un string
     return True, final_predictions
