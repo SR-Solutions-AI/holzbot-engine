@@ -1,8 +1,9 @@
-# new/runner/count_objects/jobs.py
+# file: engine/count_objects/jobs.py
 from __future__ import annotations
 
 import os
 import json
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,31 +35,35 @@ def _run_for_single_plan(
     plan: PlanInfo,
     total_plans: int
 ) -> CountObjectsJobResult:
-    """
-    Rulează Count Objects folosind fișierul detections.json generat în pasul anterior.
-    """
+    # 1. Configurare directoare curente
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
-    # 1. Identificăm directoarele sursă
-    # Pasul anterior (detections) a rulat aici:
-    detections_step_dir = work_dir.parent.parent / "detections" / plan.plan_id
+    # 2. Identificare resurse din etapele ANTERIOARE
+    # Structura: runner/output/<RUN_ID>/<STAGE>/<PLAN_ID>
+    run_output_root = work_dir.parent.parent
     
-    plan_jpg = detections_step_dir / "plan.jpg"
-    detections_json = detections_step_dir / "export_objects" / "detections.json"
+    # A. Din DETECTIONS (pentru JSON-ul cu candidați)
+    detections_dir = run_output_root / "detections" / plan.plan_id
+    plan_jpg = detections_dir / "plan.jpg"
+    detections_json = detections_dir / "export_objects" / "detections.json"
     
-    # Directorul de export curent
-    exports_dir = detections_step_dir / "export_objects" / "exports"
+    # B. Din SCALE (pentru masca outdoor)
+    scale_dir = run_output_root / "scale" / plan.plan_id
+    outdoor_mask_path = scale_dir / "cubicasa_steps" / "03_outdoor_mask.png"
     
-    # Validări
+    # Directorul unde salvăm noi rezultatele finale
+    exports_dir = detections_dir / "export_objects" / "exports" # Salvăm tot în structura detections pentru consistență
+    
+    # Validări fișiere critice
     if not plan_jpg.exists():
-        # Fallback: poate e în folderul curent?
+        # Încercăm fallback local
         if (work_dir / "plan.jpg").exists():
             plan_jpg = work_dir / "plan.jpg"
         else:
-            return CountObjectsJobResult(plan.plan_id, work_dir, False, f"Lipsă plan.jpg (căutat în {detections_step_dir})")
+            return CountObjectsJobResult(plan.plan_id, work_dir, False, "Lipsă plan.jpg (nici în detections, nici local)")
 
-    # Configurare API (pentru scări și verificări)
+    # Configurare API Roboflow (pentru scări, dacă e nevoie)
     api_key = os.getenv("ROBOFLOW_API_KEY", "")
     roboflow_config = {
         "api_key": api_key,
@@ -70,22 +75,23 @@ def _run_for_single_plan(
     try:
         print(f"[{STAGE_NAME}] Processing {plan.plan_id}...", flush=True)
         
-        # 2. ÎNCĂRCARE CANDIDAȚI DE PE DISC
+        # 3. ÎNCĂRCARE DATE DE PE DISC
         candidates = []
         if detections_json.exists():
             try:
                 with open(detections_json, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     candidates = data.get("predictions", [])
-                print(f"       📂 Loaded {len(candidates)} candidates from disk.", flush=True)
+                print(f"       📂 Loaded {len(candidates)} candidates from {detections_json.name}", flush=True)
             except Exception as e:
-                print(f"       ⚠️ Error reading detections.json: {e}", flush=True)
+                print(f"       ⚠️ JSON Corrupt: {e}", flush=True)
         else:
-            print(f"       ⚠️ detections.json not found at {detections_json}. Logic will fallback/fail.", flush=True)
+            print(f"       ⚠️ detections.json missing at {detections_json}", flush=True)
 
-        # 3. RULARE HYBRID DETECTION
-        # Trimitem calea către JSON (sau lista încărcată)
-        print(f"       🧠 Starting Validation Logic (Template + AI)...", flush=True)
+        # 4. RULARE VALIDARE
+        print(f"       🧠 Starting Hybrid Validation...", flush=True)
+        if outdoor_mask_path.exists():
+            print(f"       🏞️  Found outdoor mask: {outdoor_mask_path.name}", flush=True)
         
         success, message = run_hybrid_detection(
             plan_image=plan_jpg,
@@ -93,18 +99,19 @@ def _run_for_single_plan(
             output_dir=work_dir,
             roboflow_config=roboflow_config,
             total_plans=total_plans,
-            external_predictions=candidates # Aici intră datele de pe disc
+            external_predictions=candidates,   # <--- Aici intră lista citită de pe disc
+            outdoor_mask_path=outdoor_mask_path # <--- Aici intră masca
         )
         
-        return CountObjectsJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=success,
-            message=message
-        )
+        # 5. NOTIFICARE UI (Live Feed) - Imaginea Portocalie
+        orange_img = work_dir / "final_orange.jpg"
+        if success and orange_img.exists():
+            # Mesaj special pentru orchestrator/backend
+            print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(orange_img)}", flush=True)
+        
+        return CountObjectsJobResult(plan.plan_id, work_dir, success, message)
     
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return CountObjectsJobResult(plan.plan_id, work_dir, False, str(e))
 
