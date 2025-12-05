@@ -535,6 +535,37 @@ def classify_image_robust(
 # FUNCȚIA PRINCIPALĂ DE CLASIFICARE (INTERFAȚĂ COMPATIBILĂ)
 # ============================================================================
 
+def add_white_padding(src: Path, dst: Path, padding_pct: float = 0.10) -> None:
+    """
+    Adaugă un contur alb procentual în jurul imaginii.
+    padding_pct = 0.10 înseamnă 10% din dimensiunea respectivă pe fiecare latură.
+    """
+    try:
+        img = cv2.imread(str(src))
+        if img is None:
+            # Dacă nu putem citi imaginea, facem doar copy
+            shutil.copy(str(src), str(dst))
+            return
+
+        h, w = img.shape[:2]
+        pad_h = int(h * padding_pct)
+        pad_w = int(w * padding_pct)
+
+        # Adăugăm bordura albă (Value: [255, 255, 255])
+        img_padded = cv2.copyMakeBorder(
+            img, 
+            pad_h, pad_h, pad_w, pad_w, 
+            cv2.BORDER_CONSTANT, 
+            value=[255, 255, 255]
+        )
+        
+        cv2.imwrite(str(dst), img_padded)
+        
+    except Exception as e:
+        debug_print(f"⚠️ Eroare la adăugare padding pentru {src.name}: {e}")
+        shutil.copy(str(src), str(dst))
+
+
 def classify_segmented_plans(segmentation_out: str | Path) -> list[ClassificationResult]:
     """
     Clasifică planurile decupate de segmenter.
@@ -599,7 +630,12 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
         
         dst_dir = label_to_dir[result.label]
         dst = dst_dir / img_file.name
-        shutil.copy(str(img_file), str(dst))
+        
+        # ✅ LOGICĂ NOUĂ: Dacă este house_blueprint, adăugăm padding alb
+        if result.label == "house_blueprint":
+            add_white_padding(img_file, dst, padding_pct=0.10)
+        else:
+            shutil.copy(str(img_file), str(dst))
         
         # Update path în rezultat
         result.image_path = dst

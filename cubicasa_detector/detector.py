@@ -1,4 +1,3 @@
-
 # file: engine/cubicasa_detector/detector.py
 from __future__ import annotations
 
@@ -7,7 +6,7 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F  # Necesar pentru softmax în tiling
+import torch.nn.functional as F
 import json
 import math
 import requests
@@ -123,69 +122,6 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
     room_mask = (mask[1:-1, 1:-1] != 0).astype(np.uint8) * 255
     area_px = int(np.count_nonzero(room_mask))
     return room_mask, area_px, (x0, y0)
-
-
-# ============================================
-# HIGH-RES INFERENCE (TILING)
-# ============================================
-
-def predict_large_image_tiled(model, img_bgr, device, tile_size=512, stride=384, n_classes=12):
-    """
-    Rulează inferența pe bucăți (tiles) cu suprapunere și reconstruiește rezultatul.
-    Esențial pentru planuri mari unde resize-ul distruge detaliile pereților.
-    """
-    h_orig, w_orig = img_bgr.shape[:2]
-    
-    # 1. PADDING (Reflection pentru a evita margini negre dure)
-    pad_h = (tile_size - h_orig % tile_size) % tile_size
-    pad_w = (tile_size - w_orig % tile_size) % tile_size
-    
-    # Adăugăm extra bordură pentru context mai bun la margini
-    img_padded = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-    h_pad, w_pad = img_padded.shape[:2]
-    
-    # 2. CONTAINERE REZULTATE
-    # Stocăm suma probabilităților pentru cele 12 clase de structură (index 21-33 în model original)
-    accumulated_probs = torch.zeros((n_classes, h_pad, w_pad), device=device, dtype=torch.float16)
-    count_map = torch.zeros((1, h_pad, w_pad), device=device, dtype=torch.float16)
-    
-    model.eval()
-    
-    # 3. SLIDING WINDOW
-    # Stride mai mic = mai mult overlap = calitate mai bună (dar mai lent)
-    # Stride 384 la tile 512 = 25% overlap
-    
-    with torch.no_grad():
-        for y in range(0, h_pad - tile_size + 1, stride):
-            for x in range(0, w_pad - tile_size + 1, stride):
-                # Extrage crop
-                crop = img_padded[y : y+tile_size, x : x+tile_size]
-                
-                # Preprocesare identică cu resize mode
-                norm_crop = 2 * (crop.astype(np.float32) / 255.0) - 1
-                tensor = torch.from_numpy(norm_crop).float().permute(2, 0, 1).unsqueeze(0).to(device)
-                
-                # Inferență
-                output = model(tensor)
-                
-                # Extragem DOAR canalele de structură (21:33) și aplicăm Softmax
-                # Softmax e crucial pentru a media probabilitățile, nu valorile raw
-                probs = F.softmax(output[:, 21:33, :, :], dim=1)
-                
-                # Adăugăm la harta globală
-                accumulated_probs[:, y:y+tile_size, x:x+tile_size] += probs.squeeze(0)
-                count_map[:, y:y+tile_size, x:x+tile_size] += 1.0
-
-    # 4. RECONSTRUCȚIE
-    avg_probs = accumulated_probs / count_map
-    
-    # Eliminăm padding-ul
-    avg_probs = avg_probs[:, :h_orig, :w_orig]
-    
-    # Alegem clasa câștigătoare pentru fiecare pixel
-    final_pred_mask = torch.argmax(avg_probs, dim=0).cpu().numpy().astype(np.uint8)
-    
-    return final_pred_mask
 
 
 # ============================================
@@ -501,7 +437,7 @@ def run_cubicasa_detection(
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
-    Detectează automat planuri mari și aplică Tiled Inference.
+    ACUM FOLOSEȘTE DOAR RESIZE LA 512x512 (fără Tiling).
     """
     image_path = Path(image_path)
     output_dir = Path(output_dir)
@@ -519,45 +455,44 @@ def run_cubicasa_detection(
     if not model_weights_path.exists():
         raise FileNotFoundError(f"Lipsesc weights: {model_weights_path}")
     
-    # FIX: Adaugam weights_only=False pentru a permite incarcarea modelelor mai vechi/complexe
     checkpoint = torch.load(str(model_weights_path), map_location=device, weights_only=False)
     
     model.load_state_dict(checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint)
     model.to(device)
     model.eval()
 
-    # 2. PREPROCESARE & INFERENȚĂ
+    # 2. PREPROCESARE & INFERENȚĂ (SIMPLIFIED RESIZE)
     img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"Nu pot citi imaginea: {image_path}")
+        
     h_orig, w_orig = img.shape[:2]
     save_step("00_original", img, str(steps_dir))
     
-    # DECIDEM MODUL DE DETECȚIE: RESIZE vs TILING
-    # Dacă o latură e mai mare de 1200px, trecem pe tiling pentru a nu pierde pereții subțiri
-    USE_TILING = max(h_orig, w_orig) > 1200
+    print(f"   🚀 Detectez plan (Resize Mode 512px) - FORCED...")
     
-    if USE_TILING:
-        print(f"   🚀 Detectez plan mare (Tiled Mode 512px / Stride 384px)...")
-        # Stride 384 = overlap moderat, bun compromis viteză/calitate
-        pred_mask = predict_large_image_tiled(model, img, device, tile_size=512, stride=384)
-    else:
-        print(f"   🚀 Detectez plan standard (Resize Mode 512px)...")
-        input_img = cv2.resize(img, (512, 512))
-        norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
-        tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
+    # Resize direct la 512x512
+    input_img = cv2.resize(img, (512, 512))
+    
+    # Normalizare specifică CubiCasa
+    norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
+    tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
+    
+    # Inferență
+    with torch.no_grad():
+        output = model(tensor)
+        # Extragem structura (canale 21-33)
+        # Argmax ne dă indexul clasei dominante
+        pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
         
-        with torch.no_grad():
-            output = model(tensor)
-            # Extragem structura (21-33)
-            pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
-            
-        pred_mask = cv2.resize(
-            pred_mask_small.astype('uint8'),
-            (w_orig, h_orig),
-            interpolation=cv2.INTER_NEAREST
-        )
+    # Resize înapoi la dimensiunea originală
+    pred_mask = cv2.resize(
+        pred_mask_small.astype('uint8'),
+        (w_orig, h_orig),
+        interpolation=cv2.INTER_NEAREST
+    )
     
-    # Extragem clasa perete (index 2 în structura 21:33, deci 21+2=23 în original, dar aici e mapat local)
-    # În CubiCasa original: 2 = Wall
+    # Extragem clasa perete (index 2 în structura 21:33)
     ai_walls_raw = (pred_mask == 2).astype('uint8') * 255
     save_step("01_ai_walls_raw", ai_walls_raw, str(steps_dir))
 
