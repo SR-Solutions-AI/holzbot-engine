@@ -273,7 +273,7 @@ def run_segmentation_and_classification_for_document(
         with Timer("STEP 12: Area") as t:
             run_area_for_run(run_id)
             
-            area_out_dir = RUNNER_ROOT / "output" / run_id / "area"
+            area_out_dir = RUNNER_ROOT / "output" / run_id / "scale"
             
             found_any_image = False
             if area_out_dir.exists():
