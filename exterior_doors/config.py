@@ -9,4 +9,4 @@ COLOR_GREEN     = (0, 255, 0)    # Interior Door Box (Verde)
 
 # Parametri clasificare
 # O ușă e exterioară dacă distanța până la masca de outdoor este <= jumătate din diagonala ei
-MAX_DISTANCE_RATIO = 0.5
+MAX_DISTANCE_RATIO = 0.4
