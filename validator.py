@@ -10,7 +10,7 @@ from PIL import Image
 from openai import OpenAI
 
 # Config
-MAX_DIMENSION = 1000  # Limita cerută de tine (anulăm dacă e mai mare)
+MAX_DIMENSION = 1500  # Limita cerută de tine (anulăm dacă e mai mare)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 def validate_plan(file_url):
