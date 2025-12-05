@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,11 +15,6 @@ from config.settings import (
 )
 
 from .detector import run_hybrid_detection
-
-# ✅ IMPORTĂM MODULUL DE SLICING (pe care l-am modificat anterior)
-# Asigură-te că fișierul detections/roboflow_import.py este cel actualizat!
-from detections.roboflow_import import run_roboflow_import
-
 
 STAGE_NAME = "count_objects"
 
@@ -38,92 +34,58 @@ def _run_for_single_plan(
     plan: PlanInfo,
     total_plans: int
 ) -> CountObjectsJobResult:
-    """Rulează Slicing + Hybrid Detection pentru un singur plan."""
+    """
+    Rulează Count Objects folosind fișierul detections.json generat în pasul anterior.
+    """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
-    # Directorul unde se află imaginea originală plan.jpg
-    detections_dir = work_dir.parent.parent / "detections" / plan.plan_id
-    plan_jpg = detections_dir / "plan.jpg"
+    # 1. Identificăm directoarele sursă
+    # Pasul anterior (detections) a rulat aici:
+    detections_step_dir = work_dir.parent.parent / "detections" / plan.plan_id
     
+    plan_jpg = detections_step_dir / "plan.jpg"
+    detections_json = detections_step_dir / "export_objects" / "detections.json"
+    
+    # Directorul de export curent
+    exports_dir = detections_step_dir / "export_objects" / "exports"
+    
+    # Validări
     if not plan_jpg.exists():
-        return CountObjectsJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message=f"Nu găsesc plan.jpg în {detections_dir}"
-        )
-    
-    exports_dir = detections_dir / "export_objects" / "exports"
-    
-    if not exports_dir.exists():
-        return CountObjectsJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message=f"Nu găsesc exports_dir în {exports_dir}"
-        )
-    
-    # Configurare Roboflow
-    api_key = os.getenv("ROBOFLOW_API_KEY", "")
-    workspace = os.getenv("ROBOFLOW_WORKSPACE", "blueprint-recognition")
-    project = os.getenv("ROBOFLOW_PROJECT", "house-plan-uwkew")
-    version_str = os.getenv("ROBOFLOW_VERSION", "5")
-    
-    if not api_key:
-        return CountObjectsJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message="ROBOFLOW_API_KEY lipsește"
-        )
+        # Fallback: poate e în folderul curent?
+        if (work_dir / "plan.jpg").exists():
+            plan_jpg = work_dir / "plan.jpg"
+        else:
+            return CountObjectsJobResult(plan.plan_id, work_dir, False, f"Lipsă plan.jpg (căutat în {detections_step_dir})")
 
+    # Configurare API (pentru scări și verificări)
+    api_key = os.getenv("ROBOFLOW_API_KEY", "")
     roboflow_config = {
         "api_key": api_key,
-        "workspace": workspace,
-        "project": project,
-        "version": int(version_str)
+        "workspace": os.getenv("ROBOFLOW_WORKSPACE", "blueprint-recognition"),
+        "project": os.getenv("ROBOFLOW_PROJECT", "house-plan-uwkew"),
+        "version": int(os.getenv("ROBOFLOW_VERSION", "5"))
     }
     
     try:
-        print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → Processing... "
-            f"(total_plans={total_plans}, cwd={work_dir})",
-            flush=True,
-        )
+        print(f"[{STAGE_NAME}] Processing {plan.plan_id}...", flush=True)
         
-        # =========================================================================
-        # PASUL 1: RULARE SLICING (Pentru a prinde obiecte mici/multe)
-        # =========================================================================
-        print(f"       🚀 [SLICING] Running Roboflow Slicing first...", flush=True)
-        
-        # Configurare env pentru slicing
-        slicing_env = {
-            "ROBOFLOW_API_KEY": api_key,
-            "ROBOFLOW_PROJECT": project,
-            "ROBOFLOW_VERSION": version_str,
-            # Setăm confidence mic ca să luăm tot, detectorul va filtra ulterior
-            "ROBOFLOW_CONFIDENCE": "15" 
-        }
-        
-        # Apelăm funcția de import (modificată să returneze lista)
-        # Atenție: folderul de lucru pentru slicing este cel unde e plan.jpg (detections_dir)
-        slicing_success, slicing_predictions = run_roboflow_import(
-            env=slicing_env, 
-            work_dir=detections_dir 
-        )
-        
-        external_preds = None
-        if slicing_success and isinstance(slicing_predictions, list):
-            print(f"       ✅ [SLICING] Success! Found {len(slicing_predictions)} raw candidates.", flush=True)
-            external_preds = slicing_predictions
+        # 2. ÎNCĂRCARE CANDIDAȚI DE PE DISC
+        candidates = []
+        if detections_json.exists():
+            try:
+                with open(detections_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    candidates = data.get("predictions", [])
+                print(f"       📂 Loaded {len(candidates)} candidates from disk.", flush=True)
+            except Exception as e:
+                print(f"       ⚠️ Error reading detections.json: {e}", flush=True)
         else:
-            print(f"       ⚠️ [SLICING] Failed or no data. Falling back to standard detection.", flush=True)
+            print(f"       ⚠️ detections.json not found at {detections_json}. Logic will fallback/fail.", flush=True)
 
-        # =========================================================================
-        # PASUL 2: RULARE HYBRID DETECTION (Validare + Scări + Gemini)
-        # =========================================================================
-        print(f"       🧠 [HYBRID] validating candidates...", flush=True)
+        # 3. RULARE HYBRID DETECTION
+        # Trimitem calea către JSON (sau lista încărcată)
+        print(f"       🧠 Starting Validation Logic (Template + AI)...", flush=True)
         
         success, message = run_hybrid_detection(
             plan_image=plan_jpg,
@@ -131,8 +93,7 @@ def _run_for_single_plan(
             output_dir=work_dir,
             roboflow_config=roboflow_config,
             total_plans=total_plans,
-            # Trimitem predicțiile din slicing către detector
-            external_predictions=external_preds 
+            external_predictions=candidates # Aici intră datele de pe disc
         )
         
         return CountObjectsJobResult(
@@ -145,16 +106,10 @@ def _run_for_single_plan(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return CountObjectsJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message=f"Eroare: {e}"
-        )
+        return CountObjectsJobResult(plan.plan_id, work_dir, False, str(e))
 
 
 def run_count_objects_for_run(run_id: str, max_parallel: int | None = None) -> List[CountObjectsJobResult]:
-    """Punct de intrare pentru etapa „count_objects" (hybrid detection)."""
     try:
         plans: List[PlanInfo] = load_plan_infos(run_id, stage_name=STAGE_NAME)
     except PlansListError as e:
@@ -162,45 +117,17 @@ def run_count_objects_for_run(run_id: str, max_parallel: int | None = None) -> L
         return []
     
     total = len(plans)
-    print(f"\n📌 [{STAGE_NAME}] {total} planuri găsite pentru RUN_ID={run_id}\n", flush=True)
-    
     if max_parallel is None:
         cpu_count = os.cpu_count() or 4
         max_parallel = max(2, min(cpu_count, total))
     
-    print(f"⚙️  [{STAGE_NAME}] rulez cu max_parallel = {max_parallel}\n", flush=True)
-    
-    results: List[CountObjectsJobResult] = []
-    
+    results = []
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {
-            executor.submit(
-                _run_for_single_plan,
-                run_id,
-                idx,
-                total,
-                plan,
-                total  # TRANSMITE total_plans
-            ): plan
+            executor.submit(_run_for_single_plan, run_id, idx, total, plan, total): plan
             for idx, plan in enumerate(plans, start=1)
         }
-        
         for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            status = "✅" if res.success else "❌"
-            print(
-                f"{status} [{STAGE_NAME}] {res.plan_id} "
-                f"({res.work_dir}) → {res.message[:200]}",
-                flush=True,
-            )
-    
-    failed = [r for r in results if not r.success]
-    if failed:
-        print(f"\n⚠️ [{STAGE_NAME}] unele planuri au eșuat:")
-        for r in failed:
-            print(f"   - {r.plan_id}: {r.message[:300]}")
-    else:
-        print(f"\n✅ [{STAGE_NAME}] toate planurile au trecut etapa count_objects.")
-    
+            results.append(fut.result())
+            
     return results

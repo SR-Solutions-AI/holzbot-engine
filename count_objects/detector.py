@@ -1,20 +1,27 @@
-# new/runner/count_objects/detector.py
+# engine/count_objects/detector.py
+"""
+Hybrid Detector UPDATE:
+1. Outdoor Mask Filter (>75% white pixels -> REJECT).
+2. Gemini primește poză de REFERINȚĂ (cel mai bun detectat din plan).
+3. Export imagine finală Portocalie pentru UI.
+"""
 from __future__ import annotations
 
 import json
 import time
 import shutil
 import cv2
+import numpy as np
+import os
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict, List, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import (
     CONF_THRESHOLD,
     OVERLAP,
-    TEMPLATE_SIMILARITY,
-    GEMINI_THRESHOLD_MIN,
-    GEMINI_THRESHOLD_MAX,
     ROBOFLOW_MAIN_PROJECT,
     ROBOFLOW_MAIN_VERSION,
     MAX_TYPE_WORKERS
@@ -24,152 +31,301 @@ from .preprocessing import load_templates
 from .template_matching import process_detections_parallel
 from .gemini_verification import verify_candidates_parallel
 from .stairs_detection import process_stairs
-from .visualization import draw_results, export_to_json
+from .visualization import draw_results, draw_final_orange, export_to_json
 
+# ==========================================
+# DATA STRUCTURES
+# ==========================================
 
-def _norm_class(c: str) -> str:
-    """Normalizează numele clasei."""
-    return (c or "").lower().replace("_", "-").strip()
+class ValidationSource(Enum):
+    ROBOFLOW_DIRECT = "roboflow_direct"
+    TEMPLATE_STRONG = "template_strong"
+    GEMINI_CONFIRMED = "gemini_confirmed"
+    REJECTED_LOW_SCORE = "rejected_low_score"
+    REJECTED_OVERLAP = "rejected_overlap"
+    REJECTED_STAIRS = "rejected_stairs_overlap"
+    REJECTED_GEMINI = "rejected_gemini"
+    REJECTED_OUTDOOR = "rejected_outdoor_mask" # NOU
+    REJECTED_EMPTY = "rejected_empty_crop"
 
-
-def _fetch_roboflow_data(plan_image: Path, roboflow_config: dict):
-    """(Legacy) Fetch Roboflow data în paralel: scări + uși/ferestre simultan."""
-    def get_stairs():
-        return process_stairs(plan_image, roboflow_config["api_key"])
+@dataclass
+class DetectionRecord:
+    idx: int
+    class_name: str
+    bbox: Tuple[int, int, int, int]
+    confidence: float
+    template_similarity: float
+    combined_score: float
+    validation_source: ValidationSource
+    reason: str
+    details: Dict = None
     
-    def get_main():
-        return infer_roboflow(
-            plan_image,
-            roboflow_config["api_key"],
-            roboflow_config["workspace"],
-            ROBOFLOW_MAIN_PROJECT,
-            ROBOFLOW_MAIN_VERSION,
-            confidence=CONF_THRESHOLD,
-            overlap=OVERLAP
-        )
-    
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_stairs = executor.submit(get_stairs)
-        future_main = executor.submit(get_main)
-        return future_stairs.result(), future_main.result()
+    def to_dict(self):
+        d = asdict(self)
+        d['validation_source'] = self.validation_source.value
+        return d
 
+# ==========================================
+# HELPER: OUTDOOR CHECK
+# ==========================================
+
+def _is_outdoors(bbox: Tuple[int, int, int, int], mask: np.ndarray, threshold: float = 0.75) -> Tuple[bool, float]:
+    """
+    Verifică dacă bbox-ul cade pe zona albă (outdoor) a măștii.
+    Returnează (True dacă e outdoor, procentaj_alb).
+    """
+    if mask is None:
+        return False, 0.0
+    
+    x1, y1, x2, y2 = bbox
+    # Clamp coordinates
+    h, w = mask.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    
+    if x2 <= x1 or y2 <= y1:
+        return False, 0.0
+        
+    crop = mask[y1:y2, x1:x2]
+    
+    # Numărăm pixelii albi (sau foarte deschiși > 240)
+    # CubiCasa mask: alb = outdoor/empty, negru/gri = indoor/walls
+    white_pixels = np.sum(crop > 240)
+    total_pixels = crop.size
+    
+    if total_pixels == 0:
+        return False, 0.0
+        
+    ratio = white_pixels / total_pixels
+    return ratio > threshold, ratio
+
+# ==========================================
+# DEBUG SAVER
+# ==========================================
+
+def save_detection_debug(debug_root: Path, img_color: np.ndarray, record: DetectionRecord):
+    try:
+        status = "REJECTED" if record.validation_source.value.startswith("rejected") else "ACCEPTED"
+        src_clean = record.validation_source.value.replace("rejected_", "").replace("roboflow_", "")
+        
+        folder_name = f"{record.idx:04d}_{record.class_name}_{status}_{src_clean}"
+        save_path = debug_root / folder_name
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        with open(save_path / "info.json", "w", encoding="utf-8") as f:
+            json.dump(record.to_dict(), f, indent=2, ensure_ascii=False)
+            
+        h, w = img_color.shape[:2]
+        x1, y1, x2, y2 = record.bbox
+        pad = 60
+        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+        cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+        
+        crop = img_color[cy1:cy2, cx1:cx2].copy()
+        color = (0, 0, 255) if status == "REJECTED" else (0, 255, 0)
+        rx1, ry1 = x1 - cx1, y1 - cy1
+        rx2, ry2 = x2 - cx1, y2 - cy1
+        
+        cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), color, 2)
+        txt = f"{record.reason} ({record.confidence:.2f})"
+        cv2.putText(crop, txt, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        cv2.imwrite(str(save_path / "context.jpg"), crop)
+    except Exception as e:
+        print(f"⚠️ Failed saving debug for #{record.idx}: {e}")
+
+# ==========================================
+# OVERLAP CHECK
+# ==========================================
+
+def _check_overlap_all(bbox, used_boxes, has_stairs):
+    from .template_matching import overlap
+    if has_stairs and used_boxes:
+        if overlap(bbox, used_boxes[0]) > 0.25:
+            return True, "stairs", overlap(bbox, used_boxes[0])
+    other = used_boxes[1:] if has_stairs else used_boxes
+    for ob in other:
+        if overlap(bbox, ob) > 0.75:
+            return True, "detection", overlap(bbox, ob)
+    return False, None, 0.0
+
+# ==========================================
+# PROCESSOR
+# ==========================================
 
 def _process_object_type(
-    label: str,
-    folder: Path,
-    preds_filtered: list,
-    gray_image,
-    img_width: int,
-    img_height: int,
-    used_boxes: list,
-    temp_dir: Path,
-    has_stairs: bool = False
-) -> dict:
-    """Procesează un tip de obiect (door/window/etc) complet (Template + Gemini)."""
-    print(f"\n       {'='*50}")
-    print(f"       {label.upper()}")
-    print(f"       {'='*50}")
+    label: str, folder: Path, preds_low: list, preds_high: list,
+    color_img, gray_img, w, h, used_boxes, temp_dir, debug_dir, 
+    has_stairs, outdoor_mask
+) -> Dict:
     
+    print(f"\n       {'='*30} {label.upper()} {'='*30}")
     templates = load_templates(folder)
     if not templates:
-        print(f"       [WARN] No templates for {label}")
-        return {"confirm": [], "oblique": [], "reject": []}
+        print(f"       [WARN] No templates for {label}. Low conf will be skipped.")
+        templates = {} 
+
+    def is_relevant(p):
+        cls = (str(p.get("class", ""))).lower().replace("_", "-").strip()
+        if label == "door" and ("door" in cls and "double" not in cls): return True
+        elif label == "double-door" and ("double" in cls and "door" in cls): return True
+        elif label == "window" and ("window" in cls and "double" not in cls): return True
+        elif label == "double-window" and ("double" in cls and "window" in cls): return True
+        return False
+
+    relevant_low = [p for p in preds_low if is_relevant(p)]
+    relevant_high = [p for p in preds_high if is_relevant(p)]
     
-    print(f"       Loaded {len(templates)} template variations")
+    results = {"confirm": [], "oblique": [], "reject": [], "records": []}
     
-    # Filtrează predicții relevante pentru acest tip (ex: doar 'door')
-    relevant = []
-    for p in preds_filtered:
-        cls = _norm_class(str(p.get("class", "")))
-        if label == "door" and ("door" in cls and "double" not in cls):
-            relevant.append(p)
-        elif label == "double-door" and ("double" in cls and "door" in cls):
-            relevant.append(p)
-        elif label == "window" and ("window" in cls and "double" not in cls):
-            relevant.append(p)
-        elif label == "double-window" and ("double" in cls and "window" in cls):
-            relevant.append(p)
-    
-    print(f"       Found {len(relevant)} relevant predictions for {label}")
-    
-    if not relevant:
-        return {"confirm": [], "oblique": [], "reject": []}
-    
-    # Procesare PARALELĂ a tuturor detecțiilor
-    print(f"       🔄 Template matching (parallel)...")
-    t0 = time.time()
-    
-    processed = process_detections_parallel(
-        relevant,
-        gray_image,
-        templates,
-        used_boxes,
-        img_width,
-        img_height,
-        has_stairs=has_stairs
-    )
-    
-    print(f"       ✅ Template matching done in {time.time()-t0:.2f}s")
-    
-    # Clasificare rezultate
-    results = {"confirm": [], "oblique": [], "reject": []}
-    candidates_for_gemini = []
-    
-    for res in processed:
-        if res["skip"]:
-            continue
+    # -------------------------------------------------------------------------
+    # GĂSIM REFERINȚA PENTRU GEMINI (Cel mai bun High Conf)
+    # -------------------------------------------------------------------------
+    reference_crop_path = None
+    if relevant_high:
+        # Primul din listă are confidence cel mai mare (sunt sortate în run_hybrid_detection)
+        best_p = relevant_high[0]
+        bx, by, bw, bh = best_p["x"], best_p["y"], best_p["width"], best_p["height"]
+        bx1, by1 = int(bx - bw/2), int(by - bh/2)
+        bx2, by2 = int(bx + bw/2), int(by + bh/2)
         
-        # Scoruri: Best Similarity (Pixel) + Confidence (Roboflow)
-        print(f"       #{res['idx']} conf={res['conf']:.2f}, sim={res['best_sim']:.3f}, combined={res['combined']:.3f}")
+        # Salvăm crop-ul de referință
+        ref_crop = gray_img[max(0, by1):min(h, by2), max(0, bx1):min(w, bx2)]
+        if ref_crop.size > 0:
+            reference_crop_path = temp_dir / f"ref_{label}.jpg"
+            cv2.imwrite(str(reference_crop_path), ref_crop)
+            print(f"       ⭐ Reference found: {best_p['confidence']:.2f}")
+    
+    # Dacă nu am găsit referință high-conf, folosim un template generic din folder
+    if not reference_crop_path and templates:
+        generic_tmpl = list(folder.glob("*.png"))[0]
+        reference_crop_path = generic_tmpl
+        print(f"       ⚠️ No high conf ref. Using generic template: {generic_tmpl.name}")
+
+    # -------------------------------------------------------------------------
+    # A. LOW CONFIDENCE (TEMPLATE MATCHING -> GEMINI)
+    # -------------------------------------------------------------------------
+    if relevant_low and templates:
+        processed_low = process_detections_parallel(relevant_low, gray_img, templates, used_boxes, w, h, has_stairs)
+        candidates_gemini = []
         
-        # 1. Confirmare puternică prin Template Matching
-        if res["combined"] >= GEMINI_THRESHOLD_MAX and res["best_sim"] > TEMPLATE_SIMILARITY:
-            results["confirm"].append(res["bbox"])
-            used_boxes.append(res["bbox"])
-            print(f"       ✅ CONFIRMED (template)")
-        
-        # 2. Respingere clară
-        elif res["combined"] < GEMINI_THRESHOLD_MIN:
-            results["reject"].append(res["bbox"])
-            print(f"       ❌ REJECTED (low score)")
-        
-        # 3. Zona gri -> Gemini
-        else:
-            x1, y1, x2, y2 = res["bbox"]
-            crop = gray_image[y1:y2, x1:x2]
-            tmp_path = temp_dir / f"maybe_{label}_{res['idx']}.jpg"
-            cv2.imwrite(str(tmp_path), crop)
+        for res in processed_low:
+            bbox = res["bbox"]
+            rec = None
             
-            candidates_for_gemini.append({
-                "idx": res["idx"],
-                "bbox": res["bbox"],
-                "tmp_path": tmp_path,
-                "label": label
-            })
-            print(f"       🔍 → Gemini verification")
-    
-    # Verificare Gemini PARALELIZAT
-    if candidates_for_gemini:
-        print(f"\n       🧠 Gemini verification ({len(candidates_for_gemini)} candidates)...")
-        try:
-            sample_template = next(folder.glob("*.png"))
-            t0 = time.time()
-            gemini_results = verify_candidates_parallel(candidates_for_gemini, sample_template, temp_dir)
-            print(f"       ✅ Gemini done in {time.time()-t0:.2f}s")
-            
-            for cand in candidates_for_gemini:
-                if gemini_results.get(cand["idx"], False):
-                    results["oblique"].append(cand["bbox"])
-                    used_boxes.append(cand["bbox"])
-                    print(f"       #{cand['idx']} 🔄 GEMINI CONFIRMED")
+            # 1. OUTDOOR CHECK
+            is_out, ratio = _is_outdoors(bbox, outdoor_mask)
+            if is_out:
+                rec = DetectionRecord(res["idx"], label, bbox, res["conf"], 0, 0, 
+                                      ValidationSource.REJECTED_OUTDOOR, f"Outdoor {ratio:.0%}", {})
+                results["reject"].append(bbox)
+                if rec: results["records"].append(rec); save_detection_debug(debug_dir, color_img, rec)
+                continue
+
+            # 2. INTERNAL OVERLAP CHECKS
+            if res["skip"]:
+                reason = res.get("skip_reason", "err")
+                src = ValidationSource.REJECTED_STAIRS if "stairs" in reason else ValidationSource.REJECTED_OVERLAP
+                rec = DetectionRecord(res["idx"], label, bbox, res["conf"], 0, 0, src, reason, {})
+                results["reject"].append(bbox)
+            else:
+                sim = res["best_sim"]
+                combined = res["combined"]
+                conf = res["conf"]
+                
+                # REGULA: > 95% SIMILARITY -> ACCEPT
+                if sim > 0.95:
+                    rec = DetectionRecord(res["idx"], label, bbox, conf, sim, combined,
+                                          ValidationSource.TEMPLATE_STRONG, f"Sim {sim:.2f} > 0.95", {})
+                    results["confirm"].append(bbox)
+                    used_boxes.append(bbox)
+                
                 else:
+                    # Fallback Gemini
+                    if combined < 0.20:
+                        rec = DetectionRecord(res["idx"], label, bbox, conf, sim, combined,
+                                              ValidationSource.REJECTED_LOW_SCORE, f"Score {combined:.2f} too low", {})
+                        results["reject"].append(bbox)
+                    else:
+                        x1, y1, x2, y2 = bbox
+                        crop = gray_img[y1:y2, x1:x2]
+                        p = temp_dir / f"check_{label}_{res['idx']}.jpg"
+                        cv2.imwrite(str(p), crop)
+                        candidates_gemini.append({**res, "tmp_path": p, "label": label})
+                        continue 
+            
+            if rec:
+                results["records"].append(rec)
+                save_detection_debug(debug_dir, color_img, rec)
+
+        # GEMINI BATCH
+        if candidates_gemini:
+            print(f"       🧠 Gemini checking {len(candidates_gemini)} candidates...")
+            
+            # Trimitem referința (cel mai bun obiect) la Gemini
+            if reference_crop_path:
+                gem_res = verify_candidates_parallel(candidates_gemini, reference_crop_path, temp_dir)
+                for cand in candidates_gemini:
+                    ok = gem_res.get(cand["idx"], False)
+                    src = ValidationSource.GEMINI_CONFIRMED if ok else ValidationSource.REJECTED_GEMINI
+                    status_text = "Gemini Confirmed" if ok else "Gemini Rejected"
+                    
+                    rec = DetectionRecord(cand["idx"], label, cand["bbox"], cand["conf"], cand["best_sim"], 
+                                          cand["combined"], src, f"{status_text} (Sim={cand['best_sim']:.2f})", 
+                                          {"gemini": ok})
+                    
+                    if ok:
+                        results["oblique"].append(cand["bbox"])
+                        used_boxes.append(cand["bbox"])
+                    else:
+                        results["reject"].append(cand["bbox"])
+                    
+                    results["records"].append(rec)
+                    save_detection_debug(debug_dir, color_img, rec)
+            else:
+                print("       ❌ Skipping Gemini (No reference image available)")
+                # Reject all waiting candidates
+                for cand in candidates_gemini:
+                    rec = DetectionRecord(cand["idx"], label, cand["bbox"], cand["conf"], 0, 0, 
+                                          ValidationSource.REJECTED_GEMINI, "No Reference for AI", {})
                     results["reject"].append(cand["bbox"])
-                    print(f"       #{cand['idx']} ❌ REJECTED (Gemini)")
-        except Exception as e:
-            print(f"       [WARN] Gemini skip: {e}")
-            for cand in candidates_for_gemini:
-                results["reject"].append(cand["bbox"])
-    
+                    results["records"].append(rec)
+                    save_detection_debug(debug_dir, color_img, rec)
+
+    # -------------------------------------------------------------------------
+    # B. HIGH CONFIDENCE (DIRECT ACCEPT)
+    # -------------------------------------------------------------------------
+    for idx, p in enumerate(relevant_high, start=3000):
+        conf = float(p.get("confidence", 0))
+        cx, cy, cw, ch = p["x"], p["y"], p["width"], p["height"]
+        x1, y1 = int(cx - cw/2), int(cy - ch/2)
+        x2, y2 = int(cx + cw/2), int(cy + ch/2)
+        bbox = (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+        
+        # 1. OUTDOOR CHECK
+        is_out, ratio = _is_outdoors(bbox, outdoor_mask)
+        if is_out:
+            rec = DetectionRecord(idx, label, bbox, conf, 0, conf, 
+                                  ValidationSource.REJECTED_OUTDOOR, f"Outdoor {ratio:.0%}", {})
+            results["reject"].append(bbox)
+            results["records"].append(rec)
+            save_detection_debug(debug_dir, color_img, rec)
+            continue
+
+        # 2. OVERLAP CHECK
+        is_ov, o_type, o_val = _check_overlap_all(bbox, used_boxes, has_stairs)
+        if is_ov:
+            src = ValidationSource.REJECTED_STAIRS if o_type == "stairs" else ValidationSource.REJECTED_OVERLAP
+            rec = DetectionRecord(idx, label, bbox, conf, 0, conf, src, f"Overlap {o_val:.2f}", {})
+            results["reject"].append(bbox)
+        else:
+            rec = DetectionRecord(idx, label, bbox, conf, 0, conf, ValidationSource.ROBOFLOW_DIRECT, "High Confidence", {})
+            results["confirm"].append(bbox)
+            used_boxes.append(bbox)
+        
+        results["records"].append(rec)
+        save_detection_debug(debug_dir, color_img, rec)
+
     return results
 
 
@@ -179,77 +335,67 @@ def run_hybrid_detection(
     output_dir: Path,
     roboflow_config: dict,
     total_plans: int = 1,
-    external_predictions: list = None # <--- ARGUMENT NOU
+    external_predictions: list = None,
+    outdoor_mask_path: Path = None # <--- PARAMETRU NOU
 ) -> Tuple[bool, str]:
     """
-    Rulează pipeline-ul de validare. 
-    Integrează Slicing Results (Doors/Windows) cu modelul specializat de Scări.
+    Pipeline Hybrid:
+    - Încarcă masca outdoor.
+    - Filtrează detecțiile "afară".
+    - Trimite crop de referință la Gemini.
+    - Exportă imagine portocalie pentru UI.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = output_dir / "temp"
-    
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
+    if temp_dir.exists(): shutil.rmtree(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"       [CLEANUP] Temp folder ready: {temp_dir}")
-    
+    debug_dir = output_dir / "debug_crops"
+    if debug_dir.exists(): shutil.rmtree(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}\n 🔍 VALIDATION & DEBUG PIPELINE \n{'='*60}")
+
     try:
-        # ==========================================
-        # STEP 1: OBȚINERE DETECȚII (EXTERN + SCĂRI)
-        # ==========================================
-        
-        all_detections = []
+        # Load Images
+        img_color = cv2.imread(str(plan_image))
+        if img_color is None: return False, "Cannot read plan image"
+        img_gray = cv2.equalizeHist(cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY))
+        h, w = img_color.shape[:2]
+
+        # Load Outdoor Mask
+        outdoor_mask = None
+        if outdoor_mask_path and outdoor_mask_path.exists():
+            print(f"       🏞️  Loading outdoor mask: {outdoor_mask_path.name}")
+            mask_raw = cv2.imread(str(outdoor_mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask_raw is not None:
+                # Resize la dimensiunea planului curent (siguranță)
+                outdoor_mask = cv2.resize(mask_raw, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            print("       ⚠️  Outdoor mask not found. Skipping outdoor filter.")
+
+        # Stairs
         stairs_bbox = None
         stairs_export = {}
-
-        # 1.A. DETECTARE SCĂRI (OBLIGATORIU)
-        # Rulăm detectia de scări separat pentru că modelul de slicing 
-        # (house-plan) poate să nu aibă scări bune.
-        print(f"       [STAIRS] Running specialized stairs detection...")
         try:
-            # Folosim funcția dedicată din stairs_detection.py
             stairs_bbox, stairs_export = process_stairs(plan_image, roboflow_config["api_key"])
-            if stairs_bbox:
-                print(f"       [STAIRS] ✅ Found stairs at {stairs_bbox}")
-            else:
-                print(f"       [STAIRS] No stairs found.")
-        except Exception as e:
-            print(f"       [STAIRS] ⚠️ Error detecting stairs: {e}")
+        except: pass
 
-        # 1.B. DETECȚII PRINCIPALE (Doors/Windows)
-        if external_predictions is not None:
-            print(f"       🚀 USING EXTERNAL DETECTIONS (Slicing input: {len(external_predictions)} objects)")
-            # Folosim ce a venit din slicing
-            all_detections = external_predictions
-        else:
-            # Fallback la metoda veche (Inferență pe toată imaginea)
-            print(f"       [FALLBACK] Using standard full-image inference...")
-            rf_result = infer_roboflow(
-                plan_image,
-                roboflow_config["api_key"],
-                roboflow_config["workspace"],
-                ROBOFLOW_MAIN_PROJECT,
-                ROBOFLOW_MAIN_VERSION,
-                confidence=CONF_THRESHOLD,
-                overlap=OVERLAP
-            )
-            all_detections = rf_result.get("predictions", [])
+        # Predictions
+        all_detections = external_predictions if external_predictions else []
+        preds_filtered = [p for p in all_detections if float(p.get("confidence", 0)) >= 0.10]
+        preds_filtered.sort(key=lambda x: float(x.get("confidence", 0)), reverse=True)
+        
+        preds_low = [p for p in preds_filtered if 0.10 <= float(p.get("confidence", 0)) < 0.50]
+        preds_high = [p for p in preds_filtered if float(p.get("confidence", 0)) >= 0.50]
 
-        # Filtrare sumară (eliminăm erorile grosolane, sub 10%)
-        # Notă: Slicing-ul ne poate da obiecte cu 15-20% pe care vrem să le verificăm
-        preds_filtered = [p for p in all_detections if float(p.get("confidence", 0.0)) >= 0.10]
-        print(f"       Processing {len(preds_filtered)} potential objects through Pipeline...")
-        
-        # ==========================================
-        # STEP 2: PREPROCESARE IMAGINE
-        # ==========================================
-        img = cv2.imread(str(plan_image))
-        if img is None:
-            return False, f"Cannot read image: {plan_image}"
-        
-        gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-        img_height, img_width = img.shape[:2]
+        print(f"       📊 Input: {len(all_detections)} | High: {len(preds_high)} | Low: {len(preds_low)}")
+
+        used_boxes = []
+        if stairs_bbox:
+            used_boxes.append((stairs_bbox["x1"], stairs_bbox["y1"], stairs_bbox["x2"], stairs_bbox["y2"]))
+            has_stairs = True
+        else: has_stairs = False
         
         EXPORTS = {
             "door": exports_dir / "door",
@@ -258,82 +404,48 @@ def run_hybrid_detection(
             "double-window": exports_dir / "double_window"
         }
         
-        # ==========================================
-        # STEP 3: EXCLUDERE ZONA SCĂRILOR
-        # ==========================================
-        used_boxes = []
-        has_stairs = False
-        
-        if stairs_bbox:
-            stairs_box = (
-                stairs_bbox["x1"],
-                stairs_bbox["y1"],
-                stairs_bbox["x2"],
-                stairs_bbox["y2"]
-            )
-            used_boxes.append(stairs_box)
-            has_stairs = True
-        
-        # ==========================================
-        # STEP 4: PROCESARE TIPURI OBIECTE - PARALEL
-        # ==========================================
-        print(f"\n       [STEP] Processing object types (parallel: {len(EXPORTS)} types)...")
-        t0 = time.time()
-        
         all_results = {}
-        
-        def process_type(label_folder_pair):
-            label, folder = label_folder_pair
-            return label, _process_object_type(
-                label,
-                folder,
-                preds_filtered,
-                gray,
-                img_width,
-                img_height,
-                used_boxes,
-                temp_dir,
-                has_stairs=has_stairs
-            )
-        
-        with ThreadPoolExecutor(max_workers=MAX_TYPE_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=4) as exc:
             futures = {
-                executor.submit(process_type, (label, folder)): label
+                exc.submit(_process_object_type, label, folder, preds_low, preds_high, 
+                           img_color, img_gray, w, h, used_boxes, temp_dir, debug_dir, 
+                           has_stairs, outdoor_mask): label
                 for label, folder in EXPORTS.items()
             }
-            
-            for future in as_completed(futures):
-                label, results = future.result()
-                all_results[label] = results
-        
-        print(f"\n       ✅ All types processed in {time.time()-t0:.2f}s")
-        
-        # ==========================================
-        # STEP 5: VIZUALIZARE + EXPORT FINAL
-        # ==========================================
-        out_img = draw_results(img, all_results, stairs_bbox)
-        detections_export = export_to_json(all_results, stairs_export)
-        
-        out_image_path = output_dir / "plan_detected_all_hybrid.jpg"
-        out_json_path = output_dir / "detections_all.json"
-        
-        cv2.imwrite(str(out_image_path), out_img)
-        
-        with open(out_json_path, "w", encoding="utf-8") as f:
-            json.dump(detections_export, f, indent=2, ensure_ascii=False)
-        
-        # Rezumat la consolă
-        print(f"\n       ✅ Image saved: {out_image_path}")
-        if stairs_export:
-            conf = stairs_export.get("confidence", 0)
-            print(f"       🟢 Stairs: DETECTED (conf: {conf:.2f})")
-        else:
-            print(f"       ⚪ Stairs: None")
+            for f in as_completed(futures):
+                all_results[futures[f]] = f.result()
 
-        summary = f"{len(detections_export)} detections"
-        return True, summary
-    
+        # Export Visualization
+        # 1. Debug detaliat (culori diverse)
+        viz = draw_results(img_color, all_results, stairs_bbox)
+        cv2.imwrite(str(output_dir / "detections_all_enhanced.jpg"), viz)
+        
+        # 2. Final UI (Portocaliu)
+        viz_orange = draw_final_orange(img_color, all_results, stairs_bbox)
+        orange_path = output_dir / "final_orange.jpg"
+        cv2.imwrite(str(orange_path), viz_orange)
+        
+        meta = {"image": plan_image.name, "time": time.time()}
+        full_json = export_detailed_json(all_results, stairs_export, meta)
+        
+        with open(output_dir / "detections_detailed.json", "w") as f:
+            json.dump(full_json, f, indent=2)
+            
+        legacy = []
+        if stairs_export: legacy.append(stairs_export)
+        for lbl, res in all_results.items():
+            if "confirm" in res:
+                for b in res["confirm"]: legacy.append({"type": lbl, "status": "confirmed", "x1":b[0], "y1":b[1], "x2":b[2], "y2":b[3]})
+            if "oblique" in res:
+                for b in res["oblique"]: legacy.append({"type": lbl, "status": "gemini", "x1":b[0], "y1":b[1], "x2":b[2], "y2":b[3]})
+        
+        with open(output_dir / "detections_all.json", "w") as f:
+            json.dump(legacy, f, indent=2)
+
+        cnt = len([d for d in full_json["detections"] if "rejected" not in d.get("validation_source", "")])
+        return True, f"Validated: {cnt}"
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return False, f"Error: {e}"
+        return False, str(e)
