@@ -2,6 +2,8 @@
 # ------------------------------------------------------------
 # Clasificare ULTRA-ROBUSTĂ cu dual-model validation
 # GPT-4o + Gemini (Auto-Fallback) + Fast Failover Logic
+# + Detectare și Eliminare Duplicate Clusters (Simple AI Comparison)
+# + Verificare Măsurători Camere pentru Confirmare Duplicate
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -12,10 +14,12 @@ import shutil
 import io
 import base64
 import time
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Any
 from enum import Enum
+from collections import defaultdict, Counter
 
 import cv2
 import numpy as np
@@ -35,9 +39,9 @@ ALLOWED_LABELS: set[str] = {"house_blueprint", "site_blueprint", "side_view", "t
 
 class ConfidenceLevel(Enum):
     """Nivel de încredere în clasificare"""
-    HIGH = "high"      # Acord unanim sau Single Model Success (celălalt a eșuat)
-    MEDIUM = "medium"  # De acord după arbitraj
-    LOW = "low"        # Doar heuristici locale
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 
 @dataclass
@@ -49,6 +53,14 @@ class ClassificationResult:
     gpt_vote: Optional[str] = None
     gemini_vote: Optional[str] = None
     arbitration_rounds: int = 0
+
+
+@dataclass
+class DuplicateGroup:
+    """Grup de clustere duplicate (păstrăm cel mai mare)"""
+    keep_cluster: Path
+    remove_clusters: list[Path]
+    ai_response: str
 
 
 # ============================================================================
@@ -105,19 +117,16 @@ def prep_for_vlm(img_path: str | Path, min_long_edge: int = 1280) -> Image.Image
             scale = min_long_edge / float(long_edge)
             im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         
-        # Sharpening pentru detalii mai clare
         im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
         return im
     except Exception as e:
         debug_print(f"⚠️ Eroare la procesarea imaginii {img_path}: {e}")
-        # Returnăm o imagine goală neagră în caz de eroare gravă
         return Image.new('RGB', (500, 500), color='black')
 
 
 def pil_to_base64(pil_img: Image.Image) -> str:
     """Convertește PIL Image la base64"""
     buf = io.BytesIO()
-    # JPEG cu calitate 85 este mult mai rapid la upload decât PNG
     pil_img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
@@ -128,21 +137,16 @@ def parse_label(text: str) -> Optional[str]:
         return None
     
     text_clean = text.strip().lower()
-    
-    # Elimină caractere nedorite (markdown, punctuație)
     text_clean = text_clean.replace("```", "").replace("[", "").replace("]", "").strip()
     
-    # Verificare directă
     if text_clean in ALLOWED_LABELS:
         return text_clean
     
-    # Căutare în text (dacă modelul e guraliv)
     found_labels = []
     for label in ALLOWED_LABELS:
         if label in text_clean:
             found_labels.append(label)
     
-    # Dacă găsim exact un label în text, îl returnăm
     if len(found_labels) == 1:
         return found_labels[0]
         
@@ -188,7 +192,6 @@ def setup_gemini_client():
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
         
-        # Încercăm modelele în ordine: cel mai nou -> cel mai stabil
         models_to_try = [
             'gemini-2.5-flash',
             'gemini-2.0-flash',
@@ -197,10 +200,7 @@ def setup_gemini_client():
         
         for model_name in models_to_try:
             try:
-                # Test simplu de instanțiere
                 model = genai.GenerativeModel(model_name, safety_settings=safety_settings)
-                # Dacă nu a dat eroare la creare, presupunem că e bun.
-                # Eroarea reală de acces apare la generate_content, dar o prindem acolo.
                 debug_print(f"✅ Gemini: Model selectat '{model_name}'")
                 return model
             except Exception:
@@ -261,7 +261,6 @@ def classify_with_gemini(client, img_path: Path, prompt: str) -> Optional[str]:
     try:
         pil_img = prep_for_vlm(img_path)
         
-        # Retry logic simplu
         for _ in range(2):
             try:
                 response = client.generate_content(
@@ -277,7 +276,6 @@ def classify_with_gemini(client, img_path: Path, prompt: str) -> Optional[str]:
             except Exception:
                 pass
         
-        # Dacă ajungem aici, Gemini nu a returnat nimic valid
         return None
     
     except Exception as e:
@@ -294,11 +292,9 @@ def count_features(img_gray: np.ndarray) -> tuple[int, float, float, int]:
     h, w = img_gray.shape[:2]
     area_img = h * w
     
-    # Edge detection
     g = cv2.GaussianBlur(img_gray, (3, 3), 0)
     edges = cv2.Canny(g, 50, 150)
     
-    # Detectare linii
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, 
                            minLineLength=40, maxLineGap=8)
     
@@ -309,14 +305,12 @@ def count_features(img_gray: np.ndarray) -> tuple[int, float, float, int]:
             angle = abs(math.degrees(math.atan2(y2-y1, x2-x1))) % 180
             angles.append(angle)
     
-    # Calcul orientări
     def is_ortho(a): return min(abs(a), abs(a-180)) < 8 or abs(a-90) < 8
     def is_diag(a): return (30 <= a <= 60) or (120 <= a <= 150)
     
     ortho_ratio = np.mean([is_ortho(a) for a in angles]) if angles else 0.0
     diag_ratio = np.mean([is_diag(a) for a in angles]) if angles else 0.0
     
-    # Detectare componente mici (posibil text)
     binv = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                   cv2.THRESH_BINARY_INV, 21, 10)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binv, 8)
@@ -324,7 +318,6 @@ def count_features(img_gray: np.ndarray) -> tuple[int, float, float, int]:
     text_components = sum(1 for stat in stats[1:] 
                          if 15 <= stat[cv2.CC_STAT_AREA] <= 800)
     
-    # Detectare forme dreptunghiulare (camere)
     _, thresh = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -344,7 +337,7 @@ def count_features(img_gray: np.ndarray) -> tuple[int, float, float, int]:
 
 
 def local_classify(img_path: Path) -> str:
-    """Clasificare locală cu heuristici (fallback când AI-ul nu merge)"""
+    """Clasificare locală cu heuristici"""
     try:
         img = safe_imread(img_path)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -353,7 +346,6 @@ def local_classify(img_path: Path) -> str:
         debug_print(f"   └─ Local features: rooms={rooms}, ortho={ortho:.2f}, "
                     f"diag={diag:.2f}, text_cc={text_cc}")
         
-        # Logică de clasificare
         if text_cc >= 1800 and rooms <= 1 and ortho <= 0.55:
             return "text_area"
         
@@ -368,7 +360,7 @@ def local_classify(img_path: Path) -> str:
         
         return "side_view"
     except Exception:
-        return "text_area" # Cel mai safe fallback
+        return "text_area"
 
 
 # ============================================================================
@@ -381,10 +373,7 @@ def arbitrate_classification(
     gemini_client,
     round_num: int
 ) -> tuple[Optional[str], Optional[str]]:
-    """
-    Rundă de arbitraj. Se apelează doar dacă ambele modele au răspuns în runda anterioară
-    dar nu s-au pus de acord.
-    """
+    """Rundă de arbitraj pentru clasificare"""
     prompts = [
         PROMPT_ROUND_1_BASE,
         PROMPT_ROUND_2_EXPLICIT,
@@ -408,23 +397,15 @@ def classify_image_robust(
     gpt_client,
     gemini_client
 ) -> ClassificationResult:
-    """
-    Clasificare cu sistem dual-model + Fast Failover.
-    """
+    """Clasificare cu sistem dual-model + Fast Failover"""
     img_name = img_path.name
     debug_print(f"\n🔍 Clasificare: {img_name}")
     
-    # RUNDA 1: Clasificare inițială
     gpt_label = classify_with_gpt(gpt_client, img_path, PROMPT_ROUND_1_BASE)
     gemini_label = classify_with_gemini(gemini_client, img_path, PROMPT_ROUND_1_BASE)
     
     debug_print(f"   Round 1 → GPT: {gpt_label}, Gemini: {gemini_label}")
     
-    # ----------------------------------------------------
-    # FAST FAILOVER LOGIC
-    # ----------------------------------------------------
-    
-    # CAZ 1: Ambele modele funcționează și sunt de acord
     if gpt_label and gemini_label and gpt_label == gemini_label:
         debug_print(f"   ✅ Acord imediat: {gpt_label}")
         return ClassificationResult(
@@ -436,7 +417,6 @@ def classify_image_robust(
             arbitration_rounds=0
         )
 
-    # CAZ 2: Gemini a eșuat (None), dar GPT a reușit -> TRUST GPT
     if not gemini_label and gpt_label:
         debug_print(f"   ⚠️ Gemini failed. Trusting GPT: {gpt_label}")
         return ClassificationResult(
@@ -448,7 +428,6 @@ def classify_image_robust(
             arbitration_rounds=0
         )
 
-    # CAZ 3: GPT a eșuat (None), dar Gemini a reușit -> TRUST GEMINI
     if not gpt_label and gemini_label:
         debug_print(f"   ⚠️ GPT failed. Trusting Gemini: {gemini_label}")
         return ClassificationResult(
@@ -460,7 +439,6 @@ def classify_image_robust(
             arbitration_rounds=0
         )
 
-    # CAZ 4: Ambele au eșuat (None) -> Fallback la Heuristici
     if not gpt_label and not gemini_label:
         debug_print("   ❌ Ambele AI au eșuat. Execut fallback heuristici...")
         local_label = local_classify(img_path)
@@ -473,8 +451,6 @@ def classify_image_robust(
             arbitration_rounds=0
         )
 
-    # CAZ 5: Ambele au răspuns, dar DIFERIT -> Arbitraj
-    # Doar aici intrăm în bucla de așteptare/retry
     debug_print("   ⚔️  Dezbatere necesară (Modelele nu sunt de acord).")
     
     for round_num in range(1, 3):
@@ -486,7 +462,6 @@ def classify_image_robust(
         
         debug_print(f"   Round {round_num + 1} → GPT: {gpt_label}, Gemini: {gemini_label}")
         
-        # Verificăm din nou condițiile de acord
         if gpt_label and gemini_label and gpt_label == gemini_label:
             debug_print(f"   ✅ Acord după arbitraj: {gpt_label}")
             return ClassificationResult(
@@ -498,22 +473,17 @@ def classify_image_robust(
                 arbitration_rounds=round_num + 1
             )
         
-        # Fast failover în timpul arbitrajului (dacă unul moare pe parcurs)
         if gpt_label and not gemini_label:
              return ClassificationResult(image_path, gpt_label, ConfidenceLevel.MEDIUM, gpt_label, None, round_num + 1) # type: ignore
         if gemini_label and not gpt_label:
              return ClassificationResult(image_path, gemini_label, ConfidenceLevel.MEDIUM, None, gemini_label, round_num + 1) # type: ignore
 
-    
-    # FALLBACK FINAL: Heuristici locale + voting din ultimele rezultate AI
     debug_print("   🔧 Fallback la heuristici locale (Arbitraj eșuat)...")
     local_label = local_classify(img_path)
     
-    # Voting: 2/3 wins (Ultimul GPT, Ultimul Gemini, Local)
     votes = [v for v in [gpt_label, gemini_label, local_label] if v]
     
     if len(votes) >= 2:
-        from collections import Counter
         vote_counts = Counter(votes)
         final_label = vote_counts.most_common(1)[0][0]
     else:
@@ -532,18 +502,489 @@ def classify_image_robust(
 
 
 # ============================================================================
-# FUNCȚIA PRINCIPALĂ DE CLASIFICARE (INTERFAȚĂ COMPATIBILĂ)
+# EXTRAGERE MĂSURĂTORI CAMERE PENTRU VERIFICARE DUPLICATE
+# ============================================================================
+
+def extract_room_measurements(img_path: Path, ai_client) -> dict:
+    """
+    Extrage măsurătorile camerelor dintr-un plan pentru verificare duplicate.
+    
+    Returns:
+        dict cu structura:
+        {
+            "rooms": [
+                {"name": "Bedroom", "area_m2": 14.5},
+                {"name": "Kitchen", "area_m2": 12.3},
+                ...
+            ],
+            "total_area": 85.4
+        }
+    """
+    
+    PROMPT = """You are an expert at reading architectural floor plans.
+
+Extract ALL room measurements from this floor plan image.
+
+For each room, identify:
+1. Room name (e.g., "Bedroom", "Kitchen", "Bath", "Living", etc.)
+2. Area in square meters (the number next to m²)
+
+Return ONLY a JSON object with this EXACT structure:
+{
+  "rooms": [
+    {"name": "Bedroom", "area_m2": 14.5},
+    {"name": "Kitchen", "area_m2": 12.3}
+  ]
+}
+
+CRITICAL:
+- Extract ALL rooms you can see
+- Use exact numbers from the plan
+- Use decimal point (.), not comma
+- Return ONLY valid JSON, no explanation
+"""
+
+    try:
+        # Încercăm GPT
+        if ai_client and hasattr(ai_client, 'chat'):
+            try:
+                pil_img = prep_for_vlm(img_path, min_long_edge=1280)
+                b64 = pil_to_base64(pil_img)
+                
+                response = ai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": PROMPT},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                            ]
+                        }
+                    ],
+                    temperature=0.0,
+                    max_tokens=500
+                )
+                
+                result = response.choices[0].message.content.strip()
+                
+                # Parse JSON
+                if result.startswith("```"):
+                    start = result.find('{')
+                    end = result.rfind('}') + 1
+                    if start != -1 and end > start:
+                        result = result[start:end]
+                
+                data = json.loads(result)
+                
+                # Calculăm total
+                if "rooms" in data:
+                    total = sum(r.get("area_m2", 0) for r in data["rooms"])
+                    data["total_area"] = round(total, 2)
+                
+                return data
+                
+            except Exception as e:
+                debug_print(f"⚠️ GPT room extraction failed: {e}")
+                return {"rooms": [], "total_area": 0}
+        
+        # Încercăm Gemini
+        elif ai_client and hasattr(ai_client, 'generate_content'):
+            try:
+                pil_img = prep_for_vlm(img_path, min_long_edge=1280)
+                
+                response = ai_client.generate_content(
+                    [PROMPT, pil_img],
+                    generation_config={"temperature": 0.0, "max_output_tokens": 500}
+                )
+                
+                if response.parts:
+                    result = response.text.strip()
+                    
+                    # Parse JSON
+                    if result.startswith("```"):
+                        start = result.find('{')
+                        end = result.rfind('}') + 1
+                        if start != -1 and end > start:
+                            result = result[start:end]
+                    
+                    data = json.loads(result)
+                    
+                    # Calculăm total
+                    if "rooms" in data:
+                        total = sum(r.get("area_m2", 0) for r in data["rooms"])
+                        data["total_area"] = round(total, 2)
+                    
+                    return data
+                
+                return {"rooms": [], "total_area": 0}
+                
+            except Exception as e:
+                debug_print(f"⚠️ Gemini room extraction failed: {e}")
+                return {"rooms": [], "total_area": 0}
+        
+        return {"rooms": [], "total_area": 0}
+    
+    except Exception as e:
+        debug_print(f"❌ Eroare la extragere măsurători: {e}")
+        return {"rooms": [], "total_area": 0}
+
+
+def compare_room_measurements(data1: dict, data2: dict, tolerance: float = 0.15) -> tuple[bool, str]:
+    """
+    Compară măsurătorile camerelor din 2 planuri.
+    
+    Args:
+        data1, data2: Dict-uri cu structura {"rooms": [...], "total_area": X}
+        tolerance: Toleranță procentuală (0.15 = 15%)
+    
+    Returns:
+        (are_same_rooms, explanation)
+    """
+    
+    rooms1 = data1.get("rooms", [])
+    rooms2 = data2.get("rooms", [])
+    
+    total1 = data1.get("total_area", 0)
+    total2 = data2.get("total_area", 0)
+    
+    # Dacă nu am măsurători din ambele, returnăm incert
+    if not rooms1 or not rooms2:
+        return (False, "NO_MEASUREMENTS")
+    
+    # Verificăm numărul de camere
+    if abs(len(rooms1) - len(rooms2)) > 1:
+        return (False, f"DIFFERENT_ROOM_COUNT: {len(rooms1)} vs {len(rooms2)}")
+    
+    # Verificăm suprafața totală
+    if total1 > 0 and total2 > 0:
+        diff_pct = abs(total1 - total2) / max(total1, total2)
+        
+        if diff_pct > tolerance:
+            return (False, f"DIFFERENT_TOTAL_AREA: {total1:.1f}m² vs {total2:.1f}m² (diff: {diff_pct*100:.1f}%)")
+    
+    # Sortăm camerele după arie
+    rooms1_sorted = sorted(rooms1, key=lambda r: r.get("area_m2", 0), reverse=True)
+    rooms2_sorted = sorted(rooms2, key=lambda r: r.get("area_m2", 0), reverse=True)
+    
+    # Comparăm camerele pereche cu pereche
+    matched = 0
+    unmatched = []
+    
+    for i, r1 in enumerate(rooms1_sorted):
+        area1 = r1.get("area_m2", 0)
+        
+        if i < len(rooms2_sorted):
+            r2 = rooms2_sorted[i]
+            area2 = r2.get("area_m2", 0)
+            
+            if area1 > 0 and area2 > 0:
+                diff = abs(area1 - area2) / max(area1, area2)
+                
+                if diff <= tolerance:
+                    matched += 1
+                else:
+                    unmatched.append(f"{area1:.1f}m² vs {area2:.1f}m² (diff: {diff*100:.1f}%)")
+    
+    # Dacă majoritatea camerelor se potrivesc
+    match_ratio = matched / max(len(rooms1), len(rooms2))
+    
+    if match_ratio >= 0.7:  # 70% din camere match
+        return (True, f"SAME_ROOMS: {matched}/{max(len(rooms1), len(rooms2))} rooms match")
+    else:
+        return (False, f"DIFFERENT_ROOMS: Only {matched}/{max(len(rooms1), len(rooms2))} match. Unmatched: {', '.join(unmatched[:3])}")
+
+
+# ============================================================================
+# DETECTARE DUPLICATE CLUSTERS (SIMPLE AI COMPARISON + ROOM MEASUREMENTS)
+# ============================================================================
+
+def check_duplicate_with_ai(
+    img1_path: Path,
+    img2_path: Path,
+    ai_client
+) -> tuple[bool, str]:
+    """
+    Întreabă AI-ul dacă cele 2 planuri sunt același lucru la scale diferit.
+    ✅ ACUM verifică și măsurătorile camerelor pentru confirmare!
+    
+    Returns: (is_duplicate, ai_response_text)
+    """
+    
+    PROMPT = """Look at these two architectural floor plans.
+
+Question: Do these two images represent THE SAME floor plan, just at different scales or with different annotations/labels?
+
+Consider:
+- Same room layout and structure
+- Same number of rooms
+- Same wall positions
+- Different scale is OK
+- Different annotations/text is OK
+- Minor rotation is OK
+
+Answer with EXACTLY ONE WORD:
+- "YES" if they are the same plan (just different scale/annotations)
+- "NO" if they are different plans
+
+Your answer:"""
+
+    try:
+        # STEP 1: Verificare vizuală AI (ca înainte)
+        is_duplicate_visual = False
+        visual_response = "NO_CHECK"
+        
+        # Încercăm GPT
+        if ai_client and hasattr(ai_client, 'chat'):
+            try:
+                pil_img1 = prep_for_vlm(img1_path, min_long_edge=1024)
+                pil_img2 = prep_for_vlm(img2_path, min_long_edge=1024)
+                
+                b64_1 = pil_to_base64(pil_img1)
+                b64_2 = pil_to_base64(pil_img2)
+                
+                response = ai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": PROMPT},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_1}"}},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_2}"}}
+                            ]
+                        }
+                    ],
+                    temperature=0.0,
+                    max_tokens=10
+                )
+                
+                visual_response = response.choices[0].message.content.strip().upper()
+                is_duplicate_visual = "YES" in visual_response
+                
+            except Exception as e:
+                debug_print(f"⚠️ GPT visual check failed: {e}")
+        
+        # Încercăm Gemini
+        elif ai_client and hasattr(ai_client, 'generate_content'):
+            try:
+                pil_img1 = prep_for_vlm(img1_path, min_long_edge=1024)
+                pil_img2 = prep_for_vlm(img2_path, min_long_edge=1024)
+                
+                response = ai_client.generate_content(
+                    [PROMPT, pil_img1, "---SECOND IMAGE---", pil_img2],
+                    generation_config={"temperature": 0.0, "max_output_tokens": 10}
+                )
+                
+                if response.parts:
+                    visual_response = response.text.strip().upper()
+                    is_duplicate_visual = "YES" in visual_response
+                
+            except Exception as e:
+                debug_print(f"⚠️ Gemini visual check failed: {e}")
+        
+        # STEP 2: Dacă AI-ul vizual zice YES, verificăm și măsurătorile
+        if is_duplicate_visual:
+            debug_print(f"      → Visual check: YES - Verific măsurători...")
+            
+            # Extragem măsurători din ambele planuri
+            measurements1 = extract_room_measurements(img1_path, ai_client)
+            measurements2 = extract_room_measurements(img2_path, ai_client)
+            
+            debug_print(f"         Plan 1: {len(measurements1.get('rooms', []))} rooms, total {measurements1.get('total_area', 0):.1f}m²")
+            debug_print(f"         Plan 2: {len(measurements2.get('rooms', []))} rooms, total {measurements2.get('total_area', 0):.1f}m²")
+            
+            # Comparăm măsurătorile
+            are_same, explanation = compare_room_measurements(measurements1, measurements2, tolerance=0.15)
+            
+            if are_same:
+                final_response = f"YES (Visual + Measurements Match: {explanation})"
+                debug_print(f"      ✅ CONFIRMED DUPLICATE: {explanation}")
+                return (True, final_response)
+            else:
+                final_response = f"NO (Visual YES but Measurements Differ: {explanation})"
+                debug_print(f"      ❌ NOT DUPLICATE: {explanation}")
+                return (False, final_response)
+        
+        # Dacă AI-ul vizual zice NO, e clar diferit
+        return (is_duplicate_visual, visual_response)
+    
+    except Exception as e:
+        debug_print(f"❌ Eroare la verificare duplicate: {e}")
+        return (False, f"ERROR: {str(e)}")
+
+
+def detect_and_remove_duplicates(
+    crops_dir: Path,
+    ai_client
+) -> list[DuplicateGroup]:
+    """
+    Detectează și elimină clusterele duplicate prin comparație AI directă.
+    Compară fiecare pereche de imagini și elimină cele mai mici.
+    """
+    
+    print("\n[STEP 7B] Detectare și eliminare duplicate clusters...")
+    
+    image_files = sorted(crops_dir.glob("*.jpg")) + sorted(crops_dir.glob("*.png"))
+    
+    if len(image_files) < 2:
+        print("ℹ️ Prea puține clustere pentru verificare duplicate.")
+        return []
+    
+    if not ai_client:
+        print("⚠️ Niciun client AI disponibil - skip detectare duplicate.")
+        return []
+    
+    print(f"📊 Verificare {len(image_files)} clustere pentru duplicate...")
+    print(f"🔍 Total combinații de verificat: {len(image_files) * (len(image_files) - 1) // 2}\n")
+    
+    # Obținem dimensiunile fișierelor
+    image_data = []
+    for img_file in image_files:
+        try:
+            img = cv2.imread(str(img_file))
+            if img is not None:
+                h, w = img.shape[:2]
+                file_size = img_file.stat().st_size
+                image_data.append({
+                    'path': img_file,
+                    'size': file_size,
+                    'width': w,
+                    'height': h,
+                    'pixels': w * h
+                })
+        except Exception as e:
+            debug_print(f"⚠️ Eroare procesare {img_file.name}: {e}")
+    
+    # Verificăm toate combinațiile
+    confirmed_duplicates = []
+    total_comparisons = len(image_data) * (len(image_data) - 1) // 2
+    current_comparison = 0
+    
+    for i in range(len(image_data)):
+        for j in range(i + 1, len(image_data)):
+            current_comparison += 1
+            
+            img1 = image_data[i]
+            img2 = image_data[j]
+            
+            path1 = img1['path']
+            path2 = img2['path']
+            
+            print(f"[{current_comparison}/{total_comparisons}] Comparare:")
+            print(f"  • {path1.name} ({img1['width']}x{img1['height']}, {img1['size']/1024:.1f} KB)")
+            print(f"  • {path2.name} ({img2['width']}x{img2['height']}, {img2['size']/1024:.1f} KB)")
+            
+            # Întrebăm AI-ul
+            is_duplicate, ai_response = check_duplicate_with_ai(path1, path2, ai_client)
+            
+            print(f"  → AI răspuns: {ai_response}")
+            
+            if is_duplicate:
+                print(f"  ✅ DUPLICATE detectat!\n")
+                confirmed_duplicates.append({
+                    'img1': img1,
+                    'img2': img2,
+                    'ai_response': ai_response
+                })
+            else:
+                print(f"  ❌ Nu sunt duplicate\n")
+    
+    # Dacă nu am găsit nimic
+    if not confirmed_duplicates:
+        print("✅ Nu s-au găsit duplicate!\n")
+        return []
+    
+    # Construim grupuri de duplicate
+    print(f"🗑️ Procesare {len(confirmed_duplicates)} perechi duplicate...\n")
+    
+    graph = defaultdict(set)
+    
+    for dup in confirmed_duplicates:
+        p1 = dup['img1']['path']
+        p2 = dup['img2']['path']
+        graph[p1].add(p2)
+        graph[p2].add(p1)
+    
+    # Găsim componente conectate (grupuri de duplicate)
+    visited = set()
+    duplicate_groups = []
+    
+    def dfs(node, component):
+        visited.add(node)
+        component.append(node)
+        for neighbor in graph[node]:
+            if neighbor not in visited:
+                dfs(neighbor, component)
+    
+    for node in graph:
+        if node not in visited:
+            component = []
+            dfs(node, component)
+            if len(component) > 1:
+                # Sortăm după număr de pixeli (păstrăm cel mai mare)
+                component_with_data = []
+                for path in component:
+                    img_data = next((d for d in image_data if d['path'] == path), None)
+                    if img_data:
+                        component_with_data.append(img_data)
+                
+                component_with_data.sort(key=lambda x: x['pixels'], reverse=True)
+                
+                keep = component_with_data[0]['path']
+                remove = [d['path'] for d in component_with_data[1:]]
+                
+                # Găsim răspunsul AI pentru grup
+                ai_responses = [d['ai_response'] for d in confirmed_duplicates 
+                               if (d['img1']['path'] in component and d['img2']['path'] in component)]
+                
+                duplicate_groups.append(DuplicateGroup(
+                    keep_cluster=keep,
+                    remove_clusters=remove,
+                    ai_response=", ".join(ai_responses) if ai_responses else "YES"
+                ))
+    
+    # Eliminăm clusterele duplicate
+    total_removed = 0
+    
+    for group in duplicate_groups:
+        keep_data = next((d for d in image_data if d['path'] == group.keep_cluster), None)
+        
+        print(f"🔹 Grup duplicate (AI: {group.ai_response}):")
+        if keep_data:
+            print(f"   ✅ PĂSTRAT: {group.keep_cluster.name}")
+            print(f"      └─ Dimensiuni: {keep_data['width']}x{keep_data['height']} ({keep_data['size']/1024:.1f} KB)")
+        
+        for remove_path in group.remove_clusters:
+            remove_data = next((d for d in image_data if d['path'] == remove_path), None)
+            try:
+                remove_path.unlink()
+                if remove_data:
+                    print(f"   🗑️ ELIMINAT: {remove_path.name}")
+                    print(f"      └─ Dimensiuni: {remove_data['width']}x{remove_data['height']} ({remove_data['size']/1024:.1f} KB)")
+                total_removed += 1
+            except Exception as e:
+                debug_print(f"⚠️ Eroare la eliminare {remove_path.name}: {e}")
+        
+        print()
+    
+    print(f"✅ Eliminare duplicate finalizată!")
+    print(f"   • Grupuri duplicate: {len(duplicate_groups)}")
+    print(f"   • Clustere eliminate: {total_removed}")
+    print(f"   • Clustere rămase: {len(image_files) - total_removed}\n")
+    
+    return duplicate_groups
+
+
+# ============================================================================
+# PADDING ALB PENTRU BLUEPRINTS
 # ============================================================================
 
 def add_white_padding(src: Path, dst: Path, padding_pct: float = 0.10) -> None:
-    """
-    Adaugă un contur alb procentual în jurul imaginii.
-    padding_pct = 0.10 înseamnă 10% din dimensiunea respectivă pe fiecare latură.
-    """
+    """Adaugă un contur alb procentual în jurul imaginii"""
     try:
         img = cv2.imread(str(src))
         if img is None:
-            # Dacă nu putem citi imaginea, facem doar copy
             shutil.copy(str(src), str(dst))
             return
 
@@ -551,7 +992,6 @@ def add_white_padding(src: Path, dst: Path, padding_pct: float = 0.10) -> None:
         pad_h = int(h * padding_pct)
         pad_w = int(w * padding_pct)
 
-        # Adăugăm bordura albă (Value: [255, 255, 255])
         img_padded = cv2.copyMakeBorder(
             img, 
             pad_h, pad_h, pad_w, pad_w, 
@@ -566,13 +1006,14 @@ def add_white_padding(src: Path, dst: Path, padding_pct: float = 0.10) -> None:
         shutil.copy(str(src), str(dst))
 
 
+# ============================================================================
+# FUNCȚIA PRINCIPALĂ DE CLASIFICARE
+# ============================================================================
+
 def classify_segmented_plans(segmentation_out: str | Path) -> list[ClassificationResult]:
-    """
-    Clasifică planurile decupate de segmenter.
-    """
+    """Clasifică planurile decupate de segmenter"""
     segmentation_out = Path(segmentation_out).resolve()
     
-    # Directoare
     from .common import set_output_dir
     set_output_dir(segmentation_out)
     
@@ -590,12 +1031,10 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
         debug_print(f"ℹ️ Nu există crops_dir cu planuri: {crops_dir}")
         return []
     
-    # Setup clienți AI
-    print("\n[STEP 8] Clasificare cu Dual-Model Validation (GPT-4o + Gemini)...")
+    print("\n[STEP 7A] Inițializare AI clients...")
     gpt_client = setup_openai_client()
     gemini_client = setup_gemini_client()
     
-    # Logging clienți activi
     clients = []
     if gpt_client: clients.append("GPT-4o")
     if gemini_client: clients.append("Gemini (Auto-Detect)")
@@ -605,22 +1044,31 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
     else:
         print(f"✅ Clienți activi: {', '.join(clients)}")
     
+    # DETECTARE ȘI ELIMINARE DUPLICATE
+    # Folosim primul client disponibil (prioritate GPT)
+    ai_client = gpt_client if gpt_client else gemini_client
+    
+    duplicate_groups = detect_and_remove_duplicates(
+        crops_dir=crops_dir,
+        ai_client=ai_client
+    )
+    
+    # CLASIFICARE
+    print("[STEP 8] Clasificare cu Dual-Model Validation (GPT-4o + Gemini)...")
+    
     results: list[ClassificationResult] = []
     
-    # Procesare imagini
     image_files = sorted(crops_dir.glob("*.jpg")) + sorted(crops_dir.glob("*.png"))
     
     if not image_files:
-        debug_print(f"ℹ️ Nicio imagine găsită în {crops_dir}")
+        debug_print(f"ℹ️ Nicio imagine rămasă în {crops_dir}")
         return []
     
     print(f"📊 Clasificare {len(image_files)} planuri...\n")
     
     for img_file in image_files:
-        # Clasificare cu sistem robust
         result = classify_image_robust(img_file, gpt_client, gemini_client)
         
-        # Mapare în foldere
         label_to_dir = {
             "house_blueprint": bp_dir,
             "site_blueprint": sp_dir,
@@ -631,17 +1079,14 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
         dst_dir = label_to_dir[result.label]
         dst = dst_dir / img_file.name
         
-        # ✅ LOGICĂ NOUĂ: Dacă este house_blueprint, adăugăm padding alb
         if result.label == "house_blueprint":
             add_white_padding(img_file, dst, padding_pct=0.10)
         else:
             shutil.copy(str(img_file), str(dst))
         
-        # Update path în rezultat
         result.image_path = dst
         results.append(result)
         
-        # Status logging
         confidence_emoji = {
             ConfidenceLevel.HIGH: "🟢",
             ConfidenceLevel.MEDIUM: "🟡",
@@ -660,9 +1105,7 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
     
     print("\n✅ Clasificare finalizată!\n")
     
-    # ==========================
-    # STEP 8B – Post-validare
-    # ==========================
+    # POST-VALIDARE
     print("[STEP 8B] Post-validare folder 'blueprints' cu heuristici...")
     
     moved = 0
@@ -685,12 +1128,11 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
             moved += 1
             print(f"↪️  mutat din blueprints în {dst_dir.name}: {img_file.name}")
             
-            # Actualizăm rezultatele
             for r in results:
                 if r.image_path == img_file:
                     r.image_path = dst
                     r.label = lbl  # type: ignore[assignment]
-                    r.confidence = ConfidenceLevel.LOW  # downgrade confidence
+                    r.confidence = ConfidenceLevel.LOW
                     break
     
     print(f"✅ Post-validare terminată. Mutate din blueprints: {moved}\n")

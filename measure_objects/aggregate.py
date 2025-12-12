@@ -3,6 +3,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+def _normalize_class(cls: str) -> str:
+    """Mapează numele clasei brute (ex: sliding-door) la cheia medie (ex: door)."""
+    cls = cls.lower()
+    if 'double' in cls and 'door' in cls:
+        return 'double_door'
+    elif 'double' in cls and 'window' in cls:
+        return 'double_window'
+    elif 'door' in cls:
+        return 'door'
+    elif 'window' in cls:
+        return 'window'
+    return 'unknown'
+
 def create_openings_all(
     detections_path: Path, 
     measurements_path: Path, 
@@ -10,10 +23,7 @@ def create_openings_all(
     output_path: Path
 ) -> int:
     """
-    Agregă informațiile despre deschideri (uși/ferestre) din mai multe surse:
-    1. detections_all.json (Tip, Poziție, Scor)
-    2. openings_measurements_gemini.json (Lățimi reale calculate)
-    3. exterior_doors.json (Status Exterior/Interior)
+    Agregă informațiile despre deschideri (uși/ferestre) din mai multe surse.
     """
     
     # 1. Încărcăm datele de bază
@@ -21,14 +31,12 @@ def create_openings_all(
     if detections_path.exists():
         with open(detections_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Suportă listă sau dict cu cheia 'predictions'
             if isinstance(data, list):
                 objects = data
             else:
                 objects = data.get("predictions", [])
 
     # 2. Încărcăm măsurătorile (lățimi reale)
-    # Structura: { "measurements": { "door": { "real_width_meters": 0.9, ... } } }
     type_widths = {}
     if measurements_path.exists():
         with open(measurements_path, "r", encoding="utf-8") as f:
@@ -39,23 +47,19 @@ def create_openings_all(
                     type_widths[k] = v["real_width_meters"]
 
     # 3. Încărcăm statusul Exterior/Interior
-    # Structura: { "exterior_doors": [...], "interior_doors": [...] }
-    ext_doors_map = {} # Cheie: tuple(box) -> "exterior"
+    ext_doors_map = {} 
     
     if exterior_doors_path.exists():
         try:
             with open(exterior_doors_path, "r", encoding="utf-8") as f:
                 ext_data = json.load(f)
                 
-            # Extragem listele
             ext_list = ext_data.get("exterior_doors", [])
             int_list = ext_data.get("interior_doors", [])
             
-            # Mapăm coordonatele la status pentru lookup rapid
-            # Folosim coordonatele cutiei ca identificator unic
+            # Cheile în harta de status sunt bazate pe formatul [x1, y1, x2, y2]
             for d in ext_list:
                 if "box_2d" in d:
-                    # Convertim la tuple pentru a fi cheie de dict
                     box_key = tuple(map(int, d["box_2d"]))
                     ext_doors_map[box_key] = "exterior"
             
@@ -71,39 +75,38 @@ def create_openings_all(
     final_list = []
     
     for obj in objects:
-        cls = obj.get("class", "unknown")
-        # Ignorăm scările aici (sunt tratate separat la arii)
+        # CORECȚIE 1 (Anterior identificată): Citirea clasei din cheia 'type'
+        cls = obj.get("type", "unknown")
+        
         if cls == "stairs":
             continue
             
-        # Determină lățimea
-        width = type_widths.get(cls, 0.0)
-        
-        # Determină status (doar pentru uși)
+        normalized_cls = _normalize_class(cls)
+        width = type_widths.get(normalized_cls, 0.0)
         status = "unknown"
         
-        # Încercăm să găsim statusul în maparea de uși exterioare
-        # Roboflow dă coordonatele în 'x','y','width','height' sau 'box_2d'?
-        # Codul de detecție salvează "box_2d": [x1, y1, x2, y2]
-        
-        # Verificăm cheile disponibile
+        # CORECȚIE 2 (CRITICĂ): Asigurăm potrivirea formatului de bounding box (bbox) pentru lookup
         bbox = None
         if "box_2d" in obj:
             bbox = tuple(map(int, obj["box_2d"]))
+        # FIX CRITIC: Adăugat suport pentru formatul x1/y1/x2/y2 (cel mai probabil format din detections_all.json)
+        elif "x1" in obj and "x2" in obj and "y1" in obj and "y2" in obj:
+            bbox = (int(obj["x1"]), int(obj["y1"]), int(obj["x2"]), int(obj["y2"]))
         elif "x" in obj and "y" in obj:
-            # Reconstruim box-ul aproximativ dacă lipsește box_2d (fallback)
+            # Fallback pentru formatul Roboflow center (x/y/w/h)
             x, y, w, h = obj["x"], obj["y"], obj["width"], obj["height"]
             bbox = (int(x - w/2), int(y - h/2), int(x + w/2), int(y + h/2))
             
+        # Potrivirea statusului de Exterior/Interior
         if bbox and bbox in ext_doors_map:
             status = ext_doors_map[bbox]
         
         # Fallback simplu pe bază de nume clasă dacă nu avem potrivire geometrică
         if status == "unknown":
             if "window" in cls:
-                status = "exterior" # Ferestrele sunt implicit exterioare
+                status = "exterior" 
             elif "door" in cls:
-                status = "interior" # Ușile default interior
+                status = "interior" # Default interior dacă nu se potrivește
         
         item = {
             "type": cls,
