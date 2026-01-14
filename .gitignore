@@ -1,0 +1,24 @@
+# Virtualenvs
+.venv/
+.venv311/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS
+.DS_Store
+
+# Env / secrets
+.env
+
+# Outputs / generated files
+output/
+outputs/
+runs/
+jobs/
+test_out/
+ui_out/
+pdf_converted/

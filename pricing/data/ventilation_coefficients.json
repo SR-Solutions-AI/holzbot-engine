@@ -1,0 +1,7 @@
+{
+  "schema": "v1",
+  "description": "Coeficienți pentru calculul prețului final al ventilației",
+  "currency": "EUR",
+  "coefficient_ventilation_per_m2": 55.0,
+  "notes": "Preț pentru ventilație mecanică cu recuperare de căldură"
+}

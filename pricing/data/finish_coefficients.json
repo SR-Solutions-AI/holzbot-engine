@@ -1,0 +1,14 @@
+{
+  "interior": {
+    "Tencuială": 55.0,
+    "Lemn": 75.0,
+    "Fibrociment": 65.0,
+    "Mix": 70.0
+  },
+  "exterior": {
+    "Tencuială": 80.0,
+    "Lemn": 110.0,
+    "Fibrociment": 90.0,
+    "Mix": 100.0
+  }
+}

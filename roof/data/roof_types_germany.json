@@ -1,0 +1,172 @@
+{
+  "dachformen": [
+    {
+      "name_de": "Flachdach",
+      "name_en": "Flat roof",
+      "description": "Acoperiș aproape plat, modern, necesită izolație și drenaj eficient. Ușor de construit, dar întreținere frecventă.",
+      "cost_estimate_eur_per_m2": [80, 140],
+      "extra_walls_price_eur_per_m": 70.0
+    },
+    {
+      "name_de": "Fußwalmdach",
+      "name_en": "Truncated hip roof",
+      "description": "Acoperiș tip hip scurtat la partea inferioară, combinație între acoperiș în două ape și acoperiș hip.",
+      "cost_estimate_eur_per_m2": [90, 130],
+      "extra_walls_price_eur_per_m": 35.0
+    },
+    {
+      "name_de": "Kreuzdach",
+      "name_en": "Cross gable roof",
+      "description": "Două acoperișuri în două ape care se intersectează; design complex, costuri mai mari.",
+      "cost_estimate_eur_per_m2": [110, 160],
+      "extra_walls_price_eur_per_m": 120.0
+    },
+    {
+      "name_de": "Grabendach",
+      "name_en": "Valley roof",
+      "description": "Două pante care se întâlnesc într-o vale interioară; necesită drenaj bun și execuție precisă.",
+      "cost_estimate_eur_per_m2": [100, 150],
+      "extra_walls_price_eur_per_m": 100.0
+    },
+    {
+      "name_de": "Krüppelwalmdach",
+      "name_en": "Half-hip roof",
+      "description": "Combinație între acoperiș în două ape și acoperiș hip parțial; aspect tradițional bavarez.",
+      "cost_estimate_eur_per_m2": [90, 130],
+      "extra_walls_price_eur_per_m": 55.0
+    },
+    {
+      "name_de": "Mansardendach",
+      "name_en": "Mansard roof",
+      "description": "Acoperiș cu pante duble, folosit pentru a crea spațiu de locuit suplimentar sub acoperiș.",
+      "cost_estimate_eur_per_m2": [110, 160],
+      "extra_walls_price_eur_per_m": 130.0
+    },
+    {
+      "name_de": "Mansardendach mit Fußwalm",
+      "name_en": "Mansard roof with foot hip",
+      "description": "Variante de mansard cu zone hip inferioare, design elegant dar complex.",
+      "cost_estimate_eur_per_m2": [115, 165],
+      "extra_walls_price_eur_per_m": 120.0
+    },
+    {
+      "name_de": "Mansardendach mit Schopf",
+      "name_en": "Mansard roof with overhang",
+      "description": "Mansard cu extensii frontale, oferă protecție suplimentară la fațadă.",
+      "cost_estimate_eur_per_m2": [120, 170],
+      "extra_walls_price_eur_per_m": 140.0
+    },
+    {
+      "name_de": "Mansardenwalmdach",
+      "name_en": "Mansard hip roof",
+      "description": "Combină mansard și acoperiș hip; foarte complex, costuri ridicate.",
+      "cost_estimate_eur_per_m2": [120, 170],
+      "extra_walls_price_eur_per_m": 110.0
+    },
+    {
+      "name_de": "Nurdach",
+      "name_en": "A-frame roof",
+      "description": "Acoperiș care formează pereții laterali, de obicei pentru case de vacanță.",
+      "cost_estimate_eur_per_m2": [90, 140],
+      "extra_walls_price_eur_per_m": 150.0
+    },
+    {
+      "name_de": "Paralleldach",
+      "name_en": "Parallel roof",
+      "description": "Două acoperișuri în două ape paralele, separate; design modern.",
+      "cost_estimate_eur_per_m2": [80, 120],
+      "extra_walls_price_eur_per_m": 75.0
+    },
+    {
+      "name_de": "Pultdach",
+      "name_en": "Single-slope roof",
+      "description": "Acoperiș cu o singură pantă, simplu și economic, folosit frecvent în case moderne.",
+      "cost_estimate_eur_per_m2": [70, 110],
+      "extra_walls_price_eur_per_m": 85.0
+    },
+    {
+      "name_de": "Pultdach erweitert/versetzt",
+      "name_en": "Offset shed roof",
+      "description": "Versiune extinsă a acoperișului cu o pantă, adesea folosită pentru case cu etaj parțial.",
+      "cost_estimate_eur_per_m2": [80, 120],
+      "extra_walls_price_eur_per_m": 95.0
+    },
+    {
+      "name_de": "Satteldach",
+      "name_en": "Gable roof",
+      "description": "Cel mai comun acoperiș din Germania, simplu, eficient și ieftin de construit.",
+      "cost_estimate_eur_per_m2": [75, 110],
+      "extra_walls_price_eur_per_m": 65.0
+    },
+    {
+      "name_de": "Satteldach erweitert",
+      "name_en": "Extended gable roof",
+      "description": "Versiune lărgită a acoperișului clasic în două ape, mai mult spațiu interior.",
+      "cost_estimate_eur_per_m2": [85, 120],
+      "extra_walls_price_eur_per_m": 75.0
+    },
+    {
+      "name_de": "Sattel-Walmdach",
+      "name_en": "Gable-hip roof",
+      "description": "Combină formele gable și hip pentru un aspect mai sofisticat.",
+      "cost_estimate_eur_per_m2": [95, 135],
+      "extra_walls_price_eur_per_m": 45.0
+    },
+    {
+      "name_de": "Scheddach / Sägezahndach",
+      "name_en": "Sawtooth roof",
+      "description": "Folosit frecvent la clădiri industriale sau moderne, pentru lumină naturală.",
+      "cost_estimate_eur_per_m2": [100, 150],
+      "extra_walls_price_eur_per_m": 130.0
+    },
+    {
+      "name_de": "Schleppdach",
+      "name_en": "Lean-to roof",
+      "description": "Extensie cu o singură pantă, folosită pentru garaje sau anexe.",
+      "cost_estimate_eur_per_m2": [60, 90],
+      "extra_walls_price_eur_per_m": 25.0
+    },
+    {
+      "name_de": "Schmetterlingsdach",
+      "name_en": "Butterfly roof",
+      "description": "Două pante inversate care se întâlnesc în centru, aspect modern spectaculos.",
+      "cost_estimate_eur_per_m2": [110, 160],
+      "extra_walls_price_eur_per_m": 110.0
+    },
+    {
+      "name_de": "Tonnendach",
+      "name_en": "Barrel roof",
+      "description": "Acoperiș semicircular, design rar, dificil de executat, costuri mari.",
+      "cost_estimate_eur_per_m2": [120, 180],
+      "extra_walls_price_eur_per_m": 90.0
+    },
+    {
+      "name_de": "Walmdach",
+      "name_en": "Hip roof",
+      "description": "Toate laturile sunt în pantă; stabilitate mare, dar complex și scump.",
+      "cost_estimate_eur_per_m2": [90, 140],
+      "extra_walls_price_eur_per_m": 12.0
+    },
+    {
+      "name_de": "Walm-Kehldach",
+      "name_en": "Valley-hip roof",
+      "description": "Combină acoperiș hip cu secțiuni în vale, folosit pentru clădiri cu formă în L.",
+      "cost_estimate_eur_per_m2": [110, 160],
+      "extra_walls_price_eur_per_m": 70.0
+    },
+    {
+      "name_de": "Zeltdach",
+      "name_en": "Pyramid roof",
+      "description": "Acoperiș piramidal, toate laturile converg spre un vârf central.",
+      "cost_estimate_eur_per_m2": [110, 160],
+      "extra_walls_price_eur_per_m": 20.0
+    },
+    {
+      "name_de": "Zwerchdach",
+      "name_en": "Cross dormer roof",
+      "description": "Proeminență perpendiculară pe acoperișul principal, folosită pentru lumină și estetică.",
+      "cost_estimate_eur_per_m2": [100, 150],
+      "extra_walls_price_eur_per_m": 70.0
+    }
+  ]
+}

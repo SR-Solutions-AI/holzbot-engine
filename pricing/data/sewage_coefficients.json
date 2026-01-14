@@ -1,0 +1,6 @@
+{
+  "schema": "v1",
+  "description": "Coeficienți pentru calculul prețului final al canalizării",
+  "currency": "EUR",
+  "coefficient_sewage_per_m2": 45.0
+}

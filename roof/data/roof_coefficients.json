@@ -1,0 +1,15 @@
+{
+  "schema": "v2",
+  "currency": "EUR",
+
+  "perimeter_override_m": null,
+
+  "roof_overhang_m": 0.4,
+  "sheet_metal_price_per_m": 28.0,
+
+  "insulation_price_per_m2": 22.0,
+
+  "tile_price_per_m2": 35.0,
+  "metal_price_per_m2": 22.0,
+  "membrane_price_per_m2": 12.0
+}
