@@ -609,6 +609,190 @@ def interval_merging_axis_projections(walls_mask: np.ndarray, steps_dir: str = N
     
     return result
 
+def preprocess_image_for_ocr(image: np.ndarray) -> np.ndarray:
+    """
+    Preprocesează imaginea pentru a îmbunătăți detecția OCR.
+    
+    Aplică:
+    - Conversie la grayscale dacă este color
+    - Contrast enhancement (CLAHE)
+    - Sharpening
+    - Thresholding adaptiv pentru text clar
+    
+    Args:
+        image: Imaginea de preprocesat (BGR sau grayscale)
+    
+    Returns:
+        Imaginea preprocesată (grayscale)
+    """
+    # Convertim la grayscale dacă este color
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # 1. Contrast enhancement cu CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    # 2. Sharpening pentru a face textul mai clar
+    kernel_sharpen = np.array([[-1, -1, -1],
+                               [-1,  9, -1],
+                               [-1, -1, -1]])
+    sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+    
+    # 3. Denoising (reducere zgomot)
+    denoised = cv2.fastNlMeansDenoising(sharpened, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    
+    # 4. Thresholding adaptiv pentru text clar (opțional, dar poate ajuta)
+    # Nu aplicăm thresholding direct, ci păstrăm imaginea grayscale pentru OCR
+    # OCR-ul funcționează mai bine pe imagini grayscale cu contrast bun
+    
+    return denoised
+
+def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = None, 
+                     grid_rows: int = 3, grid_cols: int = 3, zoom_factor: float = 2.0) -> list:
+    """
+    Rulează OCR pe zone diferite ale imaginii cu zoom pentru a detecta mai bine textul mic.
+    
+    Împarte imaginea în grid și rulează OCR pe fiecare zonă, eventual cu zoom.
+    
+    Args:
+        image: Imaginea de analizat (grayscale sau BGR)
+        search_terms: Lista de termeni de căutat
+        steps_dir: Director pentru debug (opțional)
+        grid_rows: Număr de rânduri în grid
+        grid_cols: Număr de coloane în grid
+        zoom_factor: Factor de zoom pentru fiecare zonă (1.0 = fără zoom)
+    
+    Returns:
+        Lista de text_boxes detectate: [(x, y, width, height, text, conf), ...]
+    """
+    if not TESSERACT_AVAILABLE:
+        return []
+    
+    h, w = image.shape[:2]
+    text_boxes = []
+    
+    # Preprocesăm întreaga imagine
+    processed_full = preprocess_image_for_ocr(image)
+    
+    # 1. OCR pe întreaga imagine preprocesată
+    print(f"         📝 OCR pe întreaga imagine (preprocesată)...")
+    ocr_data_full = pytesseract.image_to_data(processed_full, output_type=pytesseract.Output.DICT, lang='deu+eng')
+    
+    for i, text in enumerate(ocr_data_full['text']):
+        if text.strip():
+            text_clean = text.strip()
+            text_lower = text_clean.lower()
+            
+            found_term = None
+            for term in search_terms:
+                term_lower = term.lower()
+                if (term_lower == text_lower or 
+                    term_lower in text_lower or 
+                    text_lower in term_lower):
+                    found_term = term
+                    break
+            
+            if found_term:
+                x = ocr_data_full['left'][i]
+                y = ocr_data_full['top'][i]
+                width = ocr_data_full['width'][i]
+                height = ocr_data_full['height'][i]
+                conf = ocr_data_full['conf'][i]
+                
+                if conf > 70:
+                    text_boxes.append((x, y, width, height, text_clean, conf))
+                    print(f"         ✅ Detectat (full): '{text_clean}' la ({x}, {y}) cu confidență {conf:.1f}%")
+    
+    # 2. Dacă nu am găsit nimic sau am găsit doar rezultate cu confidence scăzut, încercăm pe zone
+    if not text_boxes or (text_boxes and max(box[5] for box in text_boxes) < 80):
+        print(f"         🔍 Împărțim imaginea în {grid_rows}x{grid_cols} zone pentru OCR detaliat...")
+        
+        zone_h = h // grid_rows
+        zone_w = w // grid_cols
+        
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                # Calculăm coordonatele zonei (cu overlap pentru a nu pierde text la marginile zonei)
+                overlap = 50  # pixeli de overlap între zone
+                y_start = max(0, row * zone_h - overlap)
+                y_end = min(h, (row + 1) * zone_h + overlap)
+                x_start = max(0, col * zone_w - overlap)
+                x_end = min(w, (col + 1) * zone_w + overlap)
+                
+                # Extragem zona
+                zone = image[y_start:y_end, x_start:x_end]
+                
+                if zone.size == 0:
+                    continue
+                
+                # Preprocesăm zona
+                zone_processed = preprocess_image_for_ocr(zone)
+                
+                # Aplicăm zoom dacă este necesar
+                if zoom_factor > 1.0:
+                    zone_h_scaled = int(zone_processed.shape[0] * zoom_factor)
+                    zone_w_scaled = int(zone_processed.shape[1] * zoom_factor)
+                    zone_zoomed = cv2.resize(zone_processed, (zone_w_scaled, zone_h_scaled), 
+                                            interpolation=cv2.INTER_CUBIC)
+                else:
+                    zone_zoomed = zone_processed
+                
+                # Salvăm zonele procesate pentru debug (doar primele 3 zone)
+                if steps_dir and (row * grid_cols + col) < 3:
+                    debug_path = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_processed.png"
+                    cv2.imwrite(str(debug_path), zone_zoomed)
+                
+                # OCR pe zonă
+                try:
+                    ocr_data_zone = pytesseract.image_to_data(zone_zoomed, output_type=pytesseract.Output.DICT, lang='deu+eng')
+                    
+                    for i, text in enumerate(ocr_data_zone['text']):
+                        if text.strip():
+                            text_clean = text.strip()
+                            text_lower = text_clean.lower()
+                            
+                            found_term = None
+                            for term in search_terms:
+                                term_lower = term.lower()
+                                if (term_lower == text_lower or 
+                                    term_lower in text_lower or 
+                                    text_lower in term_lower):
+                                    found_term = term
+                                    break
+                            
+                            if found_term:
+                                # Coordonatele relative în zona zoomed
+                                rel_x = ocr_data_zone['left'][i]
+                                rel_y = ocr_data_zone['top'][i]
+                                rel_width = ocr_data_zone['width'][i]
+                                rel_height = ocr_data_zone['height'][i]
+                                
+                                # Convertim înapoi la coordonatele originale (ținând cont de zoom)
+                                if zoom_factor > 1.0:
+                                    orig_x = int(rel_x / zoom_factor) + x_start
+                                    orig_y = int(rel_y / zoom_factor) + y_start
+                                    orig_width = int(rel_width / zoom_factor)
+                                    orig_height = int(rel_height / zoom_factor)
+                                else:
+                                    orig_x = rel_x + x_start
+                                    orig_y = rel_y + y_start
+                                    orig_width = rel_width
+                                    orig_height = rel_height
+                                
+                                conf = ocr_data_zone['conf'][i]
+                                
+                                if conf > 70:
+                                    text_boxes.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
+                                    print(f"         ✅ Detectat (zona {row+1},{col+1}): '{text_clean}' la ({orig_x}, {orig_y}) cu confidență {conf:.1f}%")
+                except Exception as e:
+                    print(f"         ⚠️ Eroare OCR pe zona {row+1},{col+1}: {e}")
+                    continue
+    
+    return text_boxes
+
 def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarray:
     """
     Detectează cuvântul "terasa" (sau variante în germană) în plan și umple camera respectivă cu flood fill.
@@ -661,7 +845,7 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
     if ocr_image.shape[:2] != (h, w):
         ocr_image = cv2.resize(ocr_image, (w, h))
     
-    # Pas 2: Detectăm textul folosind OCR sau metoda alternativă
+    # Pas 2: Detectăm textul folosind OCR cu preprocesare și analiză pe zone
     print(f"         🔍 Pas 1: Detectez text (terasa/etc)...")
     
     # Variante ale cuvântului "terasa" (fără "erdgeschoss" care înseamnă parter)
@@ -677,40 +861,21 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
     
     try:
         if use_ocr:
-            # Metoda 1: OCR cu pytesseract
-            print(f"         📝 Folosesc OCR (pytesseract)...")
-            ocr_data = pytesseract.image_to_data(ocr_image, output_type=pytesseract.Output.DICT, lang='deu+eng')
+            # Metoda îmbunătățită: OCR cu preprocesare și analiză pe zone
+            print(f"         📝 Folosesc OCR cu preprocesare și analiză pe zone...")
             
-            for i, text in enumerate(ocr_data['text']):
-                if text.strip():
-                    text_clean = text.strip()
-                    text_lower = text_clean.lower()
-                    
-                    # Căutăm exact cuvântul în text
-                    found_term = None
-                    for term in search_terms:
-                        term_lower = term.lower()
-                        # Verificăm dacă termenul este exact în text sau ca cuvânt separat
-                        if (term_lower == text_lower or 
-                            term_lower in text_lower or 
-                            text_lower in term_lower):
-                            found_term = term
-                            break  # Oprim după ce găsim primul match pentru acest text
-                    
-                    # Dacă am găsit un termen, adăugăm zona (doar dacă confidence > 70%)
-                    if found_term:
-                        x = ocr_data['left'][i]
-                        y = ocr_data['top'][i]
-                        width = ocr_data['width'][i]
-                        height = ocr_data['height'][i]
-                        conf = ocr_data['conf'][i]
-                        
-                        if conf > 70:  # Doar confidence peste 70%
-                            text_boxes.append((x, y, width, height, text_clean, conf))
-                            text_found = True
-                            print(f"         ✅ Detectat (OCR): '{text_clean}' (căutat '{found_term}') la ({x}, {y}) cu confidență {conf:.1f}%")
-                        else:
-                            print(f"         ⚠️ Detectat '{text_clean}' dar confidence {conf:.1f}% < 70% - ignorat")
+            # Salvez imaginea preprocesată pentru debug
+            if steps_dir:
+                processed_img = preprocess_image_for_ocr(ocr_image)
+                cv2.imwrite(str(Path(steps_dir) / "02g_00_preprocessed.png"), processed_img)
+                print(f"         💾 Salvat: 02g_00_preprocessed.png (imagine preprocesată)")
+            
+            # Rulează OCR pe zone cu zoom
+            text_boxes = run_ocr_on_zones(ocr_image, search_terms, steps_dir, 
+                                         grid_rows=3, grid_cols=3, zoom_factor=2.0)
+            
+            if text_boxes:
+                text_found = True
         else:
             # Metoda 2: FĂRĂ OCR nu putem identifica specific cuvântul "terasa"
             # Deci nu mai detectăm zone de text generic, ci doar returnăm fără să facem nimic
