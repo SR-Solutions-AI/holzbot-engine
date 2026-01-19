@@ -710,23 +710,43 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
     if not text_boxes or (text_boxes and max(box[5] for box in text_boxes) < 80):
         print(f"         🔍 Împărțim imaginea în {grid_rows}x{grid_cols} zone pentru OCR detaliat...")
         
-        zone_h = h // grid_rows
-        zone_w = w // grid_cols
+        overlap = 50  # pixeli de overlap între zone
         
         for row in range(grid_rows):
             for col in range(grid_cols):
-                # Calculăm coordonatele zonei (cu overlap pentru a nu pierde text la marginile zonei)
-                overlap = 50  # pixeli de overlap între zone
-                y_start = max(0, row * zone_h - overlap)
-                y_end = min(h, (row + 1) * zone_h + overlap)
-                x_start = max(0, col * zone_w - overlap)
-                x_end = min(w, (col + 1) * zone_w + overlap)
+                # Calculăm coordonatele zonei corect, asigurându-ne că ultima zonă acoperă tot restul
+                if row == 0:
+                    y_start = 0
+                else:
+                    y_start = max(0, row * h // grid_rows - overlap)
+                
+                if row == grid_rows - 1:
+                    y_end = h  # Ultima zonă merge până la capăt
+                else:
+                    y_end = min(h, (row + 1) * h // grid_rows + overlap)
+                
+                if col == 0:
+                    x_start = 0
+                else:
+                    x_start = max(0, col * w // grid_cols - overlap)
+                
+                if col == grid_cols - 1:
+                    x_end = w  # Ultima zonă merge până la capăt
+                else:
+                    x_end = min(w, (col + 1) * w // grid_cols + overlap)
+                
+                # Verificăm că zona este validă
+                if x_start >= x_end or y_start >= y_end:
+                    continue
                 
                 # Extragem zona
                 zone = image[y_start:y_end, x_start:x_end]
                 
                 if zone.size == 0:
                     continue
+                
+                # Dimensiunile zonei originale (înainte de zoom)
+                zone_orig_h, zone_orig_w = zone.shape[:2]
                 
                 # Preprocesăm zona
                 zone_processed = preprocess_image_for_ocr(zone)
@@ -744,6 +764,9 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                 if steps_dir and (row * grid_cols + col) < 3:
                     debug_path = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_processed.png"
                     cv2.imwrite(str(debug_path), zone_zoomed)
+                    # Salvăm și zona originală pentru comparație
+                    debug_path_orig = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_original.png"
+                    cv2.imwrite(str(debug_path_orig), zone)
                 
                 # OCR pe zonă
                 try:
@@ -764,23 +787,36 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                                     break
                             
                             if found_term:
-                                # Coordonatele relative în zona zoomed
-                                rel_x = ocr_data_zone['left'][i]
-                                rel_y = ocr_data_zone['top'][i]
-                                rel_width = ocr_data_zone['width'][i]
-                                rel_height = ocr_data_zone['height'][i]
+                                # Coordonatele în zona zoomed
+                                rel_x_zoomed = ocr_data_zone['left'][i]
+                                rel_y_zoomed = ocr_data_zone['top'][i]
+                                rel_width_zoomed = ocr_data_zone['width'][i]
+                                rel_height_zoomed = ocr_data_zone['height'][i]
                                 
-                                # Convertim înapoi la coordonatele originale (ținând cont de zoom)
+                                # Convertim coordonatele din zona zoomed la zona originală (fără zoom)
                                 if zoom_factor > 1.0:
-                                    orig_x = int(rel_x / zoom_factor) + x_start
-                                    orig_y = int(rel_y / zoom_factor) + y_start
-                                    orig_width = int(rel_width / zoom_factor)
-                                    orig_height = int(rel_height / zoom_factor)
+                                    # Coordonatele relative în zona originală (fără zoom)
+                                    rel_x = rel_x_zoomed / zoom_factor
+                                    rel_y = rel_y_zoomed / zoom_factor
+                                    rel_width = rel_width_zoomed / zoom_factor
+                                    rel_height = rel_height_zoomed / zoom_factor
                                 else:
-                                    orig_x = rel_x + x_start
-                                    orig_y = rel_y + y_start
-                                    orig_width = rel_width
-                                    orig_height = rel_height
+                                    rel_x = rel_x_zoomed
+                                    rel_y = rel_y_zoomed
+                                    rel_width = rel_width_zoomed
+                                    rel_height = rel_height_zoomed
+                                
+                                # Convertim la coordonatele absolute în imaginea completă
+                                orig_x = int(rel_x) + x_start
+                                orig_y = int(rel_y) + y_start
+                                orig_width = int(rel_width)
+                                orig_height = int(rel_height)
+                                
+                                # Verificăm că coordonatele sunt în limitele imaginii
+                                orig_x = max(0, min(orig_x, w - 1))
+                                orig_y = max(0, min(orig_y, h - 1))
+                                orig_width = min(orig_width, w - orig_x)
+                                orig_height = min(orig_height, h - orig_y)
                                 
                                 conf = ocr_data_zone['conf'][i]
                                 
