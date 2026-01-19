@@ -713,31 +713,41 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
         
         overlap = 50  # pixeli de overlap între zone
         
+        # Calculăm dimensiunile de bază ale unei zone (folosind diviziune reală pentru acoperire completă)
+        zone_height_base = h / grid_rows
+        zone_width_base = w / grid_cols
+        
         for row in range(grid_rows):
             for col in range(grid_cols):
-                # Calculăm coordonatele zonei corect, asigurându-ne că ultima zonă acoperă tot restul
+                # Calculăm coordonatele zonei astfel încât să acopere complet imaginea
+                # Prima zonă începe de la 0
                 if row == 0:
                     y_start = 0
                 else:
-                    y_start = max(0, row * h // grid_rows - overlap)
+                    # Zonele intermediare au overlap cu zona anterioară
+                    y_start = max(0, int(row * zone_height_base) - overlap)
                 
+                # Ultima zonă merge până la marginea imaginii (h)
                 if row == grid_rows - 1:
-                    y_end = h  # Ultima zonă merge până la capăt
+                    y_end = h
                 else:
-                    y_end = min(h, (row + 1) * h // grid_rows + overlap)
+                    # Zonele intermediare se termină cu overlap pentru următoarea zonă
+                    y_end = min(h, int((row + 1) * zone_height_base) + overlap)
                 
+                # Același lucru pentru coloane
                 if col == 0:
                     x_start = 0
                 else:
-                    x_start = max(0, col * w // grid_cols - overlap)
+                    x_start = max(0, int(col * zone_width_base) - overlap)
                 
                 if col == grid_cols - 1:
-                    x_end = w  # Ultima zonă merge până la capăt
+                    x_end = w
                 else:
-                    x_end = min(w, (col + 1) * w // grid_cols + overlap)
+                    x_end = min(w, int((col + 1) * zone_width_base) + overlap)
                 
                 # Verificăm că zona este validă
                 if x_start >= x_end or y_start >= y_end:
+                    print(f"         ⚠️ Zona ({row+1},{col+1}) invalidă: x=[{x_start},{x_end}), y=[{y_start},{y_end})")
                     continue
                 
                 # Extragem zona
