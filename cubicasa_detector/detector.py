@@ -771,8 +771,8 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                 else:
                     zone_zoomed = zone_processed
                 
-                # Salvăm zonele procesate pentru debug (doar primele 3 zone)
-                if steps_dir and (row * grid_cols + col) < 3:
+                # Salvăm zonele procesate pentru debug (toate zonele)
+                if steps_dir:
                     debug_path = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_processed.png"
                     cv2.imwrite(str(debug_path), zone_zoomed)
                     # Salvăm și zona originală pentru comparație
