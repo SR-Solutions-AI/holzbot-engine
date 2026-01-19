@@ -687,14 +687,14 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
             text_clean = text.strip()
             text_lower = text_clean.lower()
             
-                            found_term = None
-                            for term in search_terms:
-                                term_lower = term.lower()
-                                # Verificăm doar match exact (case-insensitive)
-                                # Nu acceptăm fragmente - doar cuvântul complet "terasa" sau variantele sale exacte
-                                if term_lower == text_lower:
-                                    found_term = term
-                                    break
+            found_term = None
+            for term in search_terms:
+                term_lower = term.lower()
+                # Verificăm doar match exact (case-insensitive)
+                # Nu acceptăm fragmente - doar cuvântul complet "terasa" sau variantele sale exacte
+                if term_lower == text_lower:
+                    found_term = term
+                    break
             
             if found_term:
                 x = ocr_data_full['left'][i]
