@@ -631,7 +631,7 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
     h, w = walls_mask.shape[:2]
     result = walls_mask.copy()
     
-    print(f"      🏡 Detectez și umplu camere (terasa/erdgeschoss/etc)...")
+    print(f"      🏡 Detectez și umplu camere (terasa/etc)...")
     
     # Pas 1: Încărcăm overlay-ul sau original-ul pentru OCR
     overlay_path = None
@@ -662,12 +662,11 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
         ocr_image = cv2.resize(ocr_image, (w, h))
     
     # Pas 2: Detectăm textul folosind OCR sau metoda alternativă
-    print(f"         🔍 Pas 1: Detectez text (terasa/erdgeschoss/etc)...")
+    print(f"         🔍 Pas 1: Detectez text (terasa/etc)...")
     
-    # Variante ale cuvântului "terasa" și "erdgeschoss" în germană
+    # Variante ale cuvântului "terasa" (fără "erdgeschoss" care înseamnă parter)
     search_terms = [
         "terrasse", "Terrasse", "TERRASSE", "terasa", "Terasa", "TERASA",
-        "erdgeschoss", "Erdgeschoss", "ERDGESCHOSS", "erdgeschoss", "Erdgeschoss",
         "terrace", "Terrace", "TERRACE",  # engleză
         "terrasa", "Terrasa", "TERRASA",  # variante
         "terras", "Terras", "TERRAS"  # variante scurte
@@ -698,7 +697,7 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
                             found_term = term
                             break  # Oprim după ce găsim primul match pentru acest text
                     
-                    # Dacă am găsit un termen, adăugăm zona
+                    # Dacă am găsit un termen, adăugăm zona (doar dacă confidence > 70%)
                     if found_term:
                         x = ocr_data['left'][i]
                         y = ocr_data['top'][i]
@@ -706,20 +705,30 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
                         height = ocr_data['height'][i]
                         conf = ocr_data['conf'][i]
                         
-                        if conf > 0:
+                        if conf > 70:  # Doar confidence peste 70%
                             text_boxes.append((x, y, width, height, text_clean, conf))
                             text_found = True
                             print(f"         ✅ Detectat (OCR): '{text_clean}' (căutat '{found_term}') la ({x}, {y}) cu confidență {conf:.1f}%")
+                        else:
+                            print(f"         ⚠️ Detectat '{text_clean}' dar confidence {conf:.1f}% < 70% - ignorat")
         else:
-            # Metoda 2: FĂRĂ OCR nu putem identifica specific cuvântul "terasa" sau "erdgeschoss"
+            # Metoda 2: FĂRĂ OCR nu putem identifica specific cuvântul "terasa"
             # Deci nu mai detectăm zone de text generic, ci doar returnăm fără să facem nimic
-            print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul 'terasa'/'erdgeschoss'.")
+            print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul 'terasa'.")
             print(f"         ⚠️ Metoda alternativă este dezactivată - necesită OCR pentru identificare precisă.")
             text_found = False
             text_boxes = []
         
+        # Selectăm rezultatul cu confidence maxim (dacă există)
+        if text_boxes:
+            # Sortăm după confidence (descrescător) și luăm primul
+            text_boxes.sort(key=lambda box: box[5], reverse=True)  # box[5] = confidence
+            best_box = text_boxes[0]
+            text_boxes = [best_box]  # Păstrăm doar cel mai bun rezultat
+            print(f"         🎯 Selectat rezultatul cu confidence maxim: '{best_box[4]}' cu {best_box[5]:.1f}%")
+        
         if not text_found:
-            print(f"         ⚠️ Nu s-a detectat text (terasa/erdgeschoss/etc) în plan.")
+            print(f"         ⚠️ Nu s-a detectat text (terasa/etc) în plan sau toate au confidence < 70%.")
             if steps_dir:
                 vis_ocr = ocr_image.copy()
                 cv2.imwrite(str(Path(steps_dir) / "02g_01_ocr_result.png"), vis_ocr)
@@ -780,9 +789,12 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
                     outdoor_mask = cv2.resize(outdoor_mask, (w, h))
                 print(f"         📸 Folosesc outdoor_mask pentru filtrare")
         
-        # Pentru fiecare text detectat - procesăm DOAR primul match (erdgeschoss sau terrasse)
+        # Procesăm DOAR rezultatul cu confidence maxim (dacă există)
         rooms_filled = 0
-        for box_idx, (x, y, width, height, text, conf) in enumerate(text_boxes):
+        if text_boxes:
+            # Procesăm doar primul (și singurul) rezultat - cel cu confidence maxim
+            box_idx = 0
+            x, y, width, height, text, conf = text_boxes[0]
             # Centrul textului
             center_x = x + width // 2
             center_y = y + height // 2
@@ -791,146 +803,144 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
             if 0 <= center_y < h and 0 <= center_x < w:
                 if spaces_mask[center_y, center_x] == 255:  # Spațiu liber
                     # Dacă OCR a detectat textul, facem flood fill direct (fără filtrare suplimentară)
-                    # pentru că OCR deja a identificat specific cuvântul "terasa" sau "erdgeschoss"
+                    # pentru că OCR deja a identificat specific cuvântul "terasa"
                     if not use_ocr:
                         # Dacă nu avem OCR, nu mai facem nimic (metoda alternativă este dezactivată)
                         print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul. Skip.")
-                        continue
-                    
-                    print(f"         🎯 Găsit cuvântul '{text}' - fac flood fill doar pentru această cameră...")
-                    # Facem flood fill din centrul textului pe overlay-ul combinat
-                    # Flood fill-ul se va opri automat când întâlnește pereți (linii închise în overlay)
-                    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-                    flood_fill_flags = 4  # 4-conectivitate
-                    flood_fill_flags |= cv2.FLOODFILL_MASK_ONLY
-                    flood_fill_flags |= (255 << 8)  # Fill value
-                    
-                    seed_point = (center_x, center_y)
-                    
-                    # Folosim overlay-ul combinat pentru flood fill
-                    if overlay_combined is not None:
-                        # Convertim overlay-ul la grayscale pentru flood fill
-                        overlay_for_fill = cv2.cvtColor(overlay_combined, cv2.COLOR_BGR2GRAY)
-                        # Toleranță pentru a se opri la pereți (pereții sunt mai închiși în overlay)
-                        lo_diff = 30  # Toleranță pentru diferențe de culoare
-                        up_diff = 30
-                        fill_image = overlay_for_fill.copy()
-                        print(f"         🎨 Folosesc overlay combinat pentru flood fill")
                     else:
-                        # Fallback la spaces_mask dacă nu avem overlay
-                        fill_image = spaces_mask.copy()
-                        lo_diff = 0  # Nu acceptă diferențe - se oprește exact la pereți
-                        up_diff = 0
-                        print(f"         ⚠️ Folosesc spaces_mask simplu (overlay indisponibil)")
-                    
-                    # Facem flood fill pe imaginea combinată
-                    # Flood fill-ul se va opri automat când întâlnește pereți (valori diferite)
-                    _, _, _, rect = cv2.floodFill(
-                        fill_image, 
-                        flood_mask, 
-                        seed_point, 
-                        128,  # Valoare de fill (nu este folosită cu FLOODFILL_MASK_ONLY)
-                        lo_diff, 
-                        up_diff, 
-                        flood_fill_flags
-                    )
-                    
-                    # Extragem zona umplută din mask
-                    filled_region = (flood_mask[1:h+1, 1:w+1] == 255).astype(np.uint8) * 255
-                    
-                    # Verificăm că nu am umplut peste pereți (safety check)
-                    # Zona umplută nu trebuie să conțină pixeli de perete
-                    overlap_with_walls = np.sum((filled_region > 0) & (walls_mask > 0))
-                    if overlap_with_walls > 0:
-                        print(f"         ⚠️ Flood fill a depășit pereții ({overlap_with_walls} pixeli). Corectez...")
-                        # Eliminăm pixeli care sunt pe pereți
-                        filled_region = cv2.bitwise_and(filled_region, cv2.bitwise_not(walls_mask))
-                    
-                    # Verificăm dacă am umplut o zonă suficient de mare (minim 1000 pixeli)
-                    filled_area = np.count_nonzero(filled_region)
-                    if filled_area > 1000:
-                        print(f"         🔍 Extrag conturul zonei detectate pentru a completa golurile...")
+                        print(f"         🎯 Găsit cuvântul '{text}' (confidence {conf:.1f}%) - fac flood fill pentru această cameră...")
+                        # Facem flood fill din centrul textului pe overlay-ul combinat
+                        # Flood fill-ul se va opri automat când întâlnește pereți (linii închise în overlay)
+                        flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+                        flood_fill_flags = 4  # 4-conectivitate
+                        flood_fill_flags |= cv2.FLOODFILL_MASK_ONLY
+                        flood_fill_flags |= (255 << 8)  # Fill value
                         
-                        # Inițializăm variabilele pentru vizualizare
-                        gaps = None
-                        wall_border = None
-                        contours = None
+                        seed_point = (center_x, center_y)
                         
-                        # Extragem conturul zonei umplute
-                        contours, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        
-                        if contours:
-                            # Găsim cel mai mare contur (zona principală)
-                            largest_contour = max(contours, key=cv2.contourArea)
-                            
-                            # Creăm o mască pentru conturul complet
-                            contour_mask = np.zeros((h, w), dtype=np.uint8)
-                            # Desenăm conturul cu grosime adaptivă (grosimea peretelui)
-                            wall_thickness = max(3, int(min(w, h) * 0.003))  # Grosime adaptivă
-                            cv2.drawContours(contour_mask, [largest_contour], -1, 255, wall_thickness)
-                            
-                            # Identificăm golurile: unde conturul există dar pereții nu există
-                            # Golurile sunt în contur_mask dar nu în walls_mask
-                            gaps = cv2.bitwise_and(contour_mask, cv2.bitwise_not(walls_mask))
-                            
-                            # Completăm doar golurile (nu desenăm peste pereții existenți)
-                            walls_to_add = gaps
-                            
-                            # Adăugăm pereții noi (doar golurile) la masca finală
-                            result = cv2.bitwise_or(result, walls_to_add)
-                            
-                            gaps_area = np.count_nonzero(gaps)
-                            print(f"         ✅ Completat {gaps_area} pixeli de goluri în pereți conform conturului")
+                        # Folosim overlay-ul combinat pentru flood fill
+                        if overlay_combined is not None:
+                            # Convertim overlay-ul la grayscale pentru flood fill
+                            overlay_for_fill = cv2.cvtColor(overlay_combined, cv2.COLOR_BGR2GRAY)
+                            # Toleranță pentru a se opri la pereți (pereții sunt mai închiși în overlay)
+                            lo_diff = 30  # Toleranță pentru diferențe de culoare
+                            up_diff = 30
+                            fill_image = overlay_for_fill.copy()
+                            print(f"         🎨 Folosesc overlay combinat pentru flood fill")
                         else:
-                            print(f"         ⚠️ Nu s-au găsit contururi în zona umplută")
-                            # Fallback la metoda veche (dilatare)
-                            kernel_size = max(3, int(min(w, h) * 0.005))  # Adaptiv
-                            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                            filled_dilated = cv2.dilate(filled_region, kernel, iterations=1)
-                            wall_border = cv2.subtract(filled_dilated, filled_region)
-                            result = cv2.bitwise_or(result, wall_border)
+                            # Fallback la spaces_mask dacă nu avem overlay
+                            fill_image = spaces_mask.copy()
+                            lo_diff = 0  # Nu acceptă diferențe - se oprește exact la pereți
+                            up_diff = 0
+                            print(f"         ⚠️ Folosesc spaces_mask simplu (overlay indisponibil)")
                         
-                        rooms_filled += 1
+                        # Facem flood fill pe imaginea combinată
+                        # Flood fill-ul se va opri automat când întâlnește pereți (valori diferite)
+                        _, _, _, rect = cv2.floodFill(
+                            fill_image, 
+                            flood_mask, 
+                            seed_point, 
+                            128,  # Valoare de fill (nu este folosită cu FLOODFILL_MASK_ONLY)
+                            lo_diff, 
+                            up_diff, 
+                            flood_fill_flags
+                        )
                         
-                        print(f"         ✅ Umplut camera '{text}': {filled_area} pixeli")
+                        # Extragem zona umplută din mask
+                        filled_region = (flood_mask[1:h+1, 1:w+1] == 255).astype(np.uint8) * 255
                         
-                        # Vizualizăm zona umplută și golurile completate
-                        if steps_dir:
-                            vis_fill = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                            # Desenăm zona umplută cu transparență (galben)
-                            filled_colored = np.zeros_like(vis_fill)
-                            filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
-                            vis_fill = cv2.addWeighted(vis_fill, 0.7, filled_colored, 0.3, 0)
+                        # Verificăm că nu am umplut peste pereți (safety check)
+                        # Zona umplută nu trebuie să conțină pixeli de perete
+                        overlap_with_walls = np.sum((filled_region > 0) & (walls_mask > 0))
+                        if overlap_with_walls > 0:
+                            print(f"         ⚠️ Flood fill a depășit pereții ({overlap_with_walls} pixeli). Corectez...")
+                            # Eliminăm pixeli care sunt pe pereți
+                            filled_region = cv2.bitwise_and(filled_region, cv2.bitwise_not(walls_mask))
+                        
+                        # Verificăm dacă am umplut o zonă suficient de mare (minim 1000 pixeli)
+                        filled_area = np.count_nonzero(filled_region)
+                        if filled_area > 1000:
+                            print(f"         🔍 Extrag conturul zonei detectate pentru a completa golurile...")
                             
-                            # Desenăm conturul complet (albastru)
-                            if contours and len(contours) > 0:
+                            # Inițializăm variabilele pentru vizualizare
+                            gaps = None
+                            wall_border = None
+                            contours = None
+                            
+                            # Extragem conturul zonei umplute
+                            contours, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            
+                            if contours:
+                                # Găsim cel mai mare contur (zona principală)
                                 largest_contour = max(contours, key=cv2.contourArea)
-                                cv2.drawContours(vis_fill, [largest_contour], -1, (255, 0, 0), 2)  # Albastru pentru contur
+                                
+                                # Creăm o mască pentru conturul complet
+                                contour_mask = np.zeros((h, w), dtype=np.uint8)
+                                # Desenăm conturul cu grosime adaptivă (grosimea peretelui)
+                                wall_thickness = max(3, int(min(w, h) * 0.003))  # Grosime adaptivă
+                                cv2.drawContours(contour_mask, [largest_contour], -1, 255, wall_thickness)
+                                
+                                # Identificăm golurile: unde conturul există dar pereții nu există
+                                # Golurile sunt în contur_mask dar nu în walls_mask
+                                gaps = cv2.bitwise_and(contour_mask, cv2.bitwise_not(walls_mask))
+                                
+                                # Completăm doar golurile (nu desenăm peste pereții existenți)
+                                walls_to_add = gaps
+                                
+                                # Adăugăm pereții noi (doar golurile) la masca finală
+                                result = cv2.bitwise_or(result, walls_to_add)
+                                
+                                gaps_area = np.count_nonzero(gaps)
+                                print(f"         ✅ Completat {gaps_area} pixeli de goluri în pereți conform conturului")
+                            else:
+                                print(f"         ⚠️ Nu s-au găsit contururi în zona umplută")
+                                # Fallback la metoda veche (dilatare)
+                                kernel_size = max(3, int(min(w, h) * 0.005))  # Adaptiv
+                                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                                filled_dilated = cv2.dilate(filled_region, kernel, iterations=1)
+                                wall_border = cv2.subtract(filled_dilated, filled_region)
+                                result = cv2.bitwise_or(result, wall_border)
                             
-                            # Desenăm golurile completate (verde)
-                            if gaps is not None:
-                                gaps_colored = np.zeros_like(vis_fill)
-                                gaps_colored[gaps > 0] = [0, 255, 0]  # Verde pentru goluri completate
-                                vis_fill = cv2.addWeighted(vis_fill, 0.5, gaps_colored, 0.5, 0)
-                            elif wall_border is not None:
-                                # Fallback: desenăm pereții noi (verde)
-                                wall_border_colored = np.zeros_like(vis_fill)
-                                wall_border_colored[wall_border > 0] = [0, 255, 0]  # Verde
-                                vis_fill = cv2.addWeighted(vis_fill, 0.5, wall_border_colored, 0.5, 0)
+                            rooms_filled += 1
                             
-                            # Desenăm centrul textului (roșu)
-                            cv2.circle(vis_fill, (center_x, center_y), 5, (0, 0, 255), -1)
-                            cv2.rectangle(vis_fill, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                            print(f"         ✅ Umplut camera '{text}': {filled_area} pixeli")
                             
-                            output_path = Path(steps_dir) / f"02g_02_terrace_fill_{box_idx + 1}.png"
-                            cv2.imwrite(str(output_path), vis_fill)
-                            print(f"         💾 Salvat: {output_path.name}")
-                        
-                        # Oprim după primul match - am găsit terasa/erdgeschoss și am umplut camera
-                        print(f"         ✅ Gata! Am umplut camera terasei. Oprește procesarea.")
-                        break  # Oprește loop-ul după primul match
-                    else:
-                        print(f"         ⚠️ Zona detectată prea mică ({filled_area} pixeli). Skip.")
+                            # Vizualizăm zona umplută și golurile completate
+                            if steps_dir:
+                                vis_fill = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                                # Desenăm zona umplută cu transparență (galben)
+                                filled_colored = np.zeros_like(vis_fill)
+                                filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                                vis_fill = cv2.addWeighted(vis_fill, 0.7, filled_colored, 0.3, 0)
+                                
+                                # Desenăm conturul complet (albastru)
+                                if contours and len(contours) > 0:
+                                    largest_contour = max(contours, key=cv2.contourArea)
+                                    cv2.drawContours(vis_fill, [largest_contour], -1, (255, 0, 0), 2)  # Albastru pentru contur
+                                
+                                # Desenăm golurile completate (verde)
+                                if gaps is not None:
+                                    gaps_colored = np.zeros_like(vis_fill)
+                                    gaps_colored[gaps > 0] = [0, 255, 0]  # Verde pentru goluri completate
+                                    vis_fill = cv2.addWeighted(vis_fill, 0.5, gaps_colored, 0.5, 0)
+                                elif wall_border is not None:
+                                    # Fallback: desenăm pereții noi (verde)
+                                    wall_border_colored = np.zeros_like(vis_fill)
+                                    wall_border_colored[wall_border > 0] = [0, 255, 0]  # Verde
+                                    vis_fill = cv2.addWeighted(vis_fill, 0.5, wall_border_colored, 0.5, 0)
+                                
+                                # Desenăm centrul textului (roșu)
+                                cv2.circle(vis_fill, (center_x, center_y), 5, (0, 0, 255), -1)
+                                cv2.rectangle(vis_fill, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                                
+                                output_path = Path(steps_dir) / f"02g_02_terrace_fill_{box_idx + 1}.png"
+                                cv2.imwrite(str(output_path), vis_fill)
+                                print(f"         💾 Salvat: {output_path.name}")
+                            
+                            # Am umplut camera terasei
+                            print(f"         ✅ Gata! Am umplut camera terasei.")
+                        else:
+                            print(f"         ⚠️ Zona detectată prea mică ({filled_area} pixeli). Skip.")
                 else:
                     print(f"         ⚠️ Centrul textului '{text}' este pe un perete. Skip.")
         
