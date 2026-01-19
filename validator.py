@@ -10,7 +10,6 @@ from PIL import Image
 from openai import OpenAI
 
 # Config
-MAX_DIMENSION = 1500  # Limita cerută de tine (anulăm dacă e mai mare)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 def validate_plan(file_url):
@@ -49,16 +48,7 @@ def validate_plan(file_url):
             except Exception as e:
                 return {"valid": False, "reason": "Invalid Image Format"}
 
-        # 3. Verificare Dimensiuni (CRITERIUL TĂU: > 1000px ANULĂM)
-        # Notă: De obicei planurile sunt mari. Ești sigur că vrei să anulezi dacă e MARE?
-        # Codul de mai jos respectă cerința ta strictă.
-        if img_width > MAX_DIMENSION or img_height > MAX_DIMENSION:
-            return {
-                "valid": False, 
-                "reason": f"Plan zu groß ({img_width}x{img_height}) px. Die maximale Größe ist ({MAX_DIMENSION}x{MAX_DIMENSION}) px."
-            }
-
-        # 4. Pregătire pentru OpenAI (Base64)
+        # 3. Pregătire pentru OpenAI (Base64)
         image_data.seek(0)
         base64_image = base64.b64encode(image_data.read()).decode('utf-8')
         data_url = f"data:image/png;base64,{base64_image}"

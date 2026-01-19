@@ -41,9 +41,14 @@ def calculate_pricing_for_plan(
     ventilation_coeffs = pricing_coeffs["utilities"]["ventilation"]
     sewage_coeffs = pricing_coeffs["utilities"]["sewage"]
 
-    # 2. EXTRAGE ARII (NESCHIMBAT)
+    # 2. EXTRAGE ARII
     walls_data = area_data.get("walls", {})
-    w_int_net = float(walls_data.get("interior", {}).get("net_area_m2", 0.0))
+    # Pentru structură: folosim net_area_m2_structure pentru interior
+    w_int_net_structure = float(walls_data.get("interior", {}).get("net_area_m2_structure", 
+                                                                    walls_data.get("interior", {}).get("net_area_m2", 0.0)))
+    # Pentru finisaje: folosim net_area_m2 pentru interior
+    w_int_net_finish = float(walls_data.get("interior", {}).get("net_area_m2", 0.0))
+    # Exterior: același pentru structură și finisaje
     w_ext_net = float(walls_data.get("exterior", {}).get("net_area_m2", 0.0))
     
     surfaces = area_data.get("surfaces", {})
@@ -248,12 +253,12 @@ def calculate_pricing_for_plan(
     # 4. CALCULE COMPONENTE (NESCHIMBAT - DOAR INPUTURILE SUNT NOI)
     
     cost_walls = calculate_walls_details(
-        system_coeffs, w_int_net, w_ext_net,
+        system_coeffs, w_int_net_structure, w_ext_net,
         system=system_constructie, prefab_type=prefab_type
     )
     
     cost_finishes = calculate_finishes_details(
-        finish_coeffs, w_int_net, w_ext_net,
+        finish_coeffs, w_int_net_finish, w_ext_net,
         type_int=finish_int, type_ext=finish_ext,
         floor_label=floor_label
     )
@@ -321,7 +326,7 @@ def calculate_pricing_for_plan(
     )
 
     # 6. CALCUL BASEMENT (dacă există)
-    # Dacă avem basement, calculăm costurile folosind datele de la ground floor
+    # Calculăm beciul folosind coeficienți multiplicați cu suprafața parterului
     cost_basement = {"total_cost": 0.0, "detailed_items": []}
     structura_cladirii = frontend_input.get("structuraCladirii", {})
     tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci", "")
@@ -329,47 +334,101 @@ def calculate_pricing_for_plan(
     has_basement_livable = has_basement and "mit einfachem Ausbau" in str(tip_fundatie_beci)
     
     if has_basement and is_ground_floor:
-        # Pentru basement, folosim aceleași arii ca la ground floor
-        # Basement-ul are doar pereți interiori (nu exteriori, pentru că e subteran)
-        # Folosim finisajele pentru basement
+        # Coeficienți pentru beci
+        if has_basement_livable:
+            # Beci locuibil: coeficienți mai mari (include finisaje elaborate)
+            coeff_walls = 0.85  # 85% din pereții parterului
+            coeff_floors = 0.90  # 90% din suprafața parterului
+        else:
+            # Beci nelocuibil: coeficienți mai mici (finisaje simple/minime)
+            coeff_walls = 0.60  # 60% din pereții parterului
+            coeff_floors = 0.70  # 70% din suprafața parterului
+        
+        # Finisaje pentru basement (folosim finisajul specificat pentru beci sau fallback la interior)
         finish_int_beci = _norm_finish(
             mat_finisaj.get("finisajInteriorBeci") or finish_int,
             "Tencuială"
         )
         
-        # Pereți interiori pentru basement (folosim aceeași arie ca la ground floor)
+        # Calculăm ariile pentru beci folosind coeficienții
+        w_int_net_structure_basement = w_int_net_structure * coeff_walls
+        w_int_net_finish_basement = w_int_net_finish * coeff_walls
+        floor_area_basement = floor_area * coeff_floors
+        ceiling_area_basement = ceiling_area * coeff_floors
+        
+        print(f"   📐 [BASEMENT] Coeficienți aplicați: pereți={coeff_walls:.0%}, podele={coeff_floors:.0%}")
+        print(f"      - Pereți structură: {w_int_net_structure:.2f} m² × {coeff_walls:.0%} = {w_int_net_structure_basement:.2f} m²")
+        print(f"      - Pereți finisaje: {w_int_net_finish:.2f} m² × {coeff_walls:.0%} = {w_int_net_finish_basement:.2f} m²")
+        print(f"      - Podele: {floor_area:.2f} m² × {coeff_floors:.0%} = {floor_area_basement:.2f} m²")
+        
+        # Pereți interiori pentru basement (folosim ariile calculate cu coeficienții)
         cost_walls_basement = calculate_walls_details(
-            system_coeffs, w_int_net, 0.0,  # Nu avem pereți exteriori pentru basement
+            system_coeffs, w_int_net_structure_basement, 0.0,  # Nu avem pereți exteriori pentru basement
             system=system_constructie, prefab_type=prefab_type
         )
         
-        # Finisaje interioare pentru basement (doar pereți interiori)
+        # Finisaje interioare pentru basement (folosim ariile calculate cu coeficienții)
         cost_finishes_basement = calculate_finishes_details(
-            finish_coeffs, w_int_net, 0.0,  # Nu avem fațadă pentru basement
-            type_int=finish_int_beci, type_ext="Tencuială"  # Nu contează type_ext pentru basement
+            finish_coeffs, w_int_net_finish_basement, 0.0,  # Nu avem fațadă pentru basement
+            type_int=finish_int_beci, type_ext="Tencuială",  # Nu contează type_ext pentru basement
+            floor_label="Beci"
         )
         
-        # Podele și tavan pentru basement (folosim aceeași arie ca la ground floor)
+        # Podele și tavan pentru basement (folosim ariile calculate cu coeficienții)
         cost_floors_basement = calculate_floors_details(
-            area_coeffs, floor_area, ceiling_area
+            area_coeffs, floor_area_basement, ceiling_area_basement
         )
         
-        # Utilități pentru basement (doar dacă este locuibil)
+        # Utilități pentru basement
         cost_utilities_basement = {"total_cost": 0.0, "detailed_items": []}
+        
         if has_basement_livable:
-            # Dacă beciul este locuibil, adăugăm utilități: curent, ventilație, încălzire, canalizare
+            # Beci locuibil: toate utilitățile (curent + încălzire + ventilație + canalizare)
+            # Folosim suprafața calculată cu coeficientul pentru beci
             cost_utilities_basement = calculate_utilities_details(
                 electricity_coeffs,
                 heating_coeffs,
                 ventilation_coeffs,
                 sewage_coeffs,
-                total_floor_area_m2=floor_area,  # Folosim aceeași arie ca la ground floor
+                total_floor_area_m2=floor_area_basement,  # Folosim suprafața calculată pentru beci
                 energy_level=energy_level,
                 heating_type=heating_type,
                 has_ventilation=has_ventilation,
                 has_sewage=True
             )
-            print(f"✅ [PRICING] Basement utilities calculated: {cost_utilities_basement['total_cost']:,.0f} EUR (livable basement)")
+            print(f"      ✅ Utilități beci locuibil: {cost_utilities_basement['total_cost']:,.0f} EUR (arie: {floor_area_basement:.2f} m²)")
+        else:
+            # Beci nelocuibil: doar curent + canalizare (fără încălzire și ventilație)
+            elec_base = float(electricity_coeffs.get("coefficient_electricity_per_m2", 60.0))
+            elec_modifiers = electricity_coeffs.get("energy_performance_modifiers", {})
+            elec_modifier = float(elec_modifiers.get(energy_level, 1.0))
+            elec_cost = floor_area_basement * elec_base * elec_modifier
+            
+            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0))
+            sewage_cost = floor_area_basement * sewage_base
+            
+            cost_utilities_basement = {
+                "total_cost": round(elec_cost + sewage_cost, 2),
+                "detailed_items": [
+                    {
+                        "category": "electricity",
+                        "name": f"Instalație electrică beci ({energy_level})",
+                        "area_m2": round(floor_area_basement, 2),
+                        "base_price_per_m2": elec_base,
+                        "energy_modifier": elec_modifier,
+                        "final_price_per_m2": round(elec_base * elec_modifier, 2),
+                        "total_cost": round(elec_cost, 2)
+                    },
+                    {
+                        "category": "sewage",
+                        "name": "Canalizare beci",
+                        "area_m2": round(floor_area_basement, 2),
+                        "base_price_per_m2": sewage_base,
+                        "total_cost": round(sewage_cost, 2)
+                    }
+                ]
+            }
+            print(f"      ✅ Utilități beci nelocuibil: {cost_utilities_basement['total_cost']:,.0f} EUR (arie: {floor_area_basement:.2f} m², doar curent + canalizare)")
         
         # Nu avem deschideri pentru basement (nu avem ferestre/uși exterioare)
         # Nu avem acoperiș pentru basement
@@ -394,8 +453,8 @@ def calculate_pricing_for_plan(
         
         # Adăugăm costurile basement-ului la total
         total_plan_cost += cost_basement["total_cost"]
-        basement_type = "livable" if has_basement_livable else "unheated"
-        print(f"✅ [PRICING] Basement calculated ({basement_type}): {cost_basement['total_cost']:,.0f} EUR (using ground floor data)")
+        basement_type = "locuibil" if has_basement_livable else "nelocuibil"
+        print(f"✅ [PRICING] Basement calculat ({basement_type}): {cost_basement['total_cost']:,.0f} EUR")
 
     return {
         "total_cost_eur": round(total_plan_cost, 2),

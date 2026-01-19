@@ -34,8 +34,14 @@ def calculate_areas_for_plan(
     # Acestea rămân calculate deoarece CubiCasa dă doar lungimea liniară, 
     # iar noi avem nevoie de suprafața verticală (mp) pentru deviz.
     avg = walls_measurements.get("estimations", {}).get("average_result", {})
-    interior_length_m = float(avg.get("interior_meters", 0.0))
-    exterior_length_m = float(avg.get("exterior_meters", 0.0))
+    
+    # Lungimi pentru finisaje (din outline)
+    interior_length_m_finish = float(avg.get("interior_meters", 0.0))  # Outline verde
+    exterior_length_m = float(avg.get("exterior_meters", 0.0))  # Outline albastru
+    
+    # Lungimi pentru structură (din skeleton)
+    interior_length_m_structure = float(avg.get("interior_meters_structure", avg.get("interior_meters", 0.0)))  # Skeleton interior
+    # Exterior rămâne același (outline albastru) pentru structură
     
     # Determinăm înălțimea pereților din formular
     wall_height_m = STANDARD_WALL_HEIGHT_M  # Default
@@ -54,12 +60,17 @@ def calculate_areas_for_plan(
             if inaltime_pereti_mansarda and float(inaltime_pereti_mansarda) > 0:
                 wall_height_m = float(inaltime_pereti_mansarda)
     
-    interior_walls_gross_m2 = interior_length_m * wall_height_m
+    # Arii brute pentru finisaje (folosim outline)
+    interior_walls_gross_m2_finish = interior_length_m_finish * wall_height_m
     exterior_walls_gross_m2 = exterior_length_m * wall_height_m
     
+    # Arii brute pentru structură (folosim skeleton pentru interior)
+    interior_walls_gross_m2_structure = interior_length_m_structure * wall_height_m
+    
     # Calculăm footprint-ul doar informativ (nu îl mai folosim la ariile casei)
+    # Folosim lungimea skeleton pentru structură interior
     walls_footprint_m2 = (
-        (interior_length_m * WALL_THICKNESS_INTERIOR_M) +
+        (interior_length_m_structure * WALL_THICKNESS_INTERIOR_M) +
         (exterior_length_m * WALL_THICKNESS_EXTERIOR_M)
     )
     
@@ -110,8 +121,15 @@ def calculate_areas_for_plan(
                 counts["doors_interior"] += 1
 
     # Arii pereți nete (Vertical)
+    # Pentru exterior: folosim outline (pentru finisaje și structură)
     exterior_walls_net_m2 = max(0.0, exterior_walls_gross_m2 - area_windows_m2 - area_doors_exterior_m2)
-    interior_walls_net_m2 = max(0.0, interior_walls_gross_m2 - area_doors_interior_m2)
+    
+    # Pentru interior finisaje: folosim outline verde
+    interior_walls_net_m2_finish = max(0.0, interior_walls_gross_m2_finish - area_doors_interior_m2)
+    
+    # Pentru interior structură: folosim skeleton (nu scădem deschiderile pentru structură)
+    # Structura pereților interiori se calculează pe baza skeleton-ului, fără să scădem deschiderile
+    interior_walls_net_m2_structure = max(0.0, interior_walls_gross_m2_structure - area_doors_interior_m2)
     
     # ==========================================
     # 3. SUPRAFEȚE ORIZONTALE (Direct Assignment)
@@ -153,10 +171,13 @@ def calculate_areas_for_plan(
         
         "walls": {
             "interior": {
-                "length_m": round(interior_length_m, 2),
-                "gross_area_m2": round(interior_walls_gross_m2, 2),
+                "length_m": round(interior_length_m_finish, 2),  # Pentru finisaje (outline)
+                "length_m_structure": round(interior_length_m_structure, 2),  # Pentru structură (skeleton)
+                "gross_area_m2": round(interior_walls_gross_m2_finish, 2),  # Pentru finisaje
+                "gross_area_m2_structure": round(interior_walls_gross_m2_structure, 2),  # Pentru structură
                 "openings_area_m2": round(area_doors_interior_m2, 2),
-                "net_area_m2": round(interior_walls_net_m2, 2)
+                "net_area_m2": round(interior_walls_net_m2_finish, 2),  # Pentru finisaje
+                "net_area_m2_structure": round(interior_walls_net_m2_structure, 2)  # Pentru structură
             },
             "exterior": {
                 "length_m": round(exterior_length_m, 2),

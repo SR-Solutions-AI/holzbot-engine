@@ -13,6 +13,7 @@ from PIL import Image
 from dotenv import load_dotenv
 
 from .common import STEP_DIRS, save_debug, resize_bgr_max_side, get_output_dir
+from .classifier import setup_gemini_client
 
 load_dotenv()
 
@@ -292,6 +293,283 @@ Return ONLY a number (1, 2, 3...). No text."""
         return 1
 
 
+def _detect_frame_geometric(orig_img: np.ndarray, largest_cluster_box: list[int]) -> bool:
+    """
+    ✅ FUNCȚIE NOUĂ: Detectare geometrică a frame-ului fix de la marginile imaginii.
+    Verifică dacă cluster-ul mare este un frame fix la marginile absolute ale imaginii.
+    
+    Args:
+        orig_img: Imaginea originală (BGR)
+        largest_cluster_box: [x1, y1, x2, y2] pentru cel mai mare cluster
+    
+    Returns:
+        True dacă detectăm un frame fix la marginile imaginii, False altfel.
+    """
+    h, w = orig_img.shape[:2]
+    x1, y1, x2, y2 = largest_cluster_box
+    
+    # Convertim la grayscale pentru analiză
+    gray = cv2.cvtColor(orig_img, cv2.COLOR_BGR2GRAY) if len(orig_img.shape) == 3 else orig_img
+    
+    # Threshold pentru a obține o imagine binară
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+    
+    # Marginile absolute ale imaginii (primele/ultimele N pixeli)
+    edge_threshold = max(10, min(w, h) // 100)  # 1% din dimensiunea minimă, minim 10 pixeli
+    
+    # Verificare 1: Cluster-ul este foarte aproape de marginile imaginii?
+    margin_tolerance = max(5, min(w, h) // 200)  # 0.5% din dimensiunea minimă, minim 5 pixeli
+    
+    near_top = y1 <= margin_tolerance
+    near_bottom = y2 >= (h - margin_tolerance)
+    near_left = x1 <= margin_tolerance
+    near_right = x2 >= (w - margin_tolerance)
+    
+    # Verificare 2: Cluster-ul ocupă aproape toată imaginea?
+    width_ratio = (x2 - x1) / w
+    height_ratio = (y2 - y1) / h
+    
+    # Verificare 3: Există linii dense de pixeli la marginile absolute?
+    # Verificăm primele/ultimele edge_threshold pixeli de la fiecare margine
+    top_edge = binary[0:edge_threshold, :]
+    bottom_edge = binary[h-edge_threshold:h, :]
+    left_edge = binary[:, 0:edge_threshold]
+    right_edge = binary[:, w-edge_threshold:w]
+    
+    # Calculăm densitatea de pixeli negri (contururi) la fiecare margine
+    top_density = np.sum(top_edge == 0) / (edge_threshold * w)
+    bottom_density = np.sum(bottom_edge == 0) / (edge_threshold * w)
+    left_density = np.sum(left_edge == 0) / (edge_threshold * h)
+    right_density = np.sum(right_edge == 0) / (edge_threshold * h)
+    
+    # Dacă toate marginile au densitate mare (>30%), probabil e un frame
+    edge_density_threshold = 0.30
+    all_edges_dense = (
+        top_density > edge_density_threshold and
+        bottom_density > edge_density_threshold and
+        left_density > edge_density_threshold and
+        right_density > edge_density_threshold
+    )
+    
+    # Verificare 4: Cluster-ul formează un dreptunghi aproape complet la marginile imaginii?
+    is_near_all_edges = near_top and near_bottom and near_left and near_right
+    is_almost_full_size = width_ratio > 0.95 and height_ratio > 0.95
+    
+    # Logging detaliat pentru debugging
+    print(f"   🔍 [GEOMETRIC] Verificări:")
+    print(f"      Cluster box: [{x1}, {y1}, {x2}, {y2}] din [{w}x{h}]")
+    print(f"      Margin tolerance: {margin_tolerance}px")
+    print(f"      Aproape de margini: top={near_top} (y1={y1}), bottom={near_bottom} (y2={y2}, h={h}), left={near_left} (x1={x1}), right={near_right} (x2={x2}, w={w})")
+    print(f"      Dimensiuni: {width_ratio*100:.1f}% x {height_ratio*100:.1f}% din imagine")
+    print(f"      Densități margini: top={top_density:.2f}, bottom={bottom_density:.2f}, left={left_density:.2f}, right={right_density:.2f}")
+    print(f"      Condiții: is_near_all_edges={is_near_all_edges}, is_almost_full_size={is_almost_full_size}, all_edges_dense={all_edges_dense}")
+    
+    # Dacă toate condițiile sunt îndeplinite, probabil e un frame
+    if is_near_all_edges and is_almost_full_size:
+        if all_edges_dense:
+            print(f"   ✅ [GEOMETRIC] Detectat frame fix la marginile imaginii!")
+            return True
+        else:
+            print(f"   ⚠️  [GEOMETRIC] Cluster mare dar densitățile marginilor nu confirmă frame clar")
+            return False
+    
+    # Dacă cluster-ul ocupă aproape toată imaginea dar nu este aproape de toate marginile,
+    # sau dacă este aproape de toate marginile dar densitățile nu confirmă, totuși poate fi un frame
+    if is_almost_full_size and (is_near_all_edges or (near_top and near_bottom) or (near_left and near_right)):
+        # Relaxăm condițiile: dacă cel puțin 2 margini opuse au densitate mare, probabil e frame
+        opposite_edges_dense = (
+            (top_density > edge_density_threshold and bottom_density > edge_density_threshold) or
+            (left_density > edge_density_threshold and right_density > edge_density_threshold)
+        )
+        
+        if opposite_edges_dense:
+            print(f"   ✅ [GEOMETRIC] Detectat frame (condiții relaxate: margini opuse dense)")
+            return True
+    
+    return False
+
+
+def _ask_ai_if_has_frame(orig_img: np.ndarray) -> bool:
+    """
+    ✅ FUNCȚIE NOUĂ: Întreabă AI-ul (Gemini sau ChatGPT) dacă imaginea conține un frame/cadru în jurul planului.
+    Încearcă mai întâi Gemini (mai bun), apoi ChatGPT ca fallback.
+    Returnează True dacă există frame, False altfel.
+    """
+    # Prompt simplificat și mai neutru pentru a evita blocarea de safety
+    prompt = """Analyze this architectural floor plan image. Check if there is a rectangular border line at the absolute edges of the image (top, bottom, left, right edges).
+
+A border frame is a thin rectangular line that forms a complete outline around the entire image, touching or very close to all four edges.
+
+Answer ONLY: YES or NO"""
+    
+    # ========== ÎNCERCARE 1: GEMINI (mai bun) ==========
+    # Creăm un model nou cu safety settings mai permisive direct aici
+    try:
+        import google.generativeai as genai
+        load_dotenv()
+        api_key = os.getenv("GEMINI_API_KEY")
+        
+        if api_key:
+            genai.configure(api_key=api_key)
+            
+            # Safety settings foarte permisive pentru a evita blocarea
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+            
+            # Creăm modelul direct cu safety settings
+            models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            gemini_model = None
+            
+            for model_name in models_to_try:
+                try:
+                    gemini_model = genai.GenerativeModel(model_name, safety_settings=safety_settings)
+                    break
+                except Exception:
+                    continue
+            
+            if gemini_model:
+                try:
+                    # Convertim numpy array (BGR) la PIL Image (RGB)
+                    rgb_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(rgb_img)
+                    
+                    # Resize dacă e prea mare (pentru a evita erori Gemini)
+                    w, h = pil_img.size
+                    max_size = 2000
+                    if max(w, h) > max_size:
+                        scale = max_size / max(w, h)
+                        new_w = max(1, int(w * scale))
+                        new_h = max(1, int(h * scale))
+                        # Folosim LANCZOS (nu LANCZOS4 care nu există)
+                        try:
+                            pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                        except AttributeError:
+                            # Fallback pentru versiuni mai vechi de PIL
+                            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+                    
+                    print("  🤖 [AI] Trimit imaginea către Gemini pentru verificare frame...")
+                    
+                    # Apelăm cu safety_settings suplimentare în generate_content pentru siguranță
+                    response = gemini_model.generate_content(
+                        [prompt, pil_img],
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_output_tokens": 10,
+                        },
+                        safety_settings=safety_settings  # Re-iterăm safety settings aici
+                    )
+                    
+                    # Verificăm finish_reason pentru a vedea dacă răspunsul a fost blocat
+                    finish_reason = None
+                    if hasattr(response, 'candidates') and response.candidates:
+                        finish_reason = response.candidates[0].finish_reason
+                        print(f"  🔍 [AI] Gemini finish reason: {finish_reason}")
+                        
+                        # finish_reason=2 înseamnă SAFETY (blocat din motive de siguranță)
+                        if finish_reason == 2:
+                            print(f"  ⚠️  [AI] Gemini a blocat răspunsul (SAFETY). Încerc ChatGPT...")
+                        else:
+                            # Încercăm să obținem răspunsul de la Gemini
+                            answer = None
+                            
+                            if response.parts:
+                                try:
+                                    answer = response.text.strip().upper()
+                                except Exception as e:
+                                    print(f"  ⚠️  [AI] Eroare la accesare response.text: {e}")
+                            
+                            # Fallback: încercăm să accesăm direct text-ul
+                            if not answer:
+                                try:
+                                    if hasattr(response, 'text') and response.text:
+                                        answer = response.text.strip().upper()
+                                except Exception as e:
+                                    print(f"  ⚠️  [AI] Eroare la fallback text access: {e}")
+                            
+                            if answer:
+                                print(f"  💬 [AI] Gemini răspuns: '{answer}'")
+                                
+                                has_frame = "YES" in answer or "DA" in answer
+                                print(f"  ✅ [AI] Gemini detectat frame: {has_frame}")
+                                return has_frame
+                    
+                    # Dacă ajungem aici, Gemini nu a dat răspuns valid
+                    if finish_reason != 2:
+                        print(f"  ⚠️  [AI] Gemini nu a returnat răspuns valid. Încerc ChatGPT...")
+                        
+                except Exception as e:
+                    import traceback
+                    print(f"  ⚠️  [AI] Eroare la apelare Gemini: {e}")
+                    print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
+                    print(f"  ⚠️  [AI] Încerc ChatGPT ca fallback...")
+            else:
+                print("  ⚠️  [AI] Nu s-a putut crea model Gemini. Încerc ChatGPT...")
+        else:
+            print("  ⚠️  [AI] GEMINI_API_KEY lipsă. Încerc ChatGPT...")
+    except Exception as e:
+        import traceback
+        print(f"  ⚠️  [AI] Eroare inițializare Gemini: {e}")
+        print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
+        print(f"  ⚠️  [AI] Încerc ChatGPT ca fallback...")
+    
+    # ========== ÎNCERCARE 2: CHATGPT (fallback) ==========
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        print("  ⚠️  [AI] OPENAI_API_KEY lipsă - returnez False (nu eliminăm cluster)")
+        return False
+    
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+    except Exception as e:
+        print(f"  ⚠️  [AI] Eroare inițializare client OpenAI: {e}")
+        return False
+    
+    try:
+        print("  🤖 [AI] Trimit imaginea către ChatGPT pentru verificare frame...")
+        
+        b64_img = _bgr_to_base64_png(orig_img)
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
+                        }
+                    ]
+                }
+            ],
+            max_tokens=10,
+            temperature=0.0
+        )
+        
+        if response.choices and response.choices[0].message.content:
+            answer = response.choices[0].message.content.strip().upper()
+            print(f"  💬 [AI] ChatGPT răspuns: '{answer}'")
+            
+            has_frame = "YES" in answer or "DA" in answer
+            print(f"  ✅ [AI] ChatGPT detectat frame: {has_frame}")
+            return has_frame
+        else:
+            print(f"  ⚠️  [AI] ChatGPT nu a returnat răspuns valid. Returnez False (nu eliminăm cluster).")
+            return False
+            
+    except Exception as e:
+        import traceback
+        print(f"  ⚠️  [AI] Eroare la apelare ChatGPT: {e}")
+        print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
+        return False
+
+
 def _ask_ai_how_many_buildings_in_cluster(crop_img: np.ndarray) -> int:
     """
     ✅ FUNCȚIE NOUĂ: Întreabă AI-ul câte clădiri separate există într-un cluster.
@@ -468,7 +746,7 @@ def _split_cluster_by_buildings(crop: np.ndarray, offset_x: int, offset_y: int, 
     return []
 
 
-def detect_clusters(mask: np.ndarray, orig: np.ndarray) -> list[str]:
+def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = False) -> list[str] | list[list[int]]:
     print("\n========================================================")
     print("[STEP 7] START Detectare clustere")
     print("========================================================")
@@ -642,7 +920,131 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray) -> list[str]:
                 print(f"    [DROP Final] Cluster {idx} area={int(area)} < {int(min_allowed)}")
         
         final_list.sort(key=lambda b: (b[1], b[0]))
+        
+        # Recalculăm areas_map pentru final_list (după sortare)
+        final_areas_map = []
+        for i, box in enumerate(final_list):
+            a = (box[2] - box[0]) * (box[3] - box[1])
+            final_areas_map.append((i, float(a)))
+        final_areas_map.sort(key=lambda x: x[1], reverse=True)
+        
         filtered = final_list
+        
+        # ✅ VERIFICARE FRAME: Dacă cel mai mare cluster ocupă >95% din imagine
+        if len(final_list) > 0 and len(final_areas_map) > 0:
+            largest_cluster_area = final_areas_map[0][1]  # Cel mai mare cluster
+            largest_cluster_ratio = largest_cluster_area / img_area
+            
+            if largest_cluster_ratio > 0.95:
+                print(f"\n--- [FRAME CHECK] Cel mai mare cluster ocupă {largest_cluster_ratio*100:.1f}% din imagine ---")
+                print(f"   🔍 Verific dacă există frame în jurul planului...")
+                
+                # Găsim box-ul celui mai mare cluster folosind final_areas_map
+                largest_idx = final_areas_map[0][0]  # Index în final_list
+                largest_cluster_box = final_list[largest_idx]
+                
+                # Mai întâi încercăm detectarea geometrică (mai rapidă și mai precisă)
+                has_frame_geometric = _detect_frame_geometric(orig, largest_cluster_box)
+                
+                if has_frame_geometric:
+                    print(f"   ✅ [GEOMETRIC] Detectat frame fix la marginile imaginii!")
+                    print(f"   ✂️  Fac crop la imagine (exclud frame-ul) și reapelez detectarea clusterelor...")
+                    
+                    # Facem crop la imagine la conținutul din interiorul cluster-ului (cu padding mic)
+                    x1, y1, x2, y2 = largest_cluster_box
+                    h, w = orig.shape[:2]
+                    
+                    # Adăugăm un padding mic (2% din dimensiune) pentru a nu tăia prea mult
+                    padding_x = int((x2 - x1) * 0.02)
+                    padding_y = int((y2 - y1) * 0.02)
+                    
+                    # Crop la imagine (excludem marginile cu frame)
+                    crop_x1 = max(0, x1 + padding_x)
+                    crop_y1 = max(0, y1 + padding_y)
+                    crop_x2 = min(w, x2 - padding_x)
+                    crop_y2 = min(h, y2 - padding_y)
+                    
+                    cropped_img = orig[crop_y1:crop_y2, crop_x1:crop_x2]
+                    print(f"   📐 Crop: [{crop_x1}, {crop_y1}, {crop_x2}, {crop_y2}] din [{w}x{h}]")
+                    print(f"   📐 Dimensiuni după crop: {cropped_img.shape[1]}x{cropped_img.shape[0]}")
+                    
+                    # Reapelează detectarea clusterelor pe imaginea croppată
+                    print(f"   🔄 Reapelez detectarea clusterelor pe imaginea croppată...")
+                    cropped_clusters = detect_clusters(
+                        cropped_img,  # mask
+                        cropped_img,  # orig
+                        return_boxes=True  # Returnăm box-uri în loc de path-uri
+                    )
+                    
+                    # Ajustăm coordonatele clusterelor detectate la coordonatele originale
+                    adjusted_clusters = []
+                    for cluster_box in cropped_clusters:
+                        cx1, cy1, cx2, cy2 = cluster_box
+                        # Adăugăm offset-ul crop-ului
+                        adjusted_box = [
+                            cx1 + crop_x1,
+                            cy1 + crop_y1,
+                            cx2 + crop_x1,
+                            cy2 + crop_y1
+                        ]
+                        adjusted_clusters.append(adjusted_box)
+                    
+                    print(f"   ✅ Detectat {len(adjusted_clusters)} cluster-uri după eliminare frame")
+                    filtered = adjusted_clusters
+                else:
+                    # Dacă detectarea geometrică nu confirmă, încercăm AI-ul
+                    print(f"   🔍 [GEOMETRIC] Nu am detectat frame clar. Verific cu AI...")
+                    has_frame_ai = _ask_ai_if_has_frame(orig)
+                    
+                    if has_frame_ai:
+                        print(f"   ✅ AI confirmă: Există frame în jurul planului.")
+                        print(f"   ✂️  Fac crop la imagine (exclud frame-ul) și reapelez detectarea clusterelor...")
+                        
+                        # Facem crop la imagine la conținutul din interiorul cluster-ului (cu padding mic)
+                        x1, y1, x2, y2 = largest_cluster_box
+                        h, w = orig.shape[:2]
+                        
+                        # Adăugăm un padding mic (2% din dimensiune) pentru a nu tăia prea mult
+                        padding_x = int((x2 - x1) * 0.02)
+                        padding_y = int((y2 - y1) * 0.02)
+                        
+                        # Crop la imagine (excludem marginile cu frame)
+                        crop_x1 = max(0, x1 + padding_x)
+                        crop_y1 = max(0, y1 + padding_y)
+                        crop_x2 = min(w, x2 - padding_x)
+                        crop_y2 = min(h, y2 - padding_y)
+                        
+                        cropped_img = orig[crop_y1:crop_y2, crop_x1:crop_x2]
+                        print(f"   📐 Crop: [{crop_x1}, {crop_y1}, {crop_x2}, {crop_y2}] din [{w}x{h}]")
+                        print(f"   📐 Dimensiuni după crop: {cropped_img.shape[1]}x{cropped_img.shape[0]}")
+                        
+                        # Reapelează detectarea clusterelor pe imaginea croppată
+                        print(f"   🔄 Reapelez detectarea clusterelor pe imaginea croppată...")
+                        cropped_clusters = detect_clusters(
+                            cropped_img,  # mask
+                            cropped_img,  # orig
+                            return_boxes=True  # Returnăm box-uri în loc de path-uri
+                        )
+                        
+                        # Ajustăm coordonatele clusterelor detectate la coordonatele originale
+                        adjusted_clusters = []
+                        for cluster_box in cropped_clusters:
+                            cx1, cy1, cx2, cy2 = cluster_box
+                            # Adăugăm offset-ul crop-ului
+                            adjusted_box = [
+                                cx1 + crop_x1,
+                                cy1 + crop_y1,
+                                cx2 + crop_x1,
+                                cy2 + crop_y1
+                            ]
+                            adjusted_clusters.append(adjusted_box)
+                        
+                        print(f"   ✅ Detectat {len(adjusted_clusters)} cluster-uri după eliminare frame")
+                        filtered = adjusted_clusters
+                    else:
+                        print(f"   ✅ AI confirmă: NU există frame. Păstrez toate cluster-urile.")
+            else:
+                print(f"   ℹ️  Cel mai mare cluster ocupă {largest_cluster_ratio*100:.1f}% (<95%). Nu verific frame.")
 
     # ✅ 7. VALIDARE FINALĂ AI - Verificăm fiecare cluster pentru clădiri multiple
     print("\n========================================================")
@@ -699,6 +1101,8 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray) -> list[str]:
     save_debug(result, STEP_DIRS["clusters"]["final"], "final_clusters_validated.jpg")
     print(f"✅ [DONE] {len(final_validated_boxes)} clustere validate returnate")
 
+    if return_boxes:
+        return final_validated_boxes
     return crop_paths
 
 

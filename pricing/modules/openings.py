@@ -5,7 +5,7 @@ def calculate_openings_details(coeffs: dict, openings_list: list, material: str,
     # Determinăm înălțimile și coeficientul pentru calitatea geamurilor din formular
     window_height_m = 1.25  # Default
     door_height_m = 2.05  # Default
-    window_quality_multiplier = 1.0  # Default (2-fach verglast)
+    window_quality_multiplier = 1.25  # Default (3-fach verglast)
     
     if frontend_data:
         ferestre_usi = frontend_data.get("ferestreUsi", {})
@@ -30,6 +30,7 @@ def calculate_openings_details(coeffs: dict, openings_list: list, material: str,
             window_quality_multiplier = 1.25
         elif window_quality == "3-fach verglast, Passiv":
             window_quality_multiplier = 1.6
+        # Dacă windowQuality lipsește sau e invalid, folosim default 3-fach (1.25x)
     
     for op in openings_list:
         obj_type = op.get("type", "unknown")

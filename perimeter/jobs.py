@@ -80,15 +80,23 @@ def _run_for_single_plan(
             "scale_meters_per_pixel": measurements["scale_m_per_px"],
             "estimations": {
                 "by_cubicasa": {
-                    "interior_meters": measurements["walls_int_m"],
-                    "exterior_meters": measurements["walls_ext_m"],
+                    "interior_meters": measurements["walls_int_m"],  # Pentru finisaje
+                    "exterior_meters": measurements["walls_ext_m"],  # Pentru finisaje și structură
+                    "interior_meters_structure": measurements.get("walls_skeleton_structure_int_m", measurements["walls_int_m"]),  # Pentru structură (skeleton - exterior)
+                    "skeleton_ext_meters": measurements.get("walls_skeleton_ext_m", 0.0),
+                    "skeleton_int_meters": measurements.get("walls_skeleton_int_m", 0.0),
+                    "skeleton_structure_int_meters": measurements.get("walls_skeleton_structure_int_m", 0.0),
                     "total_perimeter_meters": measurements["walls_ext_m"],
                     "method_notes": "CubiCasa AI + Gemini optimization"
                 },
                 # average_result e folosit de pricing și alte module downstream
                 "average_result": {
-                    "interior_meters": measurements["walls_int_m"],
-                    "exterior_meters": measurements["walls_ext_m"],
+                    "interior_meters": measurements["walls_int_m"],  # Pentru finisaje
+                    "exterior_meters": measurements["walls_ext_m"],  # Pentru finisaje și structură
+                    "interior_meters_structure": measurements.get("walls_skeleton_structure_int_m", measurements["walls_int_m"]),  # Pentru structură (skeleton - exterior)
+                    "skeleton_ext_meters": measurements.get("walls_skeleton_ext_m", 0.0),
+                    "skeleton_int_meters": measurements.get("walls_skeleton_int_m", 0.0),
+                    "skeleton_structure_int_meters": measurements.get("walls_skeleton_structure_int_m", 0.0),
                     "total_perimeter_meters": measurements["walls_ext_m"]
                 }
             },
@@ -109,8 +117,10 @@ def _run_for_single_plan(
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         
+        skeleton_structure_int = measurements.get("walls_skeleton_structure_int_m", measurements["walls_int_m"])
         message = (
-            f"Interior: {measurements['walls_int_m']:.1f}m, "
+            f"Interior (finisaje): {measurements['walls_int_m']:.1f}m, "
+            f"Interior (structură): {skeleton_structure_int:.1f}m, "
             f"Exterior: {measurements['walls_ext_m']:.1f}m"
         )
         

@@ -384,6 +384,104 @@ def create_walls_structure_table(walls_bd: dict, plan_data: dict, enforcer: Germ
     return tbl
 
 # ----------------------------
+# Wall Measurements Table (for Admin & Calculation Method PDFs)
+# ----------------------------
+def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) -> Table:
+    """
+    Creează un tabel detaliat cu toate măsurătorile pereților pentru un plan:
+    - Lungimi pereți (interior/exterior) pentru finisaje și structură
+    - Arii brute, deschideri și nete pentru fiecare tip
+    """
+    from .utils import format_length, format_area, safe_get
+    
+    walls_data = safe_get(plan_data, "walls", default={})
+    interior_data = safe_get(walls_data, "interior", default={})
+    exterior_data = safe_get(walls_data, "exterior", default={})
+    
+    # Extragem valorile pentru lungimi
+    int_length_finish = safe_get(interior_data, "length_m", default=0.0)
+    int_length_structure = safe_get(interior_data, "length_m_structure", default=int_length_finish)
+    ext_length = safe_get(exterior_data, "length_m", default=0.0)
+    
+    # Extragem valorile pentru arii
+    int_gross_finish = safe_get(interior_data, "gross_area_m2", default=0.0)
+    int_gross_structure = safe_get(interior_data, "gross_area_m2_structure", default=int_gross_finish)
+    int_openings = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_area_finish = safe_get(interior_data, "net_area_m2", default=0.0)
+    int_area_structure = safe_get(interior_data, "net_area_m2_structure", default=int_area_finish)
+    
+    ext_gross = safe_get(exterior_data, "gross_area_m2", default=0.0)
+    ext_openings = safe_get(exterior_data, "openings_area_m2", default=0.0)
+    ext_area = safe_get(exterior_data, "net_area_m2", default=0.0)
+    
+    # Presupunem înălțimea pereților pentru calcul (din wall_height_m dacă e disponibil)
+    wall_height = safe_get(plan_data, "wall_height_m", default=2.7)
+    
+    head = [
+        P(enforcer.get("Tip Perete"), "CellBold"),
+        P(enforcer.get("Utilizare"), "CellBold"),
+        P(enforcer.get("Lungime (m)"), "CellBold"),
+        P(enforcer.get("Arie Brută (m²)"), "CellBold"),
+        P(enforcer.get("Deschideri (m²)"), "CellBold"),
+        P(enforcer.get("Arie Netă (m²)"), "CellBold"),
+    ]
+    
+    data = []
+    
+    # Structură pereți exteriori
+    data.append([
+        P(enforcer.get("Pereți Exteriori"), "Cell"),
+        P("Struktur", "Cell"),  # Direct translation for wall measurements context
+        P(format_length(ext_length), "Cell"),
+        P(format_area(ext_gross), "Cell"),
+        P(format_area(ext_openings), "Cell"),
+        P(format_area(ext_area), "CellBold"),
+    ])
+    
+    # Finisaje pereți exteriori
+    data.append([
+        P(enforcer.get("Pereți Exteriori"), "Cell"),
+        P("Ausbau & Oberflächen", "Cell"),  # Direct translation for wall measurements context
+        P(format_length(ext_length), "Cell"),
+        P(format_area(ext_gross), "Cell"),
+        P(format_area(ext_openings), "Cell"),
+        P(format_area(ext_area), "CellBold"),
+    ])
+    
+    # Structură pereți interiori (din skeleton)
+    data.append([
+        P(enforcer.get("Pereți Interiori"), "Cell"),
+        P(enforcer.get("Structură (Skeleton)"), "Cell"),
+        P(format_length(int_length_structure), "Cell"),
+        P(format_area(int_gross_structure), "Cell"),
+        P(format_area(int_openings), "Cell"),
+        P(format_area(int_area_structure), "CellBold"),
+    ])
+    
+    # Finisaje pereți interiori (din outline)
+    data.append([
+        P(enforcer.get("Pereți Interiori"), "Cell"),
+        P(enforcer.get("Finisaje (Outline)"), "Cell"),
+        P(format_length(int_length_finish), "Cell"),
+        P(format_area(int_gross_finish), "Cell"),
+        P(format_area(int_openings), "Cell"),
+        P(format_area(int_area_finish), "CellBold"),
+    ])
+    
+    # Removed calculation formulas as requested - no formulas should appear in admin PDF
+    
+    tbl = Table([head] + data, colWidths=[40*mm, 38*mm, 32*mm, 32*mm, 32*mm, 32*mm])
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+        ("BACKGROUND", (0,0), (-1,0), COLORS["bg_header"]),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+    ]))
+    return tbl
+
+# ----------------------------
 # Floors & Ceilings
 # ----------------------------
 def create_floors_ceilings_table(floors_bd: dict, enforcer: GermanEnforcer) -> Table:

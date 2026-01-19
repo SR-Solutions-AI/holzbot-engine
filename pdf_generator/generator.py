@@ -169,6 +169,24 @@ STATIC_TRANSLATIONS = {
     "Oberflächen & Ausbau": "Oberflächen & Ausbau",
     "Kategorie": "Kategorie",
     
+    # Admin PDF translations
+    "Ventilație": "Ventilation",
+    "Măsurători Pereți": "Wandmaße",
+    # Wall measurements table translations
+    "Tip Perete": "Wandtyp",
+    "Utilizare": "Verwendung",
+    "Lungime (m)": "Länge (m)",
+    "Arie Brută (m²)": "Bruttofläche (m²)",
+    "Deschideri (m²)": "Öffnungen (m²)",
+    "Arie Netă (m²)": "Nettofläche (m²)",
+    "Pereți Exteriori": "Außenwände",
+    "Pereți Interiori": "Innenwände",
+    "Structură (Skeleton)": "Struktur (Skeleton)",
+    "Finisaje (Outline)": "Ausbau",
+    # Note: "Structură" and "Finisaje" are used in wall measurements table with specific translations
+    # For wall measurements context: "Structură" = "Struktur", "Finisaje" = "Ausbau"
+    # These are handled directly in the table code to avoid conflicts with general translations
+    
     # NOU: Textele de extins
     "Vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung, basierend auf den übermittelten Planunterlagen.": "Vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung, basierend auf den übermittelten Planunterlagen.",
     "Diese Dokumentation soll Ihnen eine klare Übersicht der notwendigen Investition bieten. Sollten Sie Fragen zur Kalkulation, den Komponenten oder wünschen Sie eine individuelle Anpassung, stehen wir Ihnen jederzeit gerne zur Verfügung.": "Diese Dokumentation soll Ihnen eine klare Übersicht der notwendigen Investition bieten. Sollten Sie Fragen zur Kalkulation, den Komponenten oder wünschen Sie eine individuelle Anpassung, stehen wir Ihnen jederzeit gerne zur Verfügung.",
@@ -820,7 +838,7 @@ def _intro(story, styles, client: dict, enforcer: GermanEnforcer, offer_title: s
 
 # ---------- TABLES (TRADUCERE DIRECTĂ) ----------
 
-def _table_standard(story, styles, title: str, data_dict: dict, enforcer: GermanEnforcer):
+def _table_standard(story, styles, title: str, data_dict: dict, enforcer: GermanEnforcer, show_mod_column: bool | None = None):
     items = data_dict.get("items", []) or data_dict.get("detailed_items", [])
     if not items: 
         return
@@ -852,7 +870,8 @@ def _table_standard(story, styles, title: str, data_dict: dict, enforcer: German
         if mode:
             has_any_mode = True
     show_material = has_any_material
-    show_mode = has_any_mode
+    # If show_mod_column is explicitly set, use it; otherwise auto-detect
+    show_mode = has_any_mode if show_mod_column is None else show_mod_column
     
     # ✅ COLECTEAZĂ tot textul
     all_texts = [title, "Bauteil", "Fläche", "Preis/m²", "Gesamt", "SUMME"]
@@ -1365,6 +1384,9 @@ def _table_global_openings(story, styles, all_openings: list, enforcer: GermanEn
             break
     if not selected_material:
         selected_material = "—"
+    else:
+        # Translate material (e.g., "Lemn - Aluminiu" -> "Holz-Aluminium")
+        selected_material = translations.get(selected_material, enforcer.get(selected_material))
     
     head = [
         P(translations["Kategorie"], "CellBold"), 
@@ -2519,11 +2541,11 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     city = (client_data.get("localitate") or client_data.get("city") or "—").strip()
     
     lines = [
-        f"<b>Client:</b> {name}", 
-        f"<b>Location:</b> {city}", 
-        f"<b>Phone:</b> {client_data.get('telefon') or '—'}", 
-        f"<b>Email:</b> {client_data.get('email') or '—'}",
-        f"<b>Tenant:</b> {tenant_slug or '—'}"
+        f"<b>{enforcer.get('Bauherr / Kunde')}:</b> {name}", 
+        f"<b>{enforcer.get('Ort / Bauort')}:</b> {city}", 
+        f"<b>{enforcer.get('Telefon')}:</b> {client_data.get('telefon') or '—'}", 
+        f"<b>{enforcer.get('E-Mail')}:</b> {client_data.get('email') or '—'}",
+        f"<b>Mandant:</b> {tenant_slug or '—'}"
     ]
     story.append(Paragraph("<br/>".join(lines), styles["Cell"]))
     story.append(Spacer(1, 4*mm))
@@ -2636,11 +2658,11 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
         ventilatie = performanta.get("ventilatie", False)
         
         if nivel_energetic and nivel_energetic != "—":
-            summary_items.append(f"<b>Nivel energetic:</b> {enforcer.get(nivel_energetic)}")
+            summary_items.append(f"<b>{enforcer.get('Nivel energetic')}:</b> {enforcer.get(nivel_energetic)}")
         if incalzire and incalzire != "—":
-            summary_items.append(f"<b>Heizsystem:</b> {enforcer.get(incalzire)}")
+            summary_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> {enforcer.get(incalzire)}")
         if ventilatie:
-            summary_items.append(f"<b>Ventilație:</b> Ja")
+            summary_items.append(f"<b>{enforcer.get('Ventilație')}:</b> {enforcer.get('Ja')}")
     
     # Logistică
     if logistica:
@@ -2649,7 +2671,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
         utilitati = logistica.get("utilitati", False)
         
         if acces_santier and acces_santier != "—":
-            summary_items.append(f"<b>Baustellenzugang:</b> {acces_santier}")
+            summary_items.append(f"<b>Baustellenzugang:</b> {enforcer.get(acces_santier)}")
         if teren and teren != "—":
             summary_items.append(f"<b>Gelände:</b> {teren}")
         if utilitati:
@@ -2719,20 +2741,38 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
         bd = pricing.get("breakdown", {})
         
         # ADMIN: Afișăm TOATE categoriile, fără filtru
+        # ADMIN: Nu afișăm coloana Mod (nu se mai folosește)
         if bd.get("foundation"): 
-            _table_standard(story, styles, "Fundament / Bodenplatte", bd.get("foundation", {}), enforcer)
+            _table_standard(story, styles, "Fundament / Bodenplatte", bd.get("foundation", {}), enforcer, show_mod_column=False)
         if bd.get("basement"): 
-            _table_standard(story, styles, "Keller / Untergeschoss", bd.get("basement", {}), enforcer)
+            _table_standard(story, styles, "Keller / Untergeschoss", bd.get("basement", {}), enforcer, show_mod_column=False)
         if bd.get("structure_walls"): 
-            _table_standard(story, styles, "Tragwerkskonstruktion – Wände", bd.get("structure_walls", {}), enforcer)
+            _table_standard(story, styles, "Tragwerkskonstruktion – Wände", bd.get("structure_walls", {}), enforcer, show_mod_column=False)
+            
+            # Adaugă tabelul cu măsurătorile pereților pentru acest plan
+            try:
+                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+                if area_json_path.exists():
+                    with open(area_json_path, "r", encoding="utf-8") as f:
+                        area_data = json.load(f)
+                    
+                    from .tables import create_wall_measurements_table
+                    story.append(Spacer(1, 2*mm))
+                    story.append(Paragraph(f"<b>{enforcer.get('Măsurători Pereți')} - {plan.plan_id}:</b>", styles["Body"]))
+                    measurements_table = create_wall_measurements_table(area_data, enforcer)
+                    story.append(measurements_table)
+                    story.append(Spacer(1, 3*mm))
+            except Exception as e:
+                print(f"⚠️ [PDF ADMIN] Could not load area_data for {plan.plan_id}: {e}")
+        
         if bd.get("floors_ceilings"): 
-            _table_standard(story, styles, "Geschossdecken & Balken", bd.get("floors_ceilings", {}), enforcer)
+            _table_standard(story, styles, "Geschossdecken & Balken", bd.get("floors_ceilings", {}), enforcer, show_mod_column=False)
         if bd.get("stairs"): 
             _table_stairs(story, styles, bd.get("stairs", {}), enforcer)
         if bd.get("roof"): 
             _table_roof_quantities(story, styles, pricing, enforcer)
         if bd.get("finishes"): 
-            _table_standard(story, styles, "Oberflächen & Ausbau", bd.get("finishes", {}), enforcer)
+            _table_standard(story, styles, "Oberflächen & Ausbau", bd.get("finishes", {}), enforcer, show_mod_column=False)
 
     # ADMIN: Toate deschiderile și utilitățile
     if global_openings: 
@@ -2999,6 +3039,195 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             
+            # Încarcă area_data și cubicasa_result pentru a afișa măsurătorile detaliate
+            try:
+                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+                cubicasa_json_path = plan.stage_work_dir / "cubicasa_result.json"
+                
+                area_data = None
+                cubicasa_data = None
+                
+                if area_json_path.exists():
+                    with open(area_json_path, "r", encoding="utf-8") as f:
+                        area_data = json.load(f)
+                
+                if cubicasa_json_path.exists():
+                    with open(cubicasa_json_path, "r", encoding="utf-8") as f:
+                        cubicasa_data = json.load(f)
+                    
+                    # Adaugă secțiunea detaliată de calcul
+                    story.append(Spacer(1, 2*mm))
+                    story.append(Paragraph("<b>Detailed Calculation Process:</b>", styles["H3"]))
+                    
+                    # Scala
+                    if cubicasa_data and "measurements" in cubicasa_data:
+                        measurements = cubicasa_data["measurements"]
+                        scale_m_px = measurements.get("metrics", {}).get("scale_m_per_px", 0.0)
+                        pixels_data = measurements.get("pixels", {})
+                        metrics_data = measurements.get("metrics", {})
+                        
+                        story.append(Paragraph(f"<b>Step 1: Scale Detection</b>", styles["Body"]))
+                        story.append(Paragraph(
+                            f"Scale determined from room labels: <b>{scale_m_px:.9f} m/pixel</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 2*mm))
+                        
+                        # Pixeli din fiecare tip de imagine
+                        story.append(Paragraph("<b>Step 2: Pixel Measurements from Images</b>", styles["Body"]))
+                        story.append(Paragraph(
+                            "The following pixel counts are extracted from different image types:",
+                            styles["Body"]
+                        ))
+                        
+                        px_ext = pixels_data.get("walls_len_ext", 0)
+                        px_int = pixels_data.get("walls_len_int", 0)
+                        px_skeleton_complete = pixels_data.get("walls_skeleton_complete", 0)
+                        px_skeleton_ext = pixels_data.get("walls_skeleton_ext", 0)
+                        px_skeleton_int = pixels_data.get("walls_skeleton_int", 0)
+                        
+                        story.append(Paragraph(
+                            f"• <b>Exterior walls (blue outline):</b> {px_ext:,} pixels",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• <b>Interior walls (green outline):</b> {px_int:,} pixels",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• <b>Skeleton complete (all walls):</b> {px_skeleton_complete:,} pixels",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• <b>Skeleton exterior (from skeleton):</b> {px_skeleton_ext:,} pixels",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• <b>Skeleton interior (skeleton - exterior):</b> {px_skeleton_int:,} pixels",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 2*mm))
+                        
+                        # Conversia pixeli → metri
+                        story.append(Paragraph("<b>Step 3: Conversion from Pixels to Meters</b>", styles["Body"]))
+                        story.append(Paragraph(
+                            "Each pixel count is multiplied by the scale to get length in meters:",
+                            styles["Body"]
+                        ))
+                        
+                        walls_ext_m = metrics_data.get("walls_ext_m", 0.0)
+                        walls_int_m = metrics_data.get("walls_int_m", 0.0)
+                        walls_skeleton_complete_m = metrics_data.get("walls_skeleton_complete_m", 0.0)
+                        walls_skeleton_ext_m = metrics_data.get("walls_skeleton_ext_m", 0.0)
+                        walls_skeleton_int_m = metrics_data.get("walls_skeleton_int_m", 0.0)
+                        
+                        story.append(Paragraph(
+                            f"• Exterior (outline): {px_ext:,} px × {scale_m_px:.9f} m/px = <b>{walls_ext_m:.2f} m</b> (for finishes)",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• Interior (outline): {px_int:,} px × {scale_m_px:.9f} m/px = <b>{walls_int_m:.2f} m</b> (for finishes)",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• Skeleton complete: {px_skeleton_complete:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_complete_m:.2f} m</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• Skeleton exterior: {px_skeleton_ext:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_ext_m:.2f} m</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"• Skeleton interior: {px_skeleton_int:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_int_m:.2f} m</b> (for structure)",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 2*mm))
+                    
+                    # Calculele ariilor
+                    if area_data:
+                        story.append(Paragraph("<b>Step 4: Area Calculations</b>", styles["Body"]))
+                        story.append(Paragraph(
+                            "Wall areas are calculated by multiplying length by wall height, then subtracting openings:",
+                            styles["Body"]
+                        ))
+                        
+                        walls_data = area_data.get("walls", {})
+                        interior_data = walls_data.get("interior", {})
+                        exterior_data = walls_data.get("exterior", {})
+                        
+                        # Exterior
+                        ext_length = exterior_data.get("length_m", 0.0)
+                        ext_gross = exterior_data.get("gross_area_m2", 0.0)
+                        ext_openings = exterior_data.get("openings_area_m2", 0.0)
+                        ext_net = exterior_data.get("net_area_m2", 0.0)
+                        wall_height = area_data.get("wall_height_m", 2.7)
+                        
+                        story.append(Paragraph(
+                            f"<b>Exterior Walls:</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Length: {ext_length:.2f} m × Height: {wall_height:.2f} m = Gross Area: {ext_gross:.2f} m²",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Gross Area: {ext_gross:.2f} m² - Openings: {ext_openings:.2f} m² = <b>Net Area: {ext_net:.2f} m²</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 1*mm))
+                        
+                        # Interior finisaje
+                        int_length_finish = interior_data.get("length_m", 0.0)
+                        int_gross_finish = interior_data.get("gross_area_m2", 0.0)
+                        int_openings = interior_data.get("openings_area_m2", 0.0)
+                        int_net_finish = interior_data.get("net_area_m2", 0.0)
+                        
+                        story.append(Paragraph(
+                            f"<b>Interior Walls (Finishes - from green outline):</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Length: {int_length_finish:.2f} m × Height: {wall_height:.2f} m = Gross Area: {int_gross_finish:.2f} m²",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Gross Area: {int_gross_finish:.2f} m² - Openings: {int_openings:.2f} m² = <b>Net Area: {int_net_finish:.2f} m²</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 1*mm))
+                        
+                        # Interior structură
+                        int_length_structure = interior_data.get("length_m_structure", 0.0)
+                        int_gross_structure = interior_data.get("gross_area_m2_structure", 0.0)
+                        int_net_structure = interior_data.get("net_area_m2_structure", 0.0)
+                        
+                        story.append(Paragraph(
+                            f"<b>Interior Walls (Structure - from skeleton):</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Length: {int_length_structure:.2f} m × Height: {wall_height:.2f} m = Gross Area: {int_gross_structure:.2f} m²",
+                            styles["Body"]
+                        ))
+                        story.append(Paragraph(
+                            f"  • Gross Area: {int_gross_structure:.2f} m² - Openings: {int_openings:.2f} m² = <b>Net Area: {int_net_structure:.2f} m²</b>",
+                            styles["Body"]
+                        ))
+                        story.append(Spacer(1, 2*mm))
+                    
+                    # Adaugă tabelul cu măsurătorile pereților
+                    if area_data:
+                        from .tables import create_wall_measurements_table
+                        measurements_table = create_wall_measurements_table(area_data, enforcer)
+                        story.append(Paragraph("<b>Summary Table - Wall Measurements:</b>", styles["Body"]))
+                        story.append(measurements_table)
+                        story.append(Spacer(1, 2*mm))
+                        
+            except Exception as e:
+                print(f"⚠️ [PDF] Could not load detailed measurements for {plan.plan_id}: {e}")
+                import traceback
+                traceback.print_exc()
+            
             items = walls.get("detailed_items", [])
             for item in items:
                 area = item.get("area_m2", 0)
@@ -3050,7 +3279,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             if window_quality and window_quality != "—":
                 quality_mult_map = {
-                    "2-fach verglast": "1.0x",
                     "3-fach verglast": "1.25x",
                     "3-fach verglast, Passiv": "1.6x"
                 }
