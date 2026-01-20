@@ -651,12 +651,171 @@ def preprocess_image_for_ocr(image: np.ndarray) -> np.ndarray:
     
     return denoised
 
+def _reconstruct_word_from_chars(chars_list, search_terms, max_horizontal_distance=50, max_vertical_distance=10):
+    """
+    Reconstituie cuvântul complet din caracterele detectate individual.
+    
+    Args:
+        chars_list: Lista de caractere detectate: [(x, y, width, height, text, conf), ...]
+        search_terms: Lista de termeni de căutat
+        max_horizontal_distance: Distanța maximă orizontală între caractere pentru a fi considerate parte din același cuvânt
+        max_vertical_distance: Distanța maximă verticală între caractere pentru a fi considerate pe aceeași linie
+    
+    Returns:
+        Lista de cuvinte reconstituite: [(x, y, width, height, text, conf), ...]
+    """
+    if not chars_list:
+        return []
+    
+    # Sortăm caracterele de la stânga la dreapta, apoi de sus în jos
+    sorted_chars = sorted(chars_list, key=lambda c: (c[1], c[0]))  # Sort by y, then x
+    
+    reconstructed_words = []
+    
+    # Pentru fiecare termen căutat, încercăm să reconstituim cuvântul
+    for search_term in search_terms:
+        search_term_lower = search_term.lower()
+        term_length = len(search_term_lower)
+        
+        # Grupăm caracterele care sunt pe aceeași linie (aproximativ)
+        lines = []
+        current_line = [sorted_chars[0]]
+        
+        for char in sorted_chars[1:]:
+            prev_char = current_line[-1]
+            # Verificăm dacă caracterul este pe aceeași linie (similar y)
+            y_diff = abs(char[1] - prev_char[1])
+            if y_diff <= max_vertical_distance:
+                current_line.append(char)
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = [char]
+        
+        if current_line:
+            lines.append(current_line)
+        
+        # Pentru fiecare linie, încercăm să găsim secvența care formează cuvântul
+        for line in lines:
+            # Sortăm caracterele din linie de la stânga la dreapta
+            line_sorted = sorted(line, key=lambda c: c[0])
+            
+            # Căutăm secvențe de caractere care pot forma cuvântul
+            for start_idx in range(len(line_sorted)):
+                # Verificăm dacă primul caracter face parte din cuvântul căutat
+                first_char_text = line_sorted[start_idx][4].lower()  # text
+                
+                # Verificăm dacă primul caracter se potrivește cu prima literă din termen
+                # OCR poate detecta un singur caracter sau un grup de caractere
+                if search_term_lower[0] not in first_char_text:
+                    continue
+                
+                # Construim cuvântul de la acest caracter
+                used_indices = [start_idx]
+                x_start = line_sorted[start_idx][0]
+                y_start = line_sorted[start_idx][1]
+                x_end = x_start + line_sorted[start_idx][2]
+                y_end = y_start + line_sorted[start_idx][3]
+                conf_sum = line_sorted[start_idx][5]
+                conf_count = 1
+                
+                # Căutăm caracterele următoare
+                # Construim cuvântul caracter cu caracter, verificând dacă fiecare caracter detectat
+                # se potrivește cu următoarea literă din termenul căutat
+                reconstructed_chars = list(first_char_text)  # Lista de caractere reconstituite
+                
+                for term_idx in range(1, term_length):
+                    target_char = search_term_lower[term_idx]
+                    
+                    # Verificăm dacă avem deja caracterul în reconstructed
+                    if term_idx < len(reconstructed_chars):
+                        # Caracterul a fost deja adăugat (poate fi parte dintr-un grup de caractere detectat)
+                        continue
+                    
+                    # Căutăm următorul caracter care se potrivește
+                    best_match = None
+                    best_distance = float('inf')
+                    
+                    for char_idx, char in enumerate(line_sorted):
+                        if char_idx in used_indices:
+                            continue
+                        
+                        char_text = char[4].lower()
+                        char_x = char[0]
+                        
+                        # Verificăm dacă caracterul conține litera căutată
+                        # Poate fi un singur caracter sau un grup de caractere
+                        if target_char in char_text:
+                            # Verificăm distanța orizontală față de ultimul caracter folosit
+                            last_char = line_sorted[used_indices[-1]]
+                            last_x_end = last_char[0] + last_char[2]
+                            distance = char_x - last_x_end
+                            
+                            # Caracterul trebuie să fie la dreapta ultimului și la o distanță rezonabilă
+                            if distance >= 0 and distance <= max_horizontal_distance:
+                                if distance < best_distance:
+                                    best_match = char_idx
+                                    best_distance = distance
+                    
+                    if best_match is not None:
+                        char = line_sorted[best_match]
+                        char_text_lower = char[4].lower()
+                        
+                        # Adăugăm doar caracterul care se potrivește (nu întregul grup)
+                        # Dacă grupul conține mai multe caractere, adăugăm doar primul care se potrivește
+                        char_added = False
+                        for c in char_text_lower:
+                            if c == target_char and len(reconstructed_chars) < term_length:
+                                reconstructed_chars.append(c)
+                                char_added = True
+                                break
+                        
+                        # Dacă nu am găsit caracterul exact, încercăm să adăugăm primul caracter din grup
+                        # (poate OCR a detectat greșit sau caracterul este similar)
+                        if not char_added and len(reconstructed_chars) < term_length:
+                            # Adăugăm primul caracter din grup dacă este similar cu cel căutat
+                            if len(char_text_lower) > 0:
+                                reconstructed_chars.append(char_text_lower[0])
+                                char_added = True
+                        
+                        if char_added:
+                            used_indices.append(best_match)
+                            x_end = char[0] + char[2]
+                            y_end = max(y_end, char[1] + char[3])
+                            conf_sum += char[5]
+                            conf_count += 1
+                        else:
+                            # Nu am putut adăuga caracterul, încercăm să continuăm
+                            break
+                    else:
+                        # Nu am găsit următorul caracter, încercăm să continuăm cu ce avem
+                        break
+                
+                # Reconstruim string-ul din caracterele colectate
+                reconstructed = ''.join(reconstructed_chars[:term_length])
+                
+                # Verificăm dacă cuvântul reconstituit se potrivește cu termenul căutat
+                if reconstructed == search_term_lower:
+                    # Calculăm bounding box-ul pentru întregul cuvânt
+                    width = x_end - x_start
+                    height = y_end - y_start
+                    avg_conf = conf_sum / conf_count if conf_count > 0 else 0
+                    
+                    if avg_conf > 60:
+                        reconstructed_words.append((x_start, y_start, width, height, search_term, avg_conf))
+                        print(f"         🔤 Reconstituit cuvântul '{search_term}' din {conf_count} caractere (confidență medie: {avg_conf:.1f}%)")
+                        break  # Nu mai căutăm în această linie dacă am găsit deja cuvântul
+    
+    return reconstructed_words
+
+
 def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = None, 
                      grid_rows: int = 3, grid_cols: int = 3, zoom_factor: float = 2.0) -> list:
     """
     Rulează OCR pe zone diferite ale imaginii cu zoom pentru a detecta mai bine textul mic.
     
     Împarte imaginea în grid și rulează OCR pe fiecare zonă, eventual cu zoom.
+    Dacă detectează caractere individuale, încearcă să reconstituie cuvântul complet.
     
     Args:
         image: Imaginea de analizat (grayscale sau BGR)
@@ -674,6 +833,8 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
     
     h, w = image.shape[:2]
     text_boxes = []
+    all_chars = []  # Colectăm toate caracterele detectate pentru reconstituire
+    all_detections = []  # Colectăm TOATE detecțiile OCR pentru debug (nu doar cele care se potrivesc)
     
     # Preprocesăm întreaga imagine
     processed_full = preprocess_image_for_ocr(image)
@@ -687,6 +848,15 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
             text_clean = text.strip()
             text_lower = text_clean.lower()
             
+            x = ocr_data_full['left'][i]
+            y = ocr_data_full['top'][i]
+            width = ocr_data_full['width'][i]
+            height = ocr_data_full['height'][i]
+            conf = ocr_data_full['conf'][i]
+            
+            # Colectăm TOATE detecțiile pentru debug
+            all_detections.append((x, y, width, height, text_clean, conf))
+            
             found_term = None
             for term in search_terms:
                 term_lower = term.lower()
@@ -697,18 +867,20 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                     break
             
             if found_term:
-                x = ocr_data_full['left'][i]
-                y = ocr_data_full['top'][i]
-                width = ocr_data_full['width'][i]
-                height = ocr_data_full['height'][i]
-                conf = ocr_data_full['conf'][i]
-                
-                if conf > 70:
+                if conf > 60:
                     text_boxes.append((x, y, width, height, text_clean, conf))
                     print(f"         ✅ Detectat (full): '{text_clean}' la ({x}, {y}) cu confidență {conf:.1f}%")
+            else:
+                # Colectăm și caracterele individuale pentru reconstituire
+                # Verificăm dacă caracterul face parte din unul dintre termenii căutați
+                for term in search_terms:
+                    term_lower = term.lower()
+                    if any(char in text_lower for char in term_lower):
+                        all_chars.append((x, y, width, height, text_clean, conf))
+                        break
     
     # 2. Dacă nu am găsit nimic sau am găsit doar rezultate cu confidence scăzut, încercăm pe zone
-    if not text_boxes or (text_boxes and max(box[5] for box in text_boxes) < 80):
+    if not text_boxes or (text_boxes and max(box[5] for box in text_boxes) < 60):
         print(f"         🔍 Împărțim imaginea în {grid_rows}x{grid_cols} zone pentru OCR detaliat...")
         
         overlap = 50  # pixeli de overlap între zone
@@ -788,6 +960,42 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                             text_clean = text.strip()
                             text_lower = text_clean.lower()
                             
+                            # Coordonatele în zona zoomed
+                            rel_x_zoomed = ocr_data_zone['left'][i]
+                            rel_y_zoomed = ocr_data_zone['top'][i]
+                            rel_width_zoomed = ocr_data_zone['width'][i]
+                            rel_height_zoomed = ocr_data_zone['height'][i]
+                            
+                            # Convertim coordonatele din zona zoomed la zona originală (fără zoom)
+                            if zoom_factor > 1.0:
+                                # Coordonatele relative în zona originală (fără zoom)
+                                rel_x = rel_x_zoomed / zoom_factor
+                                rel_y = rel_y_zoomed / zoom_factor
+                                rel_width = rel_width_zoomed / zoom_factor
+                                rel_height = rel_height_zoomed / zoom_factor
+                            else:
+                                rel_x = rel_x_zoomed
+                                rel_y = rel_y_zoomed
+                                rel_width = rel_width_zoomed
+                                rel_height = rel_height_zoomed
+                            
+                            # Convertim la coordonatele absolute în imaginea completă
+                            orig_x = int(rel_x) + x_start
+                            orig_y = int(rel_y) + y_start
+                            orig_width = int(rel_width)
+                            orig_height = int(rel_height)
+                            
+                            # Verificăm că coordonatele sunt în limitele imaginii
+                            orig_x = max(0, min(orig_x, w - 1))
+                            orig_y = max(0, min(orig_y, h - 1))
+                            orig_width = min(orig_width, w - orig_x)
+                            orig_height = min(orig_height, h - orig_y)
+                            
+                            conf = ocr_data_zone['conf'][i]
+                            
+                            # Colectăm TOATE detecțiile pentru debug
+                            all_detections.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
+                            
                             found_term = None
                             for term in search_terms:
                                 term_lower = term.lower()
@@ -798,45 +1006,83 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                                     break
                             
                             if found_term:
-                                # Coordonatele în zona zoomed
-                                rel_x_zoomed = ocr_data_zone['left'][i]
-                                rel_y_zoomed = ocr_data_zone['top'][i]
-                                rel_width_zoomed = ocr_data_zone['width'][i]
-                                rel_height_zoomed = ocr_data_zone['height'][i]
-                                
-                                # Convertim coordonatele din zona zoomed la zona originală (fără zoom)
-                                if zoom_factor > 1.0:
-                                    # Coordonatele relative în zona originală (fără zoom)
-                                    rel_x = rel_x_zoomed / zoom_factor
-                                    rel_y = rel_y_zoomed / zoom_factor
-                                    rel_width = rel_width_zoomed / zoom_factor
-                                    rel_height = rel_height_zoomed / zoom_factor
-                                else:
-                                    rel_x = rel_x_zoomed
-                                    rel_y = rel_y_zoomed
-                                    rel_width = rel_width_zoomed
-                                    rel_height = rel_height_zoomed
-                                
-                                # Convertim la coordonatele absolute în imaginea completă
-                                orig_x = int(rel_x) + x_start
-                                orig_y = int(rel_y) + y_start
-                                orig_width = int(rel_width)
-                                orig_height = int(rel_height)
-                                
-                                # Verificăm că coordonatele sunt în limitele imaginii
-                                orig_x = max(0, min(orig_x, w - 1))
-                                orig_y = max(0, min(orig_y, h - 1))
-                                orig_width = min(orig_width, w - orig_x)
-                                orig_height = min(orig_height, h - orig_y)
-                                
-                                conf = ocr_data_zone['conf'][i]
-                                
-                                if conf > 70:
+                                if conf > 60:
                                     text_boxes.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
                                     print(f"         ✅ Detectat (zona {row+1},{col+1}): '{text_clean}' la ({orig_x}, {orig_y}) cu confidență {conf:.1f}%")
+                            else:
+                                # Colectăm și caracterele individuale pentru reconstituire
+                                # Verificăm dacă caracterul face parte din unul dintre termenii căutați
+                                for term in search_terms:
+                                    term_lower = term.lower()
+                                    if any(char in text_lower for char in term_lower):
+                                        all_chars.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
+                                        break
                 except Exception as e:
                     print(f"         ⚠️ Eroare OCR pe zona {row+1},{col+1}: {e}")
                     continue
+    
+    # 3. Dacă nu am găsit cuvinte complete, încercăm să reconstituim din caractere
+    if not text_boxes and all_chars:
+        print(f"         🔤 Am detectat {len(all_chars)} caractere individuale. Încerc să reconstitui cuvântul...")
+        reconstructed = _reconstruct_word_from_chars(all_chars, search_terms)
+        text_boxes.extend(reconstructed)
+    
+    # 4. Generăm imagine de debug cu TOATE detecțiile OCR
+    if steps_dir and all_detections:
+        # Convertim imaginea la BGR dacă este grayscale
+        if len(image.shape) == 2:
+            debug_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif len(image.shape) == 3 and image.shape[2] == 3:
+            debug_img = image.copy()
+        else:
+            debug_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        
+        print(f"         📊 Generând imagine de debug cu {len(all_detections)} detecții OCR...")
+        
+        # Desenăm toate detecțiile
+        for x, y, width, height, text, conf in all_detections:
+            # Verificăm dacă detecția se potrivește cu unul dintre termenii căutați
+            text_lower = text.lower()
+            is_match = False
+            for term in search_terms:
+                if term.lower() == text_lower:
+                    is_match = True
+                    break
+            
+            # Culoare: verde pentru match-uri, albastru pentru restul
+            color = (0, 255, 0) if is_match else (255, 0, 0)
+            thickness = 3 if is_match else 2
+            
+            # Desenăm dreptunghiul
+            cv2.rectangle(debug_img, (x, y), (x + width, y + height), color, thickness)
+            
+            # Desenăm textul cu procentajul
+            label = f"{text} ({conf:.0f}%)"
+            
+            # Calculăm dimensiunea fontului în funcție de înălțimea detecției
+            font_scale = max(0.4, height / 30.0)
+            font_thickness = max(1, int(font_scale * 2))
+            
+            # Calculăm dimensiunea textului pentru a-l poziționa corect
+            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            
+            # Poziționăm textul deasupra dreptunghiului (sau dedesubt dacă nu încape)
+            text_y = y - 5 if y - 5 > text_height else y + height + text_height + 5
+            
+            # Desenăm fundal pentru text (pentru lizibilitate)
+            cv2.rectangle(debug_img, 
+                         (x, text_y - text_height - baseline), 
+                         (x + text_width, text_y + baseline), 
+                         color, -1)
+            
+            # Desenăm textul
+            cv2.putText(debug_img, label, (x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+        
+        # Salvăm imaginea de debug
+        debug_path = Path(steps_dir) / "02g_02_all_ocr_detections.png"
+        cv2.imwrite(str(debug_path), debug_img)
+        print(f"         💾 Salvat: 02g_02_all_ocr_detections.png ({len(all_detections)} detecții)")
     
     return text_boxes
 
@@ -940,7 +1186,7 @@ def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarr
             print(f"         🎯 Selectat rezultatul cu confidence maxim: '{best_box[4]}' cu {best_box[5]:.1f}%")
         
         if not text_found:
-            print(f"         ⚠️ Nu s-a detectat text (terasa/etc) în plan sau toate au confidence < 70%.")
+            print(f"         ⚠️ Nu s-a detectat text (terasa/etc) în plan sau toate au confidence < 60%.")
             if steps_dir:
                 vis_ocr = ocr_image.copy()
                 cv2.imwrite(str(Path(steps_dir) / "02g_01_ocr_result.png"), vis_ocr)
@@ -1359,14 +1605,15 @@ def detect_and_visualize_wall_closures(mask: np.ndarray, steps_dir: str = None) 
         print(f"      ✅ Detectat {room_count} camere")
 
 def bridge_wall_gaps(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = None) -> np.ndarray:
-    """Umple DOAR gap-urile între pereți (nemodificată)."""
+    """Umple DOAR gap-urile între pereți - îmbunătățit pentru VPS."""
     h, w = image_dims
     min_dim = min(h, w)
     
-    kernel_size = max(13, int(min_dim * 0.016))
+    # Mărit kernel size de la 1.6% la 2.0% pentru VPS
+    kernel_size = max(15, int(min_dim * 0.020))  # Mărit de la 0.016 la 0.020
     if kernel_size % 2 == 0: kernel_size += 1
     
-    print(f"      🌉 Bridging gaps between walls: kernel {kernel_size}x{kernel_size}")
+    print(f"      🌉 Bridging gaps between walls: kernel {kernel_size}x{kernel_size} (îmbunătățit pentru VPS)")
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     
@@ -1374,7 +1621,8 @@ def bridge_wall_gaps(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = 
     if steps_dir:
         save_step("bridge_01_original", original_walls, steps_dir)
     
-    walls_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Mărit iterațiile de la 2 la 3 pentru VPS
+    walls_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=3)
     if steps_dir:
         save_step("bridge_02_closed", walls_closed, steps_dir)
     
@@ -1394,17 +1642,19 @@ def bridge_wall_gaps(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = 
     return walls_final
 
 def smart_wall_closing(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = None) -> np.ndarray:
-    """Closing inteligent (nemodificată)."""
+    """Closing inteligent - îmbunătățit pentru VPS."""
     h, w = image_dims
     min_dim = min(h, w)
     
-    print(f"      🧠 Smart closing: detecting intentional openings...")
+    print(f"      🧠 Smart closing: detecting intentional openings (îmbunătățit pentru VPS)...")
     
-    kernel_large = max(7, int(min_dim * 0.009))
+    # Mărit kernel size de la 0.9% la 1.2% pentru VPS
+    kernel_large = max(9, int(min_dim * 0.012))  # Mărit de la 0.009 la 0.012
     if kernel_large % 2 == 0: kernel_large += 1
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_large, kernel_large))
-    walls_fully_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Mărit iterațiile de la 2 la 3 pentru VPS
+    walls_fully_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=3)
     
     if steps_dir:
         save_step("smart_01_fully_closed", walls_fully_closed, steps_dir)
@@ -2269,19 +2519,19 @@ def run_cubicasa_detection(
     print(f"         Eliminat {pixels_removed_pct:.1f}% pixeli (linii subțiri)")
     save_step("01a_walls_filtered", ai_walls_raw, str(steps_dir))
 
-    # ✅ CLOSING ADAPTIV ULTRA-PUTERNIC (UNIFICAT)
-    print("      🔗 Închid găuri (closing adaptiv ULTRA-PUTERNIC)...")
+    # ✅ CLOSING ADAPTIV ULTRA-PUTERNIC (UNIFICAT) - ÎMBUNĂTĂȚIT PENTRU VPS
+    print("      🔗 Închid găuri (closing adaptiv ULTRA-PUTERNIC - îmbunătățit pentru VPS)...")
 
     if min_dim > 2500:
-        # Imagini mari: closing normal
-        close_kernel_size = max(3, int(min_dim * 0.003))  # 0.3%
-        close_iterations = 2
-        print(f"         Mode: LARGE IMAGE → Close: {close_kernel_size}px (0.3%), iter={close_iterations}")
+        # Imagini mari: closing mai puternic pentru VPS (mărit de la 0.3% la 0.5%)
+        close_kernel_size = max(5, int(min_dim * 0.005))  # 0.5% (mărit de la 0.3%)
+        close_iterations = 3  # Mărit de la 2 la 3 iterații
+        print(f"         Mode: LARGE IMAGE → Close: {close_kernel_size}px (0.5%), iter={close_iterations}")
     else:
-        # Imagini mici: closing ULTRA-PUTERNIC (1.0% + 5 iterații)
-        close_kernel_size = max(9, int(min_dim * 0.010))  # 1.0%
-        close_iterations = 5  # 5 ITERAȚII!
-        print(f"         Mode: SMALL IMAGE → ULTRA STRONG close: {close_kernel_size}px (1.0%), iter={close_iterations}")
+        # Imagini mici: closing ULTRA-PUTERNIC (mărit de la 1.0% la 1.5% + mai multe iterații)
+        close_kernel_size = max(12, int(min_dim * 0.015))  # 1.5% (mărit de la 1.0%)
+        close_iterations = 7  # Mărit de la 5 la 7 iterații
+        print(f"         Mode: SMALL IMAGE → ULTRA STRONG close: {close_kernel_size}px (1.5%), iter={close_iterations}")
 
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel_size, close_kernel_size))
     ai_walls_raw = cv2.morphologyEx(ai_walls_raw, cv2.MORPH_CLOSE, close_kernel, iterations=close_iterations)
@@ -2299,10 +2549,10 @@ def run_cubicasa_detection(
 
     LARGE_IMAGE_THRESHOLD = 1000
     
-    # Acum, `ai_walls_raw` conține deja closing-ul ULTRA-PUTERNIC
+    # Acum, `ai_walls_raw` conține deja closing-ul ULTRA-PUTERNIC (îmbunătățit pentru VPS)
     if h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD:
         print(f"      🔧 LARGE IMAGE MODE: Bridging gaps between walls (no wall thickening)")
-        # Menținem bridge_wall_gaps DOAR pentru imaginile mari, unde closing-ul a fost normal (0.3%)
+        # Menținem bridge_wall_gaps DOAR pentru imaginile mari, unde closing-ul a fost îmbunătățit (0.5%)
         ai_walls_closed = bridge_wall_gaps(ai_walls_raw, (h_orig, w_orig), str(steps_dir))
     else:
         # Pentru imagini mici: SKIP extra bridging (adaptive closing-ul ULTRA-PUTERNIC de mai sus e suficient)
