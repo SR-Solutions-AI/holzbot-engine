@@ -1401,6 +1401,59 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                         
                         filled_area = np.count_nonzero(filled_region)
                         
+                        # Salvăm imagine suplimentară: detecția cu cel mai mare procent + flood fill (chiar dacă e respins)
+                        if steps_dir and text_boxes:
+                            best_box = text_boxes[0]  # Cel mai bun rezultat
+                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box
+                            best_center_x = best_x + best_width // 2
+                            best_center_y = best_y + best_height // 2
+                            
+                            vis_best_detection = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                            
+                            # Desenăm detecția cu cel mai mare procent (verde pentru acceptat, portocaliu pentru respins)
+                            if filled_area > 1000:
+                                detection_color = (0, 255, 0)  # Verde pentru acceptat
+                                status_label = f"✅ ACCEPTED ({best_conf:.1f}%)"
+                            else:
+                                detection_color = (0, 165, 255)  # Portocaliu pentru respins
+                                status_label = f"❌ REJECTED ({best_conf:.1f}%)"
+                            
+                            # Desenăm dreptunghiul detecției
+                            cv2.rectangle(vis_best_detection, (best_x, best_y), (best_x + best_width, best_y + best_height), detection_color, 3)
+                            
+                            # Desenăm centrul detecției
+                            cv2.circle(vis_best_detection, (best_center_x, best_center_y), 8, (0, 0, 255), -1)
+                            
+                            # Desenăm flood fill-ul dacă există (galben)
+                            if filled_area > 0:
+                                filled_colored = np.zeros_like(vis_best_detection)
+                                filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                                vis_best_detection = cv2.addWeighted(vis_best_detection, 0.7, filled_colored, 0.3, 0)
+                            
+                            # Adăugăm text cu informații
+                            label_text = f"{best_text} - {status_label}"
+                            if filled_area > 0:
+                                label_text += f" | Flood Fill: {filled_area}px"
+                            
+                            font_scale = max(0.7, best_height / 30.0)
+                            font_thickness = max(2, int(font_scale * 2))
+                            (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                            
+                            # Fundal pentru text
+                            text_y = max(text_height + 5, best_y - 5)
+                            text_x = best_x
+                            cv2.rectangle(vis_best_detection, 
+                                         (text_x, text_y - text_height - baseline), 
+                                         (text_x + text_width + 10, text_y + baseline), 
+                                         (255, 255, 255), -1)
+                            
+                            cv2.putText(vis_best_detection, label_text, (text_x + 5, text_y), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, detection_color, font_thickness)
+                            
+                            output_path = Path(steps_dir) / f"{debug_prefix}_01c_best_detection_with_fill.png"
+                            cv2.imwrite(str(output_path), vis_best_detection)
+                            print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, fill: {filled_area}px)")
+                        
                         # Salvăm imagine de debug pentru TOATE tentativele de flood fill
                         if steps_dir:
                             vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
@@ -1529,6 +1582,41 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                         output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
                         cv2.imwrite(str(output_path), vis_fill_attempt)
                         print(f"         💾 Salvat: {output_path.name} (REJECTED: center on wall)")
+                        
+                        # Salvăm și imaginea cu detecția cu cel mai mare procent (chiar dacă nu s-a făcut flood fill)
+                        if text_boxes:
+                            best_box = text_boxes[0]
+                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box
+                            best_center_x = best_x + best_width // 2
+                            best_center_y = best_y + best_height // 2
+                            
+                            vis_best_detection = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                            
+                            # Desenăm detecția cu cel mai mare procent (portocaliu pentru respins - centru pe perete)
+                            detection_color = (0, 165, 255)  # Portocaliu
+                            status_label = f"❌ REJECTED: Center on wall ({best_conf:.1f}%)"
+                            
+                            cv2.rectangle(vis_best_detection, (best_x, best_y), (best_x + best_width, best_y + best_height), detection_color, 3)
+                            cv2.circle(vis_best_detection, (best_center_x, best_center_y), 8, (0, 0, 255), -1)
+                            
+                            label_text = f"{best_text} - {status_label} | No Flood Fill"
+                            font_scale = max(0.7, best_height / 30.0)
+                            font_thickness = max(2, int(font_scale * 2))
+                            (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                            
+                            text_y = max(text_height + 5, best_y - 5)
+                            text_x = best_x
+                            cv2.rectangle(vis_best_detection, 
+                                         (text_x, text_y - text_height - baseline), 
+                                         (text_x + text_width + 10, text_y + baseline), 
+                                         (255, 255, 255), -1)
+                            
+                            cv2.putText(vis_best_detection, label_text, (text_x + 5, text_y), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, detection_color, font_thickness)
+                            
+                            output_path = Path(steps_dir) / f"{debug_prefix}_01c_best_detection_with_fill.png"
+                            cv2.imwrite(str(output_path), vis_best_detection)
+                            print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, no flood fill)")
         
         if rooms_filled > 0:
             print(f"         ✅ Umplut {rooms_filled} camere de tip '{room_name}'")
