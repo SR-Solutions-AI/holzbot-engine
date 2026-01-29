@@ -103,11 +103,19 @@ def _run_for_single_plan(
             outdoor_mask_path=outdoor_mask_path # <--- Aici intră masca
         )
         
-        # 5. NOTIFICARE UI (Live Feed) - Imaginea Portocalie
-        orange_img = work_dir / "final_orange.jpg"
-        if success and orange_img.exists():
-            # Mesaj special pentru orchestrator/backend
-            print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(orange_img)}", flush=True)
+        # 5. NOTIFICARE UI (Live Feed) - Folosim imaginea din raster (01_openings.png)
+        # Prioritate: 01_openings.png din raster_processing (detecții de la RasterScan)
+        scale_dir = run_output_root / "scale" / plan.plan_id
+        raster_openings_img = scale_dir / "cubicasa_steps" / "raster_processing" / "openings" / "01_openings.png"
+        
+        if raster_openings_img.exists():
+            # Folosim imaginea din raster (detecții de la RasterScan)
+            print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(raster_openings_img)}", flush=True)
+        else:
+            # Fallback la imaginea portocalie (dacă nu există raster)
+            orange_img = work_dir / "final_orange.jpg"
+            if success and orange_img.exists():
+                print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(orange_img)}", flush=True)
         
         return CountObjectsJobResult(plan.plan_id, work_dir, success, message)
     

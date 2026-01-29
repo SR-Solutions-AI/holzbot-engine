@@ -17,6 +17,42 @@ from PIL import Image
 from io import BytesIO
 from skimage.morphology import skeletonize
 
+# Importăm funcțiile OCR și room filling din modulul dedicat
+from .ocr_room_filling import (
+    fill_stairs_room,
+    fill_room_by_ocr,
+    preprocess_image_for_ocr,
+    run_ocr_on_zones,
+    _reconstruct_word_from_chars,
+)
+
+# Importăm funcțiile din modulele refactorizate
+from .raster_api import (
+    call_raster_api,
+    generate_raster_images,
+    generate_api_walls_mask,
+    validate_api_walls_mask,
+    brute_force_alignment,
+    apply_alignment_and_generate_overlay,
+    generate_crop_from_raster,
+)
+from .wall_repair import (
+    repair_house_walls_with_floodfill,
+    bridge_wall_gaps,
+    smart_wall_closing,
+    get_strict_1px_outline,
+)
+from .raster_processing import (
+    generate_raster_walls_overlay,
+    detect_interior_exterior_from_raster,
+    calculate_scale_per_room,
+    generate_walls_interior_exterior,
+    generate_interior_structure_walls,
+)
+from .interior_exterior import detect_interior_exterior_zones
+from .scale_detection import detect_scale_from_room_labels, call_gemini
+from .measurements import calculate_measurements
+
 # OCR pentru detectarea textului
 try:
     import pytesseract
@@ -610,506 +646,44 @@ def interval_merging_axis_projections(walls_mask: np.ndarray, steps_dir: str = N
     
     return result
 
-def preprocess_image_for_ocr(image: np.ndarray) -> np.ndarray:
+# Funcțiile OCR (preprocess_image_for_ocr, _reconstruct_word_from_chars, run_ocr_on_zones) 
+# au fost mutate în ocr_room_filling.py și sunt importate de acolo.
+# Funcțiile OCR duplicate au fost șterse - sunt importate din ocr_room_filling.py
+
+# Funcțiile mutate în modulele refactorizate:
+# - repair_house_walls_with_floodfill, bridge_wall_gaps, smart_wall_closing, get_strict_1px_outline -> wall_repair.py
+# - detect_interior_exterior_zones -> interior_exterior.py
+# - detect_scale_from_room_labels, call_gemini -> scale_detection.py
+# - calculate_measurements -> measurements.py
+# - call_raster_api, generate_raster_images, brute_force_alignment, etc. -> raster_api.py
     """
-    Preprocesează imaginea pentru a îmbunătăți detecția OCR.
-    
-    Aplică:
-    - Conversie la grayscale dacă este color
-    - Contrast enhancement (CLAHE)
-    - Sharpening
-    - Thresholding adaptiv pentru text clar
+    Încearcă să repare toți pereții de jur-împrejurul casei folosind aceeași
+    idee ca la terasă: flood fill în interiorul casei, apoi completarea
+    golurilor de pe conturul regiunii umplute.
     
     Args:
-        image: Imaginea de preprocesat (BGR sau grayscale)
+        walls_mask: Masca pereților (trebuie să includă deja pereții adăugați pentru garaj/scări)
+        steps_dir: Director pentru salvarea imaginilor de debug (opțional)
     
     Returns:
-        Imaginea preprocesată (grayscale)
+        Masca pereților cu pereții exteriori reparați (dacă a fost posibil)
     """
-    # Convertim la grayscale dacă este color
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
+    if walls_mask is None:
+        print(f"      ⚠️ walls_mask este None. Skip repararea pereților casei.")
+        return None
     
-    # 1. Contrast enhancement cu CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    try:
+        h, w = walls_mask.shape[:2]
+    except AttributeError:
+        print(f"      ⚠️ walls_mask nu are atributul shape. Skip repararea pereților casei.")
+        return None
     
-    # 2. Sharpening pentru a face textul mai clar
-    kernel_sharpen = np.array([[-1, -1, -1],
-                               [-1,  9, -1],
-                               [-1, -1, -1]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-    
-    # 3. Denoising (reducere zgomot)
-    denoised = cv2.fastNlMeansDenoising(sharpened, None, h=10, templateWindowSize=7, searchWindowSize=21)
-    
-    # 4. Thresholding adaptiv pentru text clar (opțional, dar poate ajuta)
-    # Nu aplicăm thresholding direct, ci păstrăm imaginea grayscale pentru OCR
-    # OCR-ul funcționează mai bine pe imagini grayscale cu contrast bun
-    
-    return denoised
-
-def _reconstruct_word_from_chars(chars_list, search_terms, max_horizontal_distance=50, max_vertical_distance=10):
-    """
-    Reconstituie cuvântul complet din caracterele detectate individual.
-    
-    Args:
-        chars_list: Lista de caractere detectate: [(x, y, width, height, text, conf), ...]
-        search_terms: Lista de termeni de căutat
-        max_horizontal_distance: Distanța maximă orizontală între caractere pentru a fi considerate parte din același cuvânt
-        max_vertical_distance: Distanța maximă verticală între caractere pentru a fi considerate pe aceeași linie
-    
-    Returns:
-        Lista de cuvinte reconstituite: [(x, y, width, height, text, conf), ...]
-    """
-    if not chars_list:
-        return []
-    
-    # Sortăm caracterele de la stânga la dreapta, apoi de sus în jos
-    sorted_chars = sorted(chars_list, key=lambda c: (c[1], c[0]))  # Sort by y, then x
-    
-    reconstructed_words = []
-    
-    # Pentru fiecare termen căutat, încercăm să reconstituim cuvântul
-    for search_term in search_terms:
-        search_term_lower = search_term.lower()
-        term_length = len(search_term_lower)
-        
-        # Grupăm caracterele care sunt pe aceeași linie (aproximativ)
-        lines = []
-        current_line = [sorted_chars[0]]
-        
-        for char in sorted_chars[1:]:
-            prev_char = current_line[-1]
-            # Verificăm dacă caracterul este pe aceeași linie (similar y)
-            y_diff = abs(char[1] - prev_char[1])
-            if y_diff <= max_vertical_distance:
-                current_line.append(char)
-            else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = [char]
-        
-        if current_line:
-            lines.append(current_line)
-        
-        # Pentru fiecare linie, încercăm să găsim secvența care formează cuvântul
-        for line in lines:
-            # Sortăm caracterele din linie de la stânga la dreapta
-            line_sorted = sorted(line, key=lambda c: c[0])
-            
-            # Căutăm secvențe de caractere care pot forma cuvântul
-            for start_idx in range(len(line_sorted)):
-                # Verificăm dacă primul caracter face parte din cuvântul căutat
-                first_char_text = line_sorted[start_idx][4].lower()  # text
-                
-                # Verificăm dacă primul caracter se potrivește cu prima literă din termen
-                # OCR poate detecta un singur caracter sau un grup de caractere
-                if search_term_lower[0] not in first_char_text:
-                    continue
-                
-                # Construim cuvântul de la acest caracter
-                used_indices = [start_idx]
-                x_start = line_sorted[start_idx][0]
-                y_start = line_sorted[start_idx][1]
-                x_end = x_start + line_sorted[start_idx][2]
-                y_end = y_start + line_sorted[start_idx][3]
-                conf_sum = line_sorted[start_idx][5]
-                conf_count = 1
-                
-                # Căutăm caracterele următoare
-                # Construim cuvântul caracter cu caracter, verificând dacă fiecare caracter detectat
-                # se potrivește cu următoarea literă din termenul căutat
-                reconstructed_chars = list(first_char_text)  # Lista de caractere reconstituite
-                
-                for term_idx in range(1, term_length):
-                    target_char = search_term_lower[term_idx]
-                    
-                    # Verificăm dacă avem deja caracterul în reconstructed
-                    if term_idx < len(reconstructed_chars):
-                        # Caracterul a fost deja adăugat (poate fi parte dintr-un grup de caractere detectat)
-                        continue
-                    
-                    # Căutăm următorul caracter care se potrivește
-                    best_match = None
-                    best_distance = float('inf')
-                    
-                    for char_idx, char in enumerate(line_sorted):
-                        if char_idx in used_indices:
-                            continue
-                        
-                        char_text = char[4].lower()
-                        char_x = char[0]
-                        
-                        # Verificăm dacă caracterul conține litera căutată
-                        # Poate fi un singur caracter sau un grup de caractere
-                        if target_char in char_text:
-                            # Verificăm distanța orizontală față de ultimul caracter folosit
-                            last_char = line_sorted[used_indices[-1]]
-                            last_x_end = last_char[0] + last_char[2]
-                            distance = char_x - last_x_end
-                            
-                            # Caracterul trebuie să fie la dreapta ultimului și la o distanță rezonabilă
-                            if distance >= 0 and distance <= max_horizontal_distance:
-                                if distance < best_distance:
-                                    best_match = char_idx
-                                    best_distance = distance
-                    
-                    if best_match is not None:
-                        char = line_sorted[best_match]
-                        char_text_lower = char[4].lower()
-                        
-                        # Adăugăm doar caracterul care se potrivește (nu întregul grup)
-                        # Dacă grupul conține mai multe caractere, adăugăm doar primul care se potrivește
-                        char_added = False
-                        for c in char_text_lower:
-                            if c == target_char and len(reconstructed_chars) < term_length:
-                                reconstructed_chars.append(c)
-                                char_added = True
-                                break
-                        
-                        # Dacă nu am găsit caracterul exact, încercăm să adăugăm primul caracter din grup
-                        # (poate OCR a detectat greșit sau caracterul este similar)
-                        if not char_added and len(reconstructed_chars) < term_length:
-                            # Adăugăm primul caracter din grup dacă este similar cu cel căutat
-                            if len(char_text_lower) > 0:
-                                reconstructed_chars.append(char_text_lower[0])
-                                char_added = True
-                        
-                        if char_added:
-                            used_indices.append(best_match)
-                            x_end = char[0] + char[2]
-                            y_end = max(y_end, char[1] + char[3])
-                            conf_sum += char[5]
-                            conf_count += 1
-                        else:
-                            # Nu am putut adăuga caracterul, încercăm să continuăm
-                            break
-                    else:
-                        # Nu am găsit următorul caracter, încercăm să continuăm cu ce avem
-                        break
-                
-                # Reconstruim string-ul din caracterele colectate
-                reconstructed = ''.join(reconstructed_chars[:term_length])
-                
-                # Verificăm dacă cuvântul reconstituit se potrivește cu termenul căutat
-                if reconstructed == search_term_lower:
-                    # Calculăm bounding box-ul pentru întregul cuvânt
-                    width = x_end - x_start
-                    height = y_end - y_start
-                    avg_conf = conf_sum / conf_count if conf_count > 0 else 0
-                    
-                    if avg_conf > 60:
-                        reconstructed_words.append((x_start, y_start, width, height, search_term, avg_conf))
-                        print(f"         🔤 Reconstituit cuvântul '{search_term}' din {conf_count} caractere (confidență medie: {avg_conf:.1f}%)")
-                        break  # Nu mai căutăm în această linie dacă am găsit deja cuvântul
-    
-    return reconstructed_words
-
-
-def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = None, 
-                     grid_rows: int = 3, grid_cols: int = 3, zoom_factor: float = 2.0) -> list:
-    """
-    Rulează OCR pe zone diferite ale imaginii cu zoom pentru a detecta mai bine textul mic.
-    
-    Împarte imaginea în grid și rulează OCR pe fiecare zonă, eventual cu zoom.
-    Dacă detectează caractere individuale, încearcă să reconstituie cuvântul complet.
-    
-    Args:
-        image: Imaginea de analizat (grayscale sau BGR)
-        search_terms: Lista de termeni de căutat
-        steps_dir: Director pentru debug (opțional)
-        grid_rows: Număr de rânduri în grid
-        grid_cols: Număr de coloane în grid
-        zoom_factor: Factor de zoom pentru fiecare zonă (1.0 = fără zoom)
-    
-    Returns:
-        Lista de text_boxes detectate: [(x, y, width, height, text, conf), ...]
-    """
-    if not TESSERACT_AVAILABLE:
-        return []
-    
-    h, w = image.shape[:2]
-    text_boxes = []
-    all_chars = []  # Colectăm toate caracterele detectate pentru reconstituire
-    all_detections = []  # Colectăm TOATE detecțiile OCR pentru debug (nu doar cele care se potrivesc)
-    
-    # Preprocesăm întreaga imagine
-    processed_full = preprocess_image_for_ocr(image)
-    
-    # 1. OCR pe întreaga imagine preprocesată
-    print(f"         📝 OCR pe întreaga imagine (preprocesată)...")
-    ocr_data_full = pytesseract.image_to_data(processed_full, output_type=pytesseract.Output.DICT, lang='deu+eng')
-    
-    for i, text in enumerate(ocr_data_full['text']):
-        if text.strip():
-            text_clean = text.strip()
-            text_lower = text_clean.lower()
-            
-            x = ocr_data_full['left'][i]
-            y = ocr_data_full['top'][i]
-            width = ocr_data_full['width'][i]
-            height = ocr_data_full['height'][i]
-            conf = ocr_data_full['conf'][i]
-            
-            # Colectăm TOATE detecțiile pentru debug
-            all_detections.append((x, y, width, height, text_clean, conf))
-            
-            found_term = None
-            for term in search_terms:
-                term_lower = term.lower()
-                # Verificăm doar match exact (case-insensitive)
-                # Nu acceptăm fragmente - doar cuvântul complet "terasa" sau variantele sale exacte
-                if term_lower == text_lower:
-                    found_term = term
-                    break
-            
-            if found_term:
-                if conf > 60:
-                    text_boxes.append((x, y, width, height, text_clean, conf))
-                    print(f"         ✅ Detectat (full): '{text_clean}' la ({x}, {y}) cu confidență {conf:.1f}%")
-            else:
-                # Colectăm și caracterele individuale pentru reconstituire
-                # Verificăm dacă caracterul face parte din unul dintre termenii căutați
-                for term in search_terms:
-                    term_lower = term.lower()
-                    if any(char in text_lower for char in term_lower):
-                        all_chars.append((x, y, width, height, text_clean, conf))
-                        break
-    
-    # 2. Dacă nu am găsit nimic sau am găsit doar rezultate cu confidence scăzut, încercăm pe zone
-    if not text_boxes or (text_boxes and max(box[5] for box in text_boxes) < 60):
-        print(f"         🔍 Împărțim imaginea în {grid_rows}x{grid_cols} zone pentru OCR detaliat...")
-        
-        overlap = 50  # pixeli de overlap între zone
-        
-        # Calculăm dimensiunile de bază ale unei zone (folosind diviziune reală pentru acoperire completă)
-        zone_height_base = h / grid_rows
-        zone_width_base = w / grid_cols
-        
-        for row in range(grid_rows):
-            for col in range(grid_cols):
-                # Calculăm coordonatele zonei astfel încât să acopere complet imaginea
-                # Prima zonă începe de la 0
-                if row == 0:
-                    y_start = 0
-                else:
-                    # Zonele intermediare au overlap cu zona anterioară
-                    y_start = max(0, int(row * zone_height_base) - overlap)
-                
-                # Ultima zonă merge până la marginea imaginii (h)
-                if row == grid_rows - 1:
-                    y_end = h
-                else:
-                    # Zonele intermediare se termină cu overlap pentru următoarea zonă
-                    y_end = min(h, int((row + 1) * zone_height_base) + overlap)
-                
-                # Același lucru pentru coloane
-                if col == 0:
-                    x_start = 0
-                else:
-                    x_start = max(0, int(col * zone_width_base) - overlap)
-                
-                if col == grid_cols - 1:
-                    x_end = w
-                else:
-                    x_end = min(w, int((col + 1) * zone_width_base) + overlap)
-                
-                # Verificăm că zona este validă
-                if x_start >= x_end or y_start >= y_end:
-                    print(f"         ⚠️ Zona ({row+1},{col+1}) invalidă: x=[{x_start},{x_end}), y=[{y_start},{y_end})")
-                    continue
-                
-                # Extragem zona
-                zone = image[y_start:y_end, x_start:x_end]
-                
-                if zone.size == 0:
-                    continue
-                
-                # Dimensiunile zonei originale (înainte de zoom)
-                zone_orig_h, zone_orig_w = zone.shape[:2]
-                
-                # Preprocesăm zona
-                zone_processed = preprocess_image_for_ocr(zone)
-                
-                # Aplicăm zoom dacă este necesar
-                if zoom_factor > 1.0:
-                    zone_h_scaled = int(zone_processed.shape[0] * zoom_factor)
-                    zone_w_scaled = int(zone_processed.shape[1] * zoom_factor)
-                    zone_zoomed = cv2.resize(zone_processed, (zone_w_scaled, zone_h_scaled), 
-                                            interpolation=cv2.INTER_CUBIC)
-                else:
-                    zone_zoomed = zone_processed
-                
-                # Salvăm zonele procesate pentru debug (toate zonele)
-                if steps_dir:
-                    debug_path = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_processed.png"
-                    cv2.imwrite(str(debug_path), zone_zoomed)
-                    # Salvăm și zona originală pentru comparație
-                    debug_path_orig = Path(steps_dir) / f"02g_zone_{row+1}_{col+1}_original.png"
-                    cv2.imwrite(str(debug_path_orig), zone)
-                
-                # OCR pe zonă
-                try:
-                    ocr_data_zone = pytesseract.image_to_data(zone_zoomed, output_type=pytesseract.Output.DICT, lang='deu+eng')
-                    
-                    for i, text in enumerate(ocr_data_zone['text']):
-                        if text.strip():
-                            text_clean = text.strip()
-                            text_lower = text_clean.lower()
-                            
-                            # Coordonatele în zona zoomed
-                            rel_x_zoomed = ocr_data_zone['left'][i]
-                            rel_y_zoomed = ocr_data_zone['top'][i]
-                            rel_width_zoomed = ocr_data_zone['width'][i]
-                            rel_height_zoomed = ocr_data_zone['height'][i]
-                            
-                            # Convertim coordonatele din zona zoomed la zona originală (fără zoom)
-                            if zoom_factor > 1.0:
-                                # Coordonatele relative în zona originală (fără zoom)
-                                rel_x = rel_x_zoomed / zoom_factor
-                                rel_y = rel_y_zoomed / zoom_factor
-                                rel_width = rel_width_zoomed / zoom_factor
-                                rel_height = rel_height_zoomed / zoom_factor
-                            else:
-                                rel_x = rel_x_zoomed
-                                rel_y = rel_y_zoomed
-                                rel_width = rel_width_zoomed
-                                rel_height = rel_height_zoomed
-                            
-                            # Convertim la coordonatele absolute în imaginea completă
-                            orig_x = int(rel_x) + x_start
-                            orig_y = int(rel_y) + y_start
-                            orig_width = int(rel_width)
-                            orig_height = int(rel_height)
-                            
-                            # Verificăm că coordonatele sunt în limitele imaginii
-                            orig_x = max(0, min(orig_x, w - 1))
-                            orig_y = max(0, min(orig_y, h - 1))
-                            orig_width = min(orig_width, w - orig_x)
-                            orig_height = min(orig_height, h - orig_y)
-                            
-                            conf = ocr_data_zone['conf'][i]
-                            
-                            # Colectăm TOATE detecțiile pentru debug
-                            all_detections.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
-                            
-                            found_term = None
-                            for term in search_terms:
-                                term_lower = term.lower()
-                                # Verificăm doar match exact (case-insensitive)
-                                # Nu acceptăm fragmente - doar cuvântul complet "terasa" sau variantele sale exacte
-                                if term_lower == text_lower:
-                                    found_term = term
-                                    break
-                            
-                            if found_term:
-                                if conf > 60:
-                                    text_boxes.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
-                                    print(f"         ✅ Detectat (zona {row+1},{col+1}): '{text_clean}' la ({orig_x}, {orig_y}) cu confidență {conf:.1f}%")
-                            else:
-                                # Colectăm și caracterele individuale pentru reconstituire
-                                # Verificăm dacă caracterul face parte din unul dintre termenii căutați
-                                for term in search_terms:
-                                    term_lower = term.lower()
-                                    if any(char in text_lower for char in term_lower):
-                                        all_chars.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
-                                        break
-                except Exception as e:
-                    print(f"         ⚠️ Eroare OCR pe zona {row+1},{col+1}: {e}")
-                    continue
-    
-    # 3. Dacă nu am găsit cuvinte complete, încercăm să reconstituim din caractere
-    if not text_boxes and all_chars:
-        print(f"         🔤 Am detectat {len(all_chars)} caractere individuale. Încerc să reconstitui cuvântul...")
-        reconstructed = _reconstruct_word_from_chars(all_chars, search_terms)
-        text_boxes.extend(reconstructed)
-    
-    # 4. Generăm imagine de debug cu TOATE detecțiile OCR
-    if steps_dir and all_detections:
-        # Convertim imaginea la BGR dacă este grayscale
-        if len(image.shape) == 2:
-            debug_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        elif len(image.shape) == 3 and image.shape[2] == 3:
-            debug_img = image.copy()
-        else:
-            debug_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        
-        print(f"         📊 Generând imagine de debug cu {len(all_detections)} detecții OCR...")
-        
-        # Desenăm toate detecțiile
-        for x, y, width, height, text, conf in all_detections:
-            # Verificăm dacă detecția se potrivește cu unul dintre termenii căutați
-            text_lower = text.lower()
-            is_match = False
-            for term in search_terms:
-                if term.lower() == text_lower:
-                    is_match = True
-                    break
-            
-            # Culoare: verde pentru match-uri, albastru pentru restul
-            color = (0, 255, 0) if is_match else (255, 0, 0)
-            thickness = 3 if is_match else 2
-            
-            # Desenăm dreptunghiul
-            cv2.rectangle(debug_img, (x, y), (x + width, y + height), color, thickness)
-            
-            # Desenăm textul cu procentajul
-            label = f"{text} ({conf:.0f}%)"
-            
-            # Calculăm dimensiunea fontului în funcție de înălțimea detecției
-            font_scale = max(0.4, height / 30.0)
-            font_thickness = max(1, int(font_scale * 2))
-            
-            # Calculăm dimensiunea textului pentru a-l poziționa corect
-            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-            
-            # Poziționăm textul deasupra dreptunghiului (sau dedesubt dacă nu încape)
-            text_y = y - 5 if y - 5 > text_height else y + height + text_height + 5
-            
-            # Desenăm fundal pentru text (pentru lizibilitate)
-            cv2.rectangle(debug_img, 
-                         (x, text_y - text_height - baseline), 
-                         (x + text_width, text_y + baseline), 
-                         color, -1)
-            
-            # Desenăm textul
-            cv2.putText(debug_img, label, (x, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
-        
-        # Salvăm imaginea de debug
-        debug_path = Path(steps_dir) / "02g_02_all_ocr_detections.png"
-        cv2.imwrite(str(debug_path), debug_img)
-        print(f"         💾 Salvat: 02g_02_all_ocr_detections.png ({len(all_detections)} detecții)")
-    
-    return text_boxes
-
-def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str, 
-                     steps_dir: str = None, debug_prefix: str = "02g") -> np.ndarray:
-    """
-    Funcție generică pentru detectarea și umplerea camerelor prin OCR.
-    
-    Detectează cuvintele din search_terms în plan și umple camera respectivă cu flood fill.
-    
-    Args:
-        walls_mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        search_terms: Lista de termeni de căutat (ex: ["terasa", "Terasa", "TERASA"])
-        room_name: Numele camerei pentru mesaje (ex: "terasa", "garage")
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-        debug_prefix: Prefix pentru fișierele de debug (ex: "02g" pentru terasa, "02h" pentru garaje)
-    
-    Returns:
-        Masca pereților cu camera umplută (dacă a fost detectată)
-    """
     # Folosim o metodă alternativă dacă OCR nu este disponibil
     use_ocr = TESSERACT_AVAILABLE
     if not use_ocr:
         print(f"      ⚠️ pytesseract nu este disponibil. Skip detectarea {room_name}.")
         return walls_mask.copy()
     
-    h, w = walls_mask.shape[:2]
     result = walls_mask.copy()
     
     print(f"      🏡 Detectez și umplu camere ({room_name})...")
@@ -1147,6 +721,7 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
     
     text_found = False
     text_boxes = []
+    all_detections = []  # Inițializăm all_detections pentru a evita NameError
     
     try:
         if use_ocr:
@@ -1160,30 +735,86 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                 print(f"         💾 Salvat: {debug_prefix}_00_preprocessed.png (imagine preprocesată)")
             
             # Rulează OCR pe zone cu zoom
-            text_boxes = run_ocr_on_zones(ocr_image, search_terms, steps_dir, 
+            text_boxes, all_detections = run_ocr_on_zones(ocr_image, search_terms, steps_dir, 
                                          grid_rows=3, grid_cols=3, zoom_factor=2.0)
             
             if text_boxes:
-                text_found = True
+                            text_found = True
         else:
             print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul '{room_name}'.")
             text_found = False
             text_boxes = []
+            all_detections = []
         
         # Selectăm rezultatul cu confidence maxim (dacă există)
-        accepted_boxes = []  # Detecțiile acceptate și folosite
-        if text_boxes:
-            # Sortăm după confidence (descrescător) și luăm primul
-            text_boxes.sort(key=lambda box: box[5], reverse=True)  # box[5] = confidence
-            best_box = text_boxes[0]
-            accepted_boxes = [best_box]  # Păstrăm doar cel mai bun rezultat
-            text_boxes = accepted_boxes.copy()  # Actualizăm text_boxes pentru procesare
-            print(f"         🎯 Selectat rezultatul cu confidence maxim: '{best_box[4]}' cu {best_box[5]:.1f}%")
+        accepted_boxes = []  # Detecțiile acceptate și folosite (confidence > 60%)
+        best_box_all = None  # Cea mai bună detecție (chiar dacă are confidence < 60%)
         
-        if not text_found:
-            print(f"         ⚠️ Nu s-a detectat text ({room_name}) în plan sau toate au confidence < 60%.")
+        if text_boxes:
+            # Sortăm după confidence (descrescător)
+            text_boxes.sort(key=lambda box: box[5], reverse=True)  # box[5] = confidence
+            best_box_all = text_boxes[0]  # Cea mai bună detecție (chiar dacă e < 60%)
+            
+            # Filtram doar detecțiile cu confidence > 60% pentru procesare
+            accepted_boxes = [box for box in text_boxes if box[5] > 60]
+            
+            if accepted_boxes:
+                best_box = accepted_boxes[0]
+                print(f"         🎯 Selectat rezultatul cu confidence maxim: '{best_box[4]}' cu {best_box[5]:.1f}%")
+                text_boxes = accepted_boxes.copy()  # Actualizăm text_boxes pentru procesare
+            else:
+                print(f"         ⚠️ Cea mai bună detecție: '{best_box_all[4]}' cu {best_box_all[5]:.1f}% (< 60%, nu acceptată)")
+                text_boxes = []  # Nu avem detecții acceptate pentru procesare
+        elif use_ocr and all_detections:
+            # Dacă nu am găsit detecții care se potrivesc cu termenii, folosim cea mai bună detecție din toate
+            all_detections.sort(key=lambda box: box[5], reverse=True)  # box[5] = confidence
+            best_box_all = all_detections[0]
+            print(f"         ⚠️ Nu s-au găsit detecții care se potrivesc cu termenii, dar am găsit '{best_box_all[4]}' cu {best_box_all[5]:.1f}%")
+        
+        # Salvăm poza cu cea mai bună detecție (chiar dacă nu e acceptată)
+        if steps_dir and best_box_all:
+            vis_best_detection = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+            best_x, best_y, best_width, best_height, best_text, best_conf = best_box_all
+            best_center_x = best_x + best_width // 2
+            best_center_y = best_y + best_height // 2
+            
+            # Culoare: verde dacă e acceptată, portocaliu dacă nu
+            if best_conf > 60:
+                detection_color = (0, 255, 0)  # Verde
+                status_label = f"✅ ACCEPTED ({best_conf:.1f}%)"
+            else:
+                detection_color = (0, 165, 255)  # Portocaliu
+                status_label = f"❌ REJECTED ({best_conf:.1f}% < 60%)"
+            
+            cv2.rectangle(vis_best_detection, (best_x, best_y), (best_x + best_width, best_y + best_height), detection_color, 3)
+            cv2.circle(vis_best_detection, (best_center_x, best_center_y), 8, (0, 0, 255), -1)
+            
+            label_text = f"{best_text} - {status_label} | No Flood Fill"
+            font_scale = max(0.7, best_height / 30.0)
+            font_thickness = max(2, int(font_scale * 2))
+            (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            
+            text_y = max(text_height + 5, best_y - 5)
+            text_x = best_x
+            cv2.rectangle(vis_best_detection, 
+                         (text_x, text_y - text_height - baseline), 
+                         (text_x + text_width + 10, text_y + baseline), 
+                         (255, 255, 255), -1)
+            
+            cv2.putText(vis_best_detection, label_text, (text_x + 5, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, detection_color, font_thickness)
+            
+            output_path = Path(steps_dir) / f"{debug_prefix}_01c_best_detection_with_fill.png"
+            cv2.imwrite(str(output_path), vis_best_detection)
+            print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, no flood fill)")
+        
+        if not text_found or not accepted_boxes:
+            if not text_found:
+                print(f"         ⚠️ Nu s-a detectat text ({room_name}) în plan.")
+            else:
+                print(f"         ⚠️ Nu s-a detectat text ({room_name}) cu confidence > 60%.")
             if steps_dir:
-                vis_ocr = ocr_image.copy()
+                vis_ocr = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
                 cv2.imwrite(str(Path(steps_dir) / f"{debug_prefix}_01_ocr_result.png"), vis_ocr)
                 print(f"         💾 Salvat: {debug_prefix}_01_ocr_result.png")
             return result
@@ -1277,16 +908,180 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
             center_x = x + width // 2
             center_y = y + height // 2
             
-            # Verificăm dacă centrul este într-un spațiu liber (nu pe perete)
-            if 0 <= center_y < h and 0 <= center_x < w:
-                if spaces_mask[center_y, center_x] == 255:  # Spațiu liber
-                    if not use_ocr:
-                        print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul. Skip.")
+            # Determinăm dacă este garaj/carport (care are doar 3 pereți)
+            is_garage = room_name.lower() in ['garage', 'garaj', 'carport']
+            
+            if not use_ocr:
+                print(f"         ⚠️ Fără OCR nu pot identifica specific cuvântul. Skip.")
+                if steps_dir:
+                    vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                    cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
+                    cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                    status_text = "❌ REJECTED: No OCR available"
+                    font_scale = 0.8
+                    font_thickness = 2
+                    (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                    cv2.rectangle(vis_fill_attempt, 
+                                 (x, y + height + 5), 
+                                 (x + text_width + 10, y + height + text_height + baseline + 10), 
+                                 (255, 255, 255), -1)
+                    cv2.putText(vis_fill_attempt, status_text, (x + 5, y + height + text_height + 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+                    output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
+                    cv2.imwrite(str(output_path), vis_fill_attempt)
+                    print(f"         💾 Salvat: {output_path.name} (REJECTED: no OCR)")
+            else:
+                print(f"         🎯 Găsit cuvântul '{text}' (confidence {conf:.1f}%) - fac flood fill în jurul textului...")
+                # Facem flood fill DIN JURUL textului, nu din interiorul lui
+                
+                # Calculăm o zonă buffer în jurul textului pentru a găsi puncte de start
+                buffer_size = max(20, int(max(width, height) * 1.5))  # Buffer de ~1.5x dimensiunea textului
+                
+                # Identificăm puncte de start în jurul textului (sus, jos, stânga, dreapta, colțuri)
+                seed_points = []
+                
+                # Puncte pe laturile dreptunghiului textului (la distanță buffer_size)
+                seed_y_top = max(0, y - buffer_size)
+                seed_points.append((center_x, seed_y_top))
+                seed_y_bottom = min(h - 1, y + height + buffer_size)
+                seed_points.append((center_x, seed_y_bottom))
+                seed_x_left = max(0, x - buffer_size)
+                seed_points.append((seed_x_left, center_y))
+                seed_x_right = min(w - 1, x + width + buffer_size)
+                seed_points.append((seed_x_right, center_y))
+                
+                # Colțuri (diagonal)
+                seed_points.append((seed_x_left, seed_y_top))
+                seed_points.append((seed_x_right, seed_y_top))
+                seed_points.append((seed_x_left, seed_y_bottom))
+                seed_points.append((seed_x_right, seed_y_bottom))
+                
+                # Verificăm dacă există cel puțin un seed point valid în jurul textului (nu verificăm centrul!)
+                valid_seed_found = False
+                for seed_x, seed_y in seed_points:
+                    if 0 <= seed_y < h and 0 <= seed_x < w:
+                        if spaces_mask[seed_y, seed_x] == 255:  # Spațiu liber
+                            valid_seed_found = True
+                            break
+                
+                if not valid_seed_found:
+                    print(f"         ⚠️ Nu s-au găsit seed points valide în jurul textului '{text}'. Skip.")
+                    if steps_dir:
+                        vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                        cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
+                        cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                        # Desenăm seed points-urile
+                        for seed_x, seed_y in seed_points:
+                            if 0 <= seed_y < h and 0 <= seed_x < w:
+                                if spaces_mask[seed_y, seed_x] == 255:
+                                    cv2.circle(vis_fill_attempt, (seed_x, seed_y), 5, (0, 255, 0), -1)
+                                else:
+                                    cv2.circle(vis_fill_attempt, (seed_x, seed_y), 5, (128, 128, 128), -1)
+                        status_text = "❌ REJECTED: No valid seed points around text"
+                        font_scale = 0.8
+                        font_thickness = 2
+                        (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                        cv2.rectangle(vis_fill_attempt, 
+                                     (x, y + height + 5), 
+                                     (x + text_width + 10, y + height + text_height + baseline + 10), 
+                                     (255, 255, 255), -1)
+                        cv2.putText(vis_fill_attempt, status_text, (x + 5, y + height + text_height + 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+                        output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
+                        cv2.imwrite(str(output_path), vis_fill_attempt)
+                        print(f"         💾 Salvat: {output_path.name} (REJECTED: no valid seed points)")
+                else:
+                    # Creez o mască care exclude textul (pentru a nu umple interiorul textului)
+                    text_mask = np.zeros((h, w), dtype=np.uint8)
+                    cv2.rectangle(text_mask, (x, y), (x + width, y + height), 255, -1)
+                    
+                    # Mască combinată: pereți + text (nu vrem să umplem nici pereții, nici textul)
+                    exclusion_mask = cv2.bitwise_or(walls_mask, text_mask)
+                    
+                    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+                    flood_fill_flags = 4  # 4-conectivitate
+                    flood_fill_flags |= cv2.FLOODFILL_MASK_ONLY
+                    flood_fill_flags |= (255 << 8)  # Fill value
+                    
+                    # Folosim overlay-ul combinat pentru flood fill
+                    if overlay_combined is not None:
+                        overlay_for_fill = cv2.cvtColor(overlay_combined, cv2.COLOR_BGR2GRAY)
+                        lo_diff = 30
+                        up_diff = 30
+                        fill_image = overlay_for_fill.copy()
+                        print(f"         🎨 Folosesc overlay combinat pentru flood fill")
+                    else:
+                        fill_image = spaces_mask.copy()
+                        lo_diff = 0
+                        up_diff = 0
+                        print(f"         ⚠️ Folosesc spaces_mask simplu (overlay indisponibil)")
+                    
+                    # Facem flood fill din toate punctele din jurul textului
+                    combined_filled_region = np.zeros((h, w), dtype=np.uint8)
+                    valid_seeds = 0
+                    
+                    print(f"         🔍 Încerc flood fill din {len(seed_points)} puncte în jurul textului...")
+                    
+                    for seed_idx, seed_point in enumerate(seed_points):
+                        seed_x, seed_y = seed_point
+                        
+                        if not (0 <= seed_y < h and 0 <= seed_x < w):
+                            continue
+                        
+                        if exclusion_mask[seed_y, seed_x] > 0:
+                            continue
+                        
+                        if spaces_mask[seed_y, seed_x] != 255:
+                            continue
+                        
+                        temp_flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+                        try:
+                            _, _, _, rect = cv2.floodFill(
+                                fill_image.copy(),
+                                temp_flood_mask, 
+                                seed_point, 
+                                128,
+                                lo_diff, 
+                                up_diff, 
+                                flood_fill_flags
+                            )
+                            
+                            temp_filled = (temp_flood_mask[1:h+1, 1:w+1] == 255).astype(np.uint8) * 255
+                            temp_filled = cv2.bitwise_and(temp_filled, cv2.bitwise_not(exclusion_mask))
+                            combined_filled_region = cv2.bitwise_or(combined_filled_region, temp_filled)
+                            valid_seeds += 1
+                            
+                        except Exception as e:
+                            print(f"         ⚠️ Eroare la flood fill din punct {seed_idx + 1}: {e}")
+                            continue
+                    
+                    print(f"         ✅ Flood fill din {valid_seeds}/{len(seed_points)} puncte valide")
+                    
+                    filled_region = combined_filled_region
+                    
+                    # Verificăm că nu am umplut peste pereți
+                    overlap_with_walls = np.sum((filled_region > 0) & (walls_mask > 0))
+                    if overlap_with_walls > 0:
+                        print(f"         ⚠️ Flood fill a depășit pereții ({overlap_with_walls} pixeli). Corectez...")
+                        filled_region = cv2.bitwise_and(filled_region, cv2.bitwise_not(walls_mask))
+                    
+                    filled_area = np.count_nonzero(filled_region)
+                    img_total_area = h * w
+                    filled_ratio = filled_area / float(img_total_area)
+                    
+                    # Verificăm dacă flood fill-ul este prea mare (probabil a trecut prin pereți și iese din plan)
+                    # Pentru terasă, dacă umple > 50% din imagine, probabil a trecut prin pereți
+                    if not is_garage and filled_ratio > 0.50:
+                        print(f"         ⚠️ Flood fill prea mare ({filled_area}px, {filled_ratio*100:.1f}% din imagine). Probabil a trecut prin pereți și iese din plan. Skip.")
                         if steps_dir:
+                            # Salvăm imagine de debug pentru tentativa respinsă
                             vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
                             cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
                             cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
-                            status_text = "❌ REJECTED: No OCR available"
+                            filled_colored = np.zeros_like(vis_fill_attempt)
+                            filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                            vis_fill_attempt = cv2.addWeighted(vis_fill_attempt, 0.7, filled_colored, 0.3, 0)
+                            status_text = f"❌ REJECTED: Area too large ({filled_area}px, {filled_ratio*100:.1f}%)"
                             font_scale = 0.8
                             font_thickness = 2
                             (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
@@ -1298,164 +1093,674 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
                             output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
                             cv2.imwrite(str(output_path), vis_fill_attempt)
-                            print(f"         💾 Salvat: {output_path.name} (REJECTED: no OCR)")
-                    else:
-                        print(f"         🎯 Găsit cuvântul '{text}' (confidence {conf:.1f}%) - fac flood fill în jurul textului...")
-                        # Facem flood fill DIN JURUL textului, nu din interiorul lui
-                        
-                        # Calculăm o zonă buffer în jurul textului pentru a găsi puncte de start
-                        buffer_size = max(20, int(max(width, height) * 1.5))  # Buffer de ~1.5x dimensiunea textului
-                        
-                        # Identificăm puncte de start în jurul textului (sus, jos, stânga, dreapta, colțuri)
-                        seed_points = []
-                        
-                        # Puncte pe laturile dreptunghiului textului (la distanță buffer_size)
-                        seed_y_top = max(0, y - buffer_size)
-                        seed_points.append((center_x, seed_y_top))
-                        seed_y_bottom = min(h - 1, y + height + buffer_size)
-                        seed_points.append((center_x, seed_y_bottom))
-                        seed_x_left = max(0, x - buffer_size)
-                        seed_points.append((seed_x_left, center_y))
-                        seed_x_right = min(w - 1, x + width + buffer_size)
-                        seed_points.append((seed_x_right, center_y))
-                        
-                        # Colțuri (diagonal)
-                        seed_points.append((seed_x_left, seed_y_top))
-                        seed_points.append((seed_x_right, seed_y_top))
-                        seed_points.append((seed_x_left, seed_y_bottom))
-                        seed_points.append((seed_x_right, seed_y_bottom))
-                        
-                        # Creez o mască care exclude textul (pentru a nu umple interiorul textului)
-                        text_mask = np.zeros((h, w), dtype=np.uint8)
-                        cv2.rectangle(text_mask, (x, y), (x + width, y + height), 255, -1)
-                        
-                        # Mască combinată: pereți + text (nu vrem să umplem nici pereții, nici textul)
-                        exclusion_mask = cv2.bitwise_or(walls_mask, text_mask)
-                        
-                        flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-                        flood_fill_flags = 4  # 4-conectivitate
-                        flood_fill_flags |= cv2.FLOODFILL_MASK_ONLY
-                        flood_fill_flags |= (255 << 8)  # Fill value
-                        
-                        # Folosim overlay-ul combinat pentru flood fill
-                        if overlay_combined is not None:
-                            overlay_for_fill = cv2.cvtColor(overlay_combined, cv2.COLOR_BGR2GRAY)
-                            lo_diff = 30
-                            up_diff = 30
-                            fill_image = overlay_for_fill.copy()
-                            print(f"         🎨 Folosesc overlay combinat pentru flood fill")
-                        else:
-                            fill_image = spaces_mask.copy()
-                            lo_diff = 0
-                            up_diff = 0
-                            print(f"         ⚠️ Folosesc spaces_mask simplu (overlay indisponibil)")
-                        
-                        # Facem flood fill din toate punctele din jurul textului
-                        combined_filled_region = np.zeros((h, w), dtype=np.uint8)
-                        valid_seeds = 0
-                        
-                        print(f"         🔍 Încerc flood fill din {len(seed_points)} puncte în jurul textului...")
-                        
-                        for seed_idx, seed_point in enumerate(seed_points):
-                            seed_x, seed_y = seed_point
-                            
-                            if not (0 <= seed_y < h and 0 <= seed_x < w):
-                                continue
-                            
-                            if exclusion_mask[seed_y, seed_x] > 0:
-                                continue
-                            
-                            if spaces_mask[seed_y, seed_x] != 255:
-                                continue
-                            
-                            temp_flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-                            try:
-                                _, _, _, rect = cv2.floodFill(
-                                    fill_image.copy(),
-                                    temp_flood_mask, 
-                                    seed_point, 
-                                    128,
-                                    lo_diff, 
-                                    up_diff, 
-                                    flood_fill_flags
-                                )
-                                
-                                temp_filled = (temp_flood_mask[1:h+1, 1:w+1] == 255).astype(np.uint8) * 255
-                                temp_filled = cv2.bitwise_and(temp_filled, cv2.bitwise_not(exclusion_mask))
-                                combined_filled_region = cv2.bitwise_or(combined_filled_region, temp_filled)
-                                valid_seeds += 1
-                                
-                            except Exception as e:
-                                print(f"         ⚠️ Eroare la flood fill din punct {seed_idx + 1}: {e}")
-                                continue
-                        
-                        print(f"         ✅ Flood fill din {valid_seeds}/{len(seed_points)} puncte valide")
-                        
-                        filled_region = combined_filled_region
-                        
-                        # Verificăm că nu am umplut peste pereți
-                        overlap_with_walls = np.sum((filled_region > 0) & (walls_mask > 0))
-                        if overlap_with_walls > 0:
-                            print(f"         ⚠️ Flood fill a depășit pereții ({overlap_with_walls} pixeli). Corectez...")
-                            filled_region = cv2.bitwise_and(filled_region, cv2.bitwise_not(walls_mask))
-                        
-                        filled_area = np.count_nonzero(filled_region)
-                        
-                        # Salvăm imagine suplimentară: detecția cu cel mai mare procent + flood fill (chiar dacă e respins)
-                        if steps_dir and text_boxes:
-                            best_box = text_boxes[0]  # Cel mai bun rezultat
-                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box
+                            print(f"         💾 Salvat: {output_path.name} (REJECTED: area too large)")
+                        # Actualizăm și poza cu best detection
+                        if steps_dir and best_box_all:
+                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box_all
                             best_center_x = best_x + best_width // 2
                             best_center_y = best_y + best_height // 2
-                            
                             vis_best_detection = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                            
-                            # Desenăm detecția cu cel mai mare procent (verde pentru acceptat, portocaliu pentru respins)
-                            if filled_area > 1000:
-                                detection_color = (0, 255, 0)  # Verde pentru acceptat
-                                status_label = f"✅ ACCEPTED ({best_conf:.1f}%)"
-                            else:
-                                detection_color = (0, 165, 255)  # Portocaliu pentru respins
-                                status_label = f"❌ REJECTED ({best_conf:.1f}%)"
-                            
-                            # Desenăm dreptunghiul detecției
+                            detection_color = (0, 165, 255)  # Portocaliu pentru respins
+                            status_label = f"❌ REJECTED ({best_conf:.1f}%)"
                             cv2.rectangle(vis_best_detection, (best_x, best_y), (best_x + best_width, best_y + best_height), detection_color, 3)
-                            
-                            # Desenăm centrul detecției
                             cv2.circle(vis_best_detection, (best_center_x, best_center_y), 8, (0, 0, 255), -1)
-                            
-                            # Desenăm flood fill-ul dacă există (galben)
-                            if filled_area > 0:
-                                filled_colored = np.zeros_like(vis_best_detection)
-                                filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
-                                vis_best_detection = cv2.addWeighted(vis_best_detection, 0.7, filled_colored, 0.3, 0)
-                            
-                            # Adăugăm text cu informații
-                            label_text = f"{best_text} - {status_label}"
-                            if filled_area > 0:
-                                label_text += f" | Flood Fill: {filled_area}px"
-                            
+                            filled_colored = np.zeros_like(vis_best_detection)
+                            filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                            vis_best_detection = cv2.addWeighted(vis_best_detection, 0.7, filled_colored, 0.3, 0)
+                            label_text = f"{best_text} - {status_label} | Flood Fill: {filled_area}px ({filled_ratio*100:.1f}%) - TOO LARGE"
                             font_scale = max(0.7, best_height / 30.0)
                             font_thickness = max(2, int(font_scale * 2))
                             (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-                            
-                            # Fundal pentru text
                             text_y = max(text_height + 5, best_y - 5)
                             text_x = best_x
                             cv2.rectangle(vis_best_detection, 
                                          (text_x, text_y - text_height - baseline), 
                                          (text_x + text_width + 10, text_y + baseline), 
                                          (255, 255, 255), -1)
-                            
                             cv2.putText(vis_best_detection, label_text, (text_x + 5, text_y), 
                                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, detection_color, font_thickness)
-                            
                             output_path = Path(steps_dir) / f"{debug_prefix}_01c_best_detection_with_fill.png"
                             cv2.imwrite(str(output_path), vis_best_detection)
-                            print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, fill: {filled_area}px)")
+                            print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, fill: {filled_area}px - REJECTED: too large)")
+                        return result
+                    
+                    # Pentru garaj/carport (care are doar 3 pereți), folosim o abordare geometrică
+                    if is_garage:
+                        print(f"         🚗 Detectat garaj/carport - calculez distanțele până la pereți...")
                         
-                        # Salvăm imagine de debug pentru TOATE tentativele de flood fill
+                        # Încărcăm imaginile pentru căutare (mai întâi doar pereții, apoi overlay cu ghost image)
+                        walls_image = None  # Doar pereții detectați (02_ai_walls_closed.png)
+                        overlay_image = None  # Pereții + ghost image (02d_walls_closed_overlay.png)
+                        
                         if steps_dir:
+                            # 1. Încărcăm imaginea cu doar pereții detectați
+                            walls_image_path = Path(steps_dir) / "02_ai_walls_closed.png"
+                            if walls_image_path.exists():
+                                walls_image = cv2.imread(str(walls_image_path), cv2.IMREAD_GRAYSCALE)
+                                if walls_image is not None:
+                                    if walls_image.shape[:2] != (h, w):
+                                        walls_image = cv2.resize(walls_image, (w, h))
+                                    print(f"         📸 Am încărcat 02_ai_walls_closed.png (doar pereții detectați)")
+                            
+                            # 2. Încărcăm overlay-ul cu ghost image (dacă există)
+                            overlay_path = Path(steps_dir) / "02d_walls_closed_overlay.png"
+                            if overlay_path.exists():
+                                overlay_bgr = cv2.imread(str(overlay_path), cv2.IMREAD_COLOR)
+                                if overlay_bgr is not None:
+                                    if overlay_bgr.shape[:2] != (h, w):
+                                        overlay_bgr = cv2.resize(overlay_bgr, (w, h))
+                                    # Convertim la grayscale pentru analiză
+                                    overlay_image = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2GRAY)
+                                    print(f"         📸 Am încărcat 02d_walls_closed_overlay.png (pereții + ghost image)")
+                        
+                        # Fallback: folosim walls_mask dacă nu am putut încărca niciuna
+                        if walls_image is None:
+                            walls_image = walls_mask.copy()
+                            print(f"         ⚠️ Folosesc walls_mask ca fallback pentru walls_image")
+                        
+                        # Centrul textului
+                        center_x = x + width // 2
+                        center_y = y + height // 2
+                        
+                        # Calculăm distanțele până la primul perete în toate direcțiile
+                        # În walls_image, pereții sunt albi (255) și spațiile libere sunt negre (0)
+                        wall_threshold = 128  # Valori >= 128 = perete
+                        
+                        distances = {}
+                        directions = {
+                            'top': (0, -1),      # Sus
+                            'bottom': (0, 1),    # Jos
+                            'left': (-1, 0),     # Stânga
+                            'right': (1, 0)      # Dreapta
+                        }
+                        
+                        max_search_distance = min(w, h) // 2  # Căutăm până la jumătate din imagine
+                        
+                        for dir_name, (dx, dy) in directions.items():
+                            distance = 0
+                            found_wall = False
+                            
+                            for step in range(1, max_search_distance):
+                                check_x = center_x + dx * step
+                                check_y = center_y + dy * step
+                                
+                                if not (0 <= check_y < h and 0 <= check_x < w):
+                                    break
+                                
+                                # Verificăm dacă am găsit un perete (valoare >= threshold = perete)
+                                pixel_value = walls_image[check_y, check_x]
+                                if pixel_value >= wall_threshold:
+                                    distance = step
+                                    found_wall = True
+                                    break
+                            
+                            if found_wall:
+                                distances[dir_name] = distance
+                                print(f"         📏 Distanță {dir_name}: {distance}px")
+                            else:
+                                distances[dir_name] = max_search_distance  # Nu am găsit perete
+                                print(f"         ⚠️ Nu am găsit perete în direcția {dir_name}")
+                        
+                        # Analizăm distanțele pentru a identifica pereții paraleli și cel lipsă
+                        dist_values = list(distances.values())
+                        dist_sorted = sorted(set(dist_values))
+                        
+                        print(f"         📊 Distanțe unice: {dist_sorted}")
+                        
+                        # Identificăm distanța care este mult diferită (probabil unde lipsește peretele)
+                        if len(dist_sorted) >= 2:
+                            # Găsim distanța care este cel mai diferită
+                            # Comparăm fiecare distanță cu celelalte
+                            max_diff = 0
+                            outlier_dir = None
+                            outlier_value = None
+                            
+                            for dir_name, dist in distances.items():
+                                # Calculăm diferența medie față de celelalte distanțe
+                                other_dists = [d for d_name, d in distances.items() if d_name != dir_name]
+                                avg_diff = sum(abs(dist - d) for d in other_dists) / len(other_dists) if other_dists else 0
+                                
+                                if avg_diff > max_diff:
+                                    max_diff = avg_diff
+                                    outlier_dir = dir_name
+                                    outlier_value = dist
+                            
+                            # Dacă am găsit o distanță outlier, căutăm artefacte (2 linii mici) pentru al 4-lea perete
+                            # Căutăm în direcția opusă celui de-al 3-lea perete (direcția outlier_dir)
+                            if outlier_dir and max_diff > 50:  # Prag pentru a considera că e diferită
+                                print(f"         🔍 Distanța outlier: {outlier_dir} = {outlier_value}px (diferență medie: {max_diff:.1f}px)")
+                                print(f"         🔍 Caut artefacte (2 linii mici) pentru peretele lipsă în direcția {outlier_dir} (opus celui de-al 3-lea perete)...")
+                                
+                                # Găsim direcția paralelă (al 3-lea perete - top-bottom sau left-right)
+                                if outlier_dir in ['top', 'bottom']:
+                                    # Peretele lipsă este sus sau jos, al 3-lea perete este cel paralel
+                                    parallel_dir = 'bottom' if outlier_dir == 'top' else 'top'
+                                    parallel_value = distances[parallel_dir]
+                                    
+                                    # Pornim de după textul găsit, în direcția opusă celui de-al 3-lea perete (outlier_dir)
+                                    if outlier_dir == 'top':
+                                        # Căutăm sus, pornind de după text (center_y) în direcția opusă celui de-al 3-lea perete (bottom)
+                                        search_start_y = center_y + parallel_value  # După text, în direcția celui de-al 3-lea perete
+                                        search_end_y = center_y - outlier_value  # Până la distanța outlier (direcția opusă)
+                                    else:  # bottom
+                                        # Căutăm jos, pornind de după text (center_y) în direcția opusă celui de-al 3-lea perete (top)
+                                        search_start_y = center_y - parallel_value  # După text, în direcția celui de-al 3-lea perete
+                                        search_end_y = center_y + outlier_value  # Până la distanța outlier (direcția opusă)
+                                    
+                                    # Căutăm 2 linii mici verticale (artefacte) între left_x și right_x
+                                    left_x = center_x - distances['left']
+                                    right_x = center_x + distances['right']
+                                    
+                                    # Căutăm linii mici verticale (artefacte de perete)
+                                    artifact_found = False
+                                    artifact_y = None
+                                    
+                                    # Parcurgem zona între search_start_y și search_end_y
+                                    search_range = range(min(search_start_y, search_end_y), max(search_start_y, search_end_y))
+                                    
+                                    # Căutăm linii verticale mici (2-5 pixeli înălțime) care sunt conectate la pereții paraleli
+                                    min_line_length = 2
+                                    max_line_length = 5
+                                    
+                                    # METODA 1: Căutăm în walls_image (doar pereții detectați)
+                                    print(f"         🔍 Metoda 1: Caut în 02_ai_walls_closed.png (doar pereții detectați)...")
+                                    for check_y in search_range:
+                                        if not (0 <= check_y < h):
+                                            continue
+                                        
+                                        # Verificăm dacă există o linie verticală mică la această poziție
+                                        line_pixels = []
+                                        for check_x in range(left_x, right_x):
+                                            if 0 <= check_x < w and walls_image[check_y, check_x] >= wall_threshold:
+                                                line_pixels.append(check_x)
+                                        
+                                        # Verificăm dacă avem o linie continuă de lungime între min_line_length și max_line_length
+                                        if len(line_pixels) >= min_line_length and len(line_pixels) <= max_line_length:
+                                            # Verificăm dacă linia este conectată la pereții paraleli (left sau right)
+                                            connected_left = False
+                                            if left_x > 0:
+                                                for conn_y in range(max(0, check_y - 2), min(h, check_y + 3)):
+                                                    if walls_image[conn_y, left_x - 1] >= wall_threshold:
+                                                        connected_left = True
+                                                        break
+                                            
+                                            # Verificăm conexiunea la dreapta
+                                            connected_right = False
+                                            if right_x < w - 1:
+                                                for conn_y in range(max(0, check_y - 2), min(h, check_y + 3)):
+                                                    if walls_image[conn_y, right_x + 1] >= wall_threshold:
+                                                        connected_right = True
+                                                        break
+                                            
+                                            # Dacă linia este conectată la ambele pereți paraleli, am găsit artefactul
+                                            if connected_left and connected_right:
+                                                artifact_found = True
+                                                artifact_y = check_y
+                                                print(f"         ✅ Găsit artefact în walls_image (linie mică) la y={artifact_y}, conectat la ambele pereți paraleli")
+                                                break
+                                    
+                                    # METODA 2: Dacă nu am găsit în walls_image, căutăm în overlay_image (pereții + ghost image)
+                                    if not artifact_found and overlay_image is not None:
+                                        print(f"         🔍 Metoda 2: Caut în 02d_walls_closed_overlay.png (pereții + ghost image)...")
+                                        # Folosim un threshold mai mic pentru overlay (poate avea valori intermediare)
+                                        overlay_threshold = 100  # Threshold mai mic pentru overlay
+                                        
+                                        for check_y in search_range:
+                                            if not (0 <= check_y < h):
+                                                continue
+                                            
+                                            # Verificăm dacă există o linie verticală mică la această poziție
+                                            line_pixels = []
+                                            for check_x in range(left_x, right_x):
+                                                if 0 <= check_x < w and overlay_image[check_y, check_x] >= overlay_threshold:
+                                                    line_pixels.append(check_x)
+                                            
+                                            # Verificăm dacă avem o linie continuă de lungime între min_line_length și max_line_length
+                                            if len(line_pixels) >= min_line_length and len(line_pixels) <= max_line_length:
+                                                # Verificăm dacă linia este conectată la pereții paraleli (left sau right)
+                                                connected_left = False
+                                                if left_x > 0:
+                                                    for conn_y in range(max(0, check_y - 2), min(h, check_y + 3)):
+                                                        if overlay_image[conn_y, left_x - 1] >= overlay_threshold:
+                                                            connected_left = True
+                                                            break
+                                                
+                                                # Verificăm conexiunea la dreapta
+                                                connected_right = False
+                                                if right_x < w - 1:
+                                                    for conn_y in range(max(0, check_y - 2), min(h, check_y + 3)):
+                                                        if overlay_image[conn_y, right_x + 1] >= overlay_threshold:
+                                                            connected_right = True
+                                                            break
+                                                
+                                                # Dacă linia este conectată la ambele pereți paraleli, am găsit artefactul
+                                                if connected_left and connected_right:
+                                                    artifact_found = True
+                                                    artifact_y = check_y
+                                                    print(f"         ✅ Găsit artefact în overlay_image (linie mică) la y={artifact_y}, conectat la ambele pereți paraleli")
+                                                    break
+                                    
+                                    # Actualizăm distanța sau aplicăm fallback
+                                    if artifact_found and artifact_y is not None:
+                                        # Actualizăm distanța outlier cu poziția artefactului
+                                        if outlier_dir == 'top':
+                                            distances[outlier_dir] = center_y - artifact_y
+                                        else:  # bottom
+                                            distances[outlier_dir] = artifact_y - center_y
+                                        print(f"         ✅ Actualizat {outlier_dir} cu distanța către artefact: {distances[outlier_dir]}px")
+                                    else:
+                                        # FALLBACK: Dacă nu am găsit artefacte, folosim distanța paralelă
+                                        replacement_value = parallel_value
+                                        distances[outlier_dir] = replacement_value
+                                        print(f"         ⚠️ Nu am găsit artefacte în niciuna dintre imagini, folosesc fallback (distanța paralelă): {replacement_value}px")
+                                else:
+                                    # Peretele lipsă este stânga sau dreapta, al 3-lea perete este cel paralel
+                                    parallel_dir = 'right' if outlier_dir == 'left' else 'left'
+                                    parallel_value = distances[parallel_dir]
+                                    
+                                    # Pornim de după textul găsit, în direcția opusă celui de-al 3-lea perete (outlier_dir)
+                                    if outlier_dir == 'left':
+                                        # Căutăm stânga, pornind de după text (center_x) în direcția opusă celui de-al 3-lea perete (right)
+                                        search_start_x = center_x + parallel_value  # După text, în direcția celui de-al 3-lea perete
+                                        search_end_x = center_x - outlier_value  # Până la distanța outlier (direcția opusă)
+                                    else:  # right
+                                        # Căutăm dreapta, pornind de după text (center_x) în direcția opusă celui de-al 3-lea perete (left)
+                                        search_start_x = center_x - parallel_value  # După text, în direcția celui de-al 3-lea perete
+                                        search_end_x = center_x + outlier_value  # Până la distanța outlier (direcția opusă)
+                                    
+                                    # Căutăm 2 linii mici orizontale (artefacte) între top_y și bottom_y
+                                    top_y = center_y - distances['top']
+                                    bottom_y = center_y + distances['bottom']
+                                    
+                                    # Căutăm linii mici orizontale (artefacte de perete)
+                                    artifact_found = False
+                                    artifact_x = None
+                                    
+                                    # Parcurgem zona între search_start_x și search_end_x
+                                    search_range = range(min(search_start_x, search_end_x), max(search_start_x, search_end_x))
+                                    
+                                    # Căutăm linii orizontale mici (2-5 pixeli lungime) care sunt conectate la pereții paraleli
+                                    min_line_length = 2
+                                    max_line_length = 5
+                                    
+                                    # METODA 1: Căutăm în walls_image (doar pereții detectați)
+                                    print(f"         🔍 Metoda 1: Caut în 02_ai_walls_closed.png (doar pereții detectați)...")
+                                    for check_x in search_range:
+                                        if not (0 <= check_x < w):
+                                            continue
+                                        
+                                        # Verificăm dacă există o linie orizontală mică la această poziție
+                                        line_pixels = []
+                                        for check_y in range(top_y, bottom_y):
+                                            if 0 <= check_y < h and walls_image[check_y, check_x] >= wall_threshold:
+                                                line_pixels.append(check_y)
+                                        
+                                        # Verificăm dacă avem o linie continuă de lungime între min_line_length și max_line_length
+                                        if len(line_pixels) >= min_line_length and len(line_pixels) <= max_line_length:
+                                            # Verificăm dacă linia este conectată la pereții paraleli (top sau bottom)
+                                            # Verificăm conexiunea la sus
+                                            connected_top = False
+                                            if top_y > 0:
+                                                for conn_x in range(max(0, check_x - 2), min(w, check_x + 3)):
+                                                    if walls_image[top_y - 1, conn_x] >= wall_threshold:
+                                                        connected_top = True
+                                                        break
+                                            
+                                            # Verificăm conexiunea la jos
+                                            connected_bottom = False
+                                            if bottom_y < h - 1:
+                                                for conn_x in range(max(0, check_x - 2), min(w, check_x + 3)):
+                                                    if walls_image[bottom_y + 1, conn_x] >= wall_threshold:
+                                                        connected_bottom = True
+                                                        break
+                                            
+                                            # Dacă linia este conectată la ambele pereți paraleli, am găsit artefactul
+                                            if connected_top and connected_bottom:
+                                                artifact_found = True
+                                                artifact_x = check_x
+                                                print(f"         ✅ Găsit artefact în walls_image (linie mică) la x={artifact_x}, conectat la ambele pereți paraleli")
+                                                break
+                                    
+                                    # METODA 2: Dacă nu am găsit în walls_image, căutăm în overlay_image (pereții + ghost image)
+                                    if not artifact_found and overlay_image is not None:
+                                        print(f"         🔍 Metoda 2: Caut în 02d_walls_closed_overlay.png (pereții + ghost image)...")
+                                        # Folosim un threshold mai mic pentru overlay (poate avea valori intermediare)
+                                        overlay_threshold = 100  # Threshold mai mic pentru overlay
+                                        
+                                        for check_x in search_range:
+                                            if not (0 <= check_x < w):
+                                                continue
+                                            
+                                            # Verificăm dacă există o linie orizontală mică la această poziție
+                                            line_pixels = []
+                                            for check_y in range(top_y, bottom_y):
+                                                if 0 <= check_y < h and overlay_image[check_y, check_x] >= overlay_threshold:
+                                                    line_pixels.append(check_y)
+                                            
+                                            # Verificăm dacă avem o linie continuă de lungime între min_line_length și max_line_length
+                                            if len(line_pixels) >= min_line_length and len(line_pixels) <= max_line_length:
+                                                # Verificăm dacă linia este conectată la pereții paraleli (top sau bottom)
+                                                # Verificăm conexiunea la sus
+                                                connected_top = False
+                                                if top_y > 0:
+                                                    for conn_x in range(max(0, check_x - 2), min(w, check_x + 3)):
+                                                        if overlay_image[top_y - 1, conn_x] >= overlay_threshold:
+                                                            connected_top = True
+                                                            break
+                                                
+                                                # Verificăm conexiunea la jos
+                                                connected_bottom = False
+                                                if bottom_y < h - 1:
+                                                    for conn_x in range(max(0, check_x - 2), min(w, check_x + 3)):
+                                                        if overlay_image[bottom_y + 1, conn_x] >= overlay_threshold:
+                                                            connected_bottom = True
+                                                            break
+                                                
+                                                # Dacă linia este conectată la ambele pereți paraleli, am găsit artefactul
+                                                if connected_top and connected_bottom:
+                                                    artifact_found = True
+                                                    artifact_x = check_x
+                                                    print(f"         ✅ Găsit artefact în overlay_image (linie mică) la x={artifact_x}, conectat la ambele pereți paraleli")
+                                                    break
+                                    
+                                    # Actualizăm distanța sau aplicăm fallback
+                                    if artifact_found and artifact_x is not None:
+                                        # Actualizăm distanța outlier cu poziția artefactului
+                                        if outlier_dir == 'left':
+                                            distances[outlier_dir] = center_x - artifact_x
+                                        else:  # right
+                                            distances[outlier_dir] = artifact_x - center_x
+                                        print(f"         ✅ Actualizat {outlier_dir} cu distanța către artefact: {distances[outlier_dir]}px")
+                                    else:
+                                        # FALLBACK: Dacă nu am găsit artefacte, folosim distanța paralelă
+                                        replacement_value = parallel_value
+                                        distances[outlier_dir] = replacement_value
+                                        print(f"         ⚠️ Nu am găsit artefacte în niciuna dintre imagini, folosesc fallback (distanța paralelă): {replacement_value}px")
+                            
+                            # Acum desenăm forma geometrică bazată pe distanțele corectate
+                            print(f"         🎨 Desenez forma geometrică pentru garaj...")
+                            
+                            # Calculăm colțurile dreptunghiului
+                            top_y = center_y - distances['top']
+                            bottom_y = center_y + distances['bottom']
+                            left_x = center_x - distances['left']
+                            right_x = center_x + distances['right']
+                            
+                            # Creăm o mască pentru forma geometrică
+                            geometric_mask = np.zeros((h, w), dtype=np.uint8)
+                            cv2.rectangle(geometric_mask, (left_x, top_y), (right_x, bottom_y), 255, -1)
+                            
+                            # Înlocuim zona umplută cu forma geometrică
+                            filled_region = geometric_mask
+                            filled_area = np.count_nonzero(filled_region)
+                            
+                            print(f"         ✅ Formă geometrică: ({left_x}, {top_y}) -> ({right_x}, {bottom_y}), aria: {filled_area}px")
+                            
+                            # Desenăm peretele lipsă aproximat
+                            if outlier_dir == 'top':
+                                wall_thickness = max(3, int(min(w, h) * 0.003))
+                                cv2.line(result, (left_x, top_y), (right_x, top_y), 255, wall_thickness)
+                                print(f"         ✅ Aproximat perete de sus: linie la y={top_y}")
+                            elif outlier_dir == 'bottom':
+                                wall_thickness = max(3, int(min(w, h) * 0.003))
+                                cv2.line(result, (left_x, bottom_y), (right_x, bottom_y), 255, wall_thickness)
+                                print(f"         ✅ Aproximat perete de jos: linie la y={bottom_y}")
+                            elif outlier_dir == 'left':
+                                wall_thickness = max(3, int(min(w, h) * 0.003))
+                                cv2.line(result, (left_x, top_y), (left_x, bottom_y), 255, wall_thickness)
+                                print(f"         ✅ Aproximat perete din stânga: linie la x={left_x}")
+                            elif outlier_dir == 'right':
+                                wall_thickness = max(3, int(min(w, h) * 0.003))
+                                cv2.line(result, (right_x, top_y), (right_x, bottom_y), 255, wall_thickness)
+                                print(f"         ✅ Aproximat perete din dreapta: linie la x={right_x}")
+                            
+                            # Actualizăm walls_mask cu peretele aproximat
+                            walls_mask = result.copy()
+                        else:
+                            print(f"         ⚠️ Nu am găsit suficiente pereți pentru analiză geometrică")
+                    
+                    # Verificăm că zona umplută este suficient de mare
+                    if not is_garage and filled_area < 1000:
+                        print(f"         ⚠️ Zona detectată prea mică ({filled_area} pixeli). Skip.")
+                        # Continuăm cu următorul text_box
+                        if steps_dir:
+                            # Salvăm imagine de debug pentru tentativa respinsă
+                            vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                            cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
+                            cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                            status_text = f"❌ REJECTED: Area too small ({filled_area}px)"
+                            font_scale = 0.8
+                            font_thickness = 2
+                            (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                            cv2.rectangle(vis_fill_attempt, 
+                                         (x, y + height + 5), 
+                                         (x + text_width + 10, y + height + text_height + baseline + 10), 
+                                         (255, 255, 255), -1)
+                            cv2.putText(vis_fill_attempt, status_text, (x + 5, y + height + text_height + 5), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+                            output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
+                            cv2.imwrite(str(output_path), vis_fill_attempt)
+                            print(f"         💾 Salvat: {output_path.name} (REJECTED: area too small)")
+                        # Nu continuăm - procesăm doar primul rezultat, deci returnăm
+                        return result
+                    
+                    if is_garage and filled_area < 1000:
+                        print(f"         ⚠️ Zona geometrică prea mică ({filled_area} pixeli). Skip.")
+                        # Nu continuăm - procesăm doar primul rezultat, deci returnăm
+                        if steps_dir:
+                            # Salvăm imagine de debug pentru tentativa respinsă
+                            vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                            cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
+                            cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                            status_text = f"❌ REJECTED: Geometric area too small ({filled_area}px)"
+                            font_scale = 0.8
+                            font_thickness = 2
+                            (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                            cv2.rectangle(vis_fill_attempt, 
+                                         (x, y + height + 5), 
+                                         (x + text_width + 10, y + height + text_height + baseline + 10), 
+                                         (255, 255, 255), -1)
+                            cv2.putText(vis_fill_attempt, status_text, (x + 5, y + height + text_height + 5), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+                            output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
+                            cv2.imwrite(str(output_path), vis_fill_attempt)
+                            print(f"         💾 Salvat: {output_path.name} (REJECTED: geometric area too small)")
+                        # Nu continuăm - procesăm doar primul rezultat, deci returnăm
+                        return result
+                    
+                    # Pentru garaj, verificăm că zona este suficient de mare
+                    if not is_garage and filled_area < 1000:
+                        print(f"         🚗 Detectat garaj/carport - verific pereții și corectez zona umplută (ar trebui să fie 3, nu 4)...")
+                        
+                        # Găsim conturul zonei umplute
+                        contours_temp, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if contours_temp:
+                            largest_contour = max(contours_temp, key=cv2.contourArea)
+                            
+                            # Obținem bounding box-ul zonei umplute
+                            bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(largest_contour)
+                            
+                            # Extindem zona umplută pentru a căuta pereții în jur
+                            expanded_region = cv2.dilate(filled_region, np.ones((30, 30), np.uint8), iterations=1)
+                            
+                            # Verificăm marginile zonei umplute pentru a vedea unde sunt pereții
+                            # Folosim bounding box-ul pentru a verifica pereții în jur
+                            margin = 30
+                            top_wall_check = walls_mask[max(0, bbox_y - margin):bbox_y + bbox_h//4, bbox_x:bbox_x + bbox_w] if bbox_y >= margin else np.array([])
+                            bottom_wall_check = walls_mask[bbox_y + 3*bbox_h//4:min(h, bbox_y + bbox_h + margin), bbox_x:bbox_x + bbox_w] if bbox_y + bbox_h + margin <= h else np.array([])
+                            left_wall_check = walls_mask[bbox_y:bbox_y + bbox_h, max(0, bbox_x - margin):bbox_x + bbox_w//4] if bbox_x >= margin else np.array([])
+                            right_wall_check = walls_mask[bbox_y:bbox_y + bbox_h, bbox_x + 3*bbox_w//4:min(w, bbox_x + bbox_w + margin)] if bbox_x + bbox_w + margin <= w else np.array([])
+                            
+                            walls_detected = []
+                            if top_wall_check.size > 0 and np.any(top_wall_check > 0):
+                                walls_detected.append('top')
+                            if bottom_wall_check.size > 0 and np.any(bottom_wall_check > 0):
+                                walls_detected.append('bottom')
+                            if left_wall_check.size > 0 and np.any(left_wall_check > 0):
+                                walls_detected.append('left')
+                            if right_wall_check.size > 0 and np.any(right_wall_check > 0):
+                                walls_detected.append('right')
+                            
+                            print(f"         📐 Pereți detectați: {len(walls_detected)} ({', '.join(walls_detected)})")
+                            
+                            # Dacă avem exact 3 pereți, "tăiem" zona umplută la marginea unde lipsește peretele
+                            if len(walls_detected) == 3:
+                                print(f"         ✅ Confirmat: garaj/carport cu 3 pereți. Corectez zona umplută...")
+                                
+                                # Determinăm care perete lipsește
+                                all_sides = ['top', 'bottom', 'left', 'right']
+                                missing_wall = [side for side in all_sides if side not in walls_detected][0]
+                                
+                                # Analizăm forma zonei umplute pentru a determina unde să o "tăiem"
+                                contour_points = largest_contour.reshape(-1, 2)
+                                
+                                # Creăm o mască pentru a "tăia" zona dincolo de marginea lipsă
+                                cut_mask = np.ones((h, w), dtype=np.uint8) * 255
+                                
+                                if missing_wall == 'top':
+                                    # Peretele de sus lipsește - "tăiem" zona deasupra
+                                    # Găsim punctele de pe marginea de sus a zonei (unde se opresc cei 3 pereți)
+                                    top_points = contour_points[contour_points[:, 1] <= bbox_y + bbox_h//3]
+                                    if len(top_points) > 0:
+                                        # Găsim linia care conectează punctele extreme de sus
+                                        min_x = int(np.min(top_points[:, 0]))
+                                        max_x = int(np.max(top_points[:, 0]))
+                                        # Folosim y-ul minim al punctelor de sus ca limită
+                                        cut_y = int(np.min(top_points[:, 1]))
+                                        # "Tăiem" tot ce este deasupra acestei linii
+                                        cut_mask[:cut_y, :] = 0
+                                        print(f"         ✂️ Tăiat zona deasupra y={cut_y}")
+                                elif missing_wall == 'bottom':
+                                    # Peretele de jos lipsește - "tăiem" zona de jos
+                                    bottom_points = contour_points[contour_points[:, 1] >= bbox_y + 2*bbox_h//3]
+                                    if len(bottom_points) > 0:
+                                        cut_y = int(np.max(bottom_points[:, 1]))
+                                        cut_mask[cut_y:, :] = 0
+                                        print(f"         ✂️ Tăiat zona de jos y={cut_y}")
+                                elif missing_wall == 'left':
+                                    # Peretele din stânga lipsește - "tăiem" zona din stânga
+                                    left_points = contour_points[contour_points[:, 0] <= bbox_x + bbox_w//3]
+                                    if len(left_points) > 0:
+                                        cut_x = int(np.min(left_points[:, 0]))
+                                        cut_mask[:, :cut_x] = 0
+                                        print(f"         ✂️ Tăiat zona din stânga x={cut_x}")
+                                elif missing_wall == 'right':
+                                    # Peretele din dreapta lipsește - "tăiem" zona din dreapta
+                                    right_points = contour_points[contour_points[:, 0] >= bbox_x + 2*bbox_w//3]
+                                    if len(right_points) > 0:
+                                        cut_x = int(np.max(right_points[:, 0]))
+                                        cut_mask[:, cut_x:] = 0
+                                        print(f"         ✂️ Tăiat zona din dreapta x={cut_x}")
+                                
+                                # Aplicăm masca de tăiere pe zona umplută
+                                filled_region = cv2.bitwise_and(filled_region, cut_mask)
+                                filled_area = np.count_nonzero(filled_region)
+                                print(f"         ✅ Zona corectată: {filled_area} pixeli (după tăiere)")
+                                
+                                # Acum aproximăm peretele lipsă bazându-ne pe conturul corectat
+                                contours_corrected, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                if contours_corrected:
+                                    largest_contour_corrected = max(contours_corrected, key=cv2.contourArea)
+                                    contour_points_corrected = largest_contour_corrected.reshape(-1, 2)
+                                    
+                                    if missing_wall == 'top':
+                                        top_points = contour_points_corrected[contour_points_corrected[:, 1] <= bbox_y + bbox_h//3]
+                                        if len(top_points) > 0:
+                                            min_x = int(np.min(top_points[:, 0]))
+                                            max_x = int(np.max(top_points[:, 0]))
+                                            avg_y = int(np.mean(top_points[:, 1]))
+                                            wall_thickness = max(3, int(min(w, h) * 0.003))
+                                            cv2.line(result, (min_x, avg_y), (max_x, avg_y), 255, wall_thickness)
+                                            print(f"         ✅ Aproximat perete de sus: linie la y={avg_y} între x={min_x}-{max_x}")
+                                    elif missing_wall == 'bottom':
+                                        bottom_points = contour_points_corrected[contour_points_corrected[:, 1] >= bbox_y + 2*bbox_h//3]
+                                        if len(bottom_points) > 0:
+                                            min_x = int(np.min(bottom_points[:, 0]))
+                                            max_x = int(np.max(bottom_points[:, 0]))
+                                            avg_y = int(np.mean(bottom_points[:, 1]))
+                                            wall_thickness = max(3, int(min(w, h) * 0.003))
+                                            cv2.line(result, (min_x, avg_y), (max_x, avg_y), 255, wall_thickness)
+                                            print(f"         ✅ Aproximat perete de jos: linie la y={avg_y} între x={min_x}-{max_x}")
+                                    elif missing_wall == 'left':
+                                        left_points = contour_points_corrected[contour_points_corrected[:, 0] <= bbox_x + bbox_w//3]
+                                        if len(left_points) > 0:
+                                            min_y = int(np.min(left_points[:, 1]))
+                                            max_y = int(np.max(left_points[:, 1]))
+                                            avg_x = int(np.mean(left_points[:, 0]))
+                                            wall_thickness = max(3, int(min(w, h) * 0.003))
+                                            cv2.line(result, (avg_x, min_y), (avg_x, max_y), 255, wall_thickness)
+                                            print(f"         ✅ Aproximat perete din stânga: linie la x={avg_x} între y={min_y}-{max_y}")
+                                    elif missing_wall == 'right':
+                                        right_points = contour_points_corrected[contour_points_corrected[:, 0] >= bbox_x + 2*bbox_w//3]
+                                        if len(right_points) > 0:
+                                            min_y = int(np.min(right_points[:, 1]))
+                                            max_y = int(np.max(right_points[:, 1]))
+                                            avg_x = int(np.mean(right_points[:, 0]))
+                                            wall_thickness = max(3, int(min(w, h) * 0.003))
+                                            cv2.line(result, (avg_x, min_y), (avg_x, max_y), 255, wall_thickness)
+                                            print(f"         ✅ Aproximat perete din dreapta: linie la x={avg_x} între y={min_y}-{max_y}")
+                                
+                                # Actualizăm walls_mask cu peretele aproximat pentru a fi folosit în completarea golurilor
+                                walls_mask = result.copy()
+                    
+                    # Salvăm imagine suplimentară: detecția cu cel mai mare procent + flood fill (chiar dacă e respins)
+                    if steps_dir and best_box_all:
+                        best_x, best_y, best_width, best_height, best_text, best_conf = best_box_all
+                        best_center_x = best_x + best_width // 2
+                        best_center_y = best_y + best_height // 2
+                        
+                        vis_best_detection = ocr_image.copy() if ocr_image is not None else cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                        
+                        # Desenăm detecția cu cel mai mare procent (verde pentru acceptat, portocaliu pentru respins)
+                        filled_ratio_best = filled_area / float(h * w) if filled_area > 0 else 0
+                        if filled_area > 1000 and (is_garage or filled_ratio_best <= 0.50):
+                            detection_color = (0, 255, 0)  # Verde pentru acceptat
+                            status_label = f"✅ ACCEPTED ({best_conf:.1f}%)"
+                        else:
+                            detection_color = (0, 165, 255)  # Portocaliu pentru respins
+                            if filled_area > 0 and filled_ratio_best > 0.50:
+                                status_label = f"❌ REJECTED ({best_conf:.1f}%) - Too large"
+                            else:
+                                status_label = f"❌ REJECTED ({best_conf:.1f}%)"
+                        
+                        # Desenăm dreptunghiul detecției
+                        cv2.rectangle(vis_best_detection, (best_x, best_y), (best_x + best_width, best_y + best_height), detection_color, 3)
+                        
+                        # Desenăm centrul detecției
+                        cv2.circle(vis_best_detection, (best_center_x, best_center_y), 8, (0, 0, 255), -1)
+                        
+                        # Desenăm flood fill-ul dacă există (galben)
+                        if filled_area > 0:
+                            filled_colored = np.zeros_like(vis_best_detection)
+                            filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                            vis_best_detection = cv2.addWeighted(vis_best_detection, 0.7, filled_colored, 0.3, 0)
+                        
+                        # Adăugăm text cu informații
+                        label_text = f"{best_text} - {status_label}"
+                        if filled_area > 0:
+                            label_text += f" | Flood Fill: {filled_area}px"
+                        
+                        font_scale = max(0.7, best_height / 30.0)
+                        font_thickness = max(2, int(font_scale * 2))
+                        (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                        
+                        # Fundal pentru text
+                        text_y = max(text_height + 5, best_y - 5)
+                        text_x = best_x
+                        cv2.rectangle(vis_best_detection, 
+                                     (text_x, text_y - text_height - baseline), 
+                                     (text_x + text_width + 10, text_y + baseline), 
+                                     (255, 255, 255), -1)
+                        
+                        cv2.putText(vis_best_detection, label_text, (text_x + 5, text_y), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, detection_color, font_thickness)
+                        
+                        output_path = Path(steps_dir) / f"{debug_prefix}_01c_best_detection_with_fill.png"
+                        cv2.imwrite(str(output_path), vis_best_detection)
+                        print(f"         💾 Salvat: {output_path.name} (best detection: {best_conf:.1f}%, fill: {filled_area}px)")
+                    
+                    # Salvăm imagine de debug pentru TOATE tentativele de flood fill
+                    if steps_dir:
                             vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
                             filled_colored = np.zeros_like(vis_fill_attempt)
                             filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
@@ -1476,12 +1781,16 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                             exclusion_colored[exclusion_mask > 0] = [255, 0, 255]  # Magenta
                             vis_fill_attempt = cv2.addWeighted(vis_fill_attempt, 0.8, exclusion_colored, 0.2, 0)
                             
-                            status_text = f"Area: {filled_area}px"
-                            if filled_area > 1000:
+                            filled_ratio_debug = filled_area / float(h * w)
+                            status_text = f"Area: {filled_area}px ({filled_ratio_debug*100:.1f}%)"
+                            if filled_area > 1000 and (is_garage or filled_ratio_debug <= 0.50):
                                 status_text += " ✅ ACCEPTED"
                                 status_color = (0, 255, 0)
-                            else:
+                            elif filled_area <= 1000:
                                 status_text += f" ❌ REJECTED (< 1000px)"
+                                status_color = (0, 0, 255)
+                            else:
+                                status_text += f" ❌ REJECTED (> 50% of image)"
                                 status_color = (0, 0, 255)
                             
                             font_scale = 0.8
@@ -1502,91 +1811,75 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
                             output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
                             cv2.imwrite(str(output_path), vis_fill_attempt)
                             print(f"         💾 Salvat: {output_path.name} (area={filled_area}px, {'ACCEPTED' if filled_area > 1000 else 'REJECTED'})")
+                    
+                    # Verificăm că zona umplută este suficient de mare dar nu prea mare (pentru terasă)
+                    if filled_area > 1000 and (is_garage or filled_ratio <= 0.50):
+                        print(f"         🔍 Extrag conturul zonei detectate pentru a completa golurile...")
                         
-                        if filled_area > 1000:
-                            print(f"         🔍 Extrag conturul zonei detectate pentru a completa golurile...")
+                        gaps = None
+                        wall_border = None
+                        contours = None
+                        
+                        contours, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        if contours:
+                            largest_contour = max(contours, key=cv2.contourArea)
+                            contour_mask = np.zeros((h, w), dtype=np.uint8)
+                            wall_thickness = max(3, int(min(w, h) * 0.003))
+                            cv2.drawContours(contour_mask, [largest_contour], -1, 255, wall_thickness)
+                            gaps = cv2.bitwise_and(contour_mask, cv2.bitwise_not(walls_mask))
+                            walls_to_add = gaps
+                            result = cv2.bitwise_or(result, walls_to_add)
+                            gaps_area = np.count_nonzero(gaps)
+                            print(f"         ✅ Completat {gaps_area} pixeli de goluri în pereți conform conturului")
+                        else:
+                            print(f"         ⚠️ Nu s-au găsit contururi în zona umplută")
+                            kernel_size = max(3, int(min(w, h) * 0.005))
+                            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                            filled_dilated = cv2.dilate(filled_region, kernel, iterations=1)
+                            wall_border = cv2.subtract(filled_dilated, filled_region)
+                            result = cv2.bitwise_or(result, wall_border)
+                        
+                        rooms_filled += 1
+                        print(f"         ✅ Umplut camera '{text}': {filled_area} pixeli")
+                        
+                        # Vizualizăm zona umplută și golurile completate
+                        if steps_dir:
+                            vis_fill = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
+                            filled_colored = np.zeros_like(vis_fill)
+                            filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
+                            vis_fill = cv2.addWeighted(vis_fill, 0.7, filled_colored, 0.3, 0)
                             
-                            gaps = None
-                            wall_border = None
-                            contours = None
-                            
-                            contours, _ = cv2.findContours(filled_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            
-                            if contours:
+                            if contours and len(contours) > 0:
                                 largest_contour = max(contours, key=cv2.contourArea)
-                                contour_mask = np.zeros((h, w), dtype=np.uint8)
-                                wall_thickness = max(3, int(min(w, h) * 0.003))
-                                cv2.drawContours(contour_mask, [largest_contour], -1, 255, wall_thickness)
-                                gaps = cv2.bitwise_and(contour_mask, cv2.bitwise_not(walls_mask))
-                                walls_to_add = gaps
-                                result = cv2.bitwise_or(result, walls_to_add)
-                                gaps_area = np.count_nonzero(gaps)
-                                print(f"         ✅ Completat {gaps_area} pixeli de goluri în pereți conform conturului")
-                            else:
-                                print(f"         ⚠️ Nu s-au găsit contururi în zona umplută")
-                                kernel_size = max(3, int(min(w, h) * 0.005))
-                                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                                filled_dilated = cv2.dilate(filled_region, kernel, iterations=1)
-                                wall_border = cv2.subtract(filled_dilated, filled_region)
-                                result = cv2.bitwise_or(result, wall_border)
+                                cv2.drawContours(vis_fill, [largest_contour], -1, (255, 0, 0), 2)
                             
-                            rooms_filled += 1
-                            print(f"         ✅ Umplut camera '{text}': {filled_area} pixeli")
+                            if gaps is not None:
+                                gaps_colored = np.zeros_like(vis_fill)
+                                gaps_colored[gaps > 0] = [0, 255, 0]
+                                vis_fill = cv2.addWeighted(vis_fill, 0.5, gaps_colored, 0.5, 0)
+                            elif wall_border is not None:
+                                wall_border_colored = np.zeros_like(vis_fill)
+                                wall_border_colored[wall_border > 0] = [0, 255, 0]
+                                vis_fill = cv2.addWeighted(vis_fill, 0.5, wall_border_colored, 0.5, 0)
                             
-                            # Vizualizăm zona umplută și golurile completate
-                            if steps_dir:
-                                vis_fill = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                                filled_colored = np.zeros_like(vis_fill)
-                                filled_colored[filled_region > 0] = [0, 255, 255]  # Galben
-                                vis_fill = cv2.addWeighted(vis_fill, 0.7, filled_colored, 0.3, 0)
-                                
-                                if contours and len(contours) > 0:
-                                    largest_contour = max(contours, key=cv2.contourArea)
-                                    cv2.drawContours(vis_fill, [largest_contour], -1, (255, 0, 0), 2)
-                                
-                                if gaps is not None:
-                                    gaps_colored = np.zeros_like(vis_fill)
-                                    gaps_colored[gaps > 0] = [0, 255, 0]
-                                    vis_fill = cv2.addWeighted(vis_fill, 0.5, gaps_colored, 0.5, 0)
-                                elif wall_border is not None:
-                                    wall_border_colored = np.zeros_like(vis_fill)
-                                    wall_border_colored[wall_border > 0] = [0, 255, 0]
-                                    vis_fill = cv2.addWeighted(vis_fill, 0.5, wall_border_colored, 0.5, 0)
-                                
-                                cv2.circle(vis_fill, (center_x, center_y), 5, (0, 0, 255), -1)
-                                cv2.rectangle(vis_fill, (x, y), (x + width, y + height), (0, 255, 0), 2)
-                                
-                                output_path = Path(steps_dir) / f"{debug_prefix}_02_{room_name}_fill_{box_idx + 1}.png"
-                                cv2.imwrite(str(output_path), vis_fill)
-                                print(f"         💾 Salvat: {output_path.name}")
+                            cv2.circle(vis_fill, (center_x, center_y), 5, (0, 0, 255), -1)
+                            cv2.rectangle(vis_fill, (x, y), (x + width, y + height), (0, 255, 0), 2)
                             
-                            print(f"         ✅ Gata! Am umplut camera {room_name}.")
+                            output_path = Path(steps_dir) / f"{debug_prefix}_02_{room_name}_fill_{box_idx + 1}.png"
+                            cv2.imwrite(str(output_path), vis_fill)
+                            print(f"         💾 Salvat: {output_path.name}")
+                        
+                        print(f"         ✅ Gata! Am umplut camera {room_name}.")
+                    else:
+                        if filled_area > 0 and filled_ratio > 0.50:
+                            print(f"         ⚠️ Zona detectată prea mare ({filled_area} pixeli, {filled_ratio*100:.1f}% din imagine). Probabil a trecut prin pereți. Skip.")
                         else:
                             print(f"         ⚠️ Zona detectată prea mică ({filled_area} pixeli). Skip.")
-                else:
-                    print(f"         ⚠️ Centrul textului '{text}' este pe un perete. Skip.")
-                    if steps_dir:
-                        vis_fill_attempt = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                        cv2.circle(vis_fill_attempt, (center_x, center_y), 8, (0, 0, 255), -1)
-                        cv2.rectangle(vis_fill_attempt, (x, y), (x + width, y + height), (0, 255, 0), 2)
-                        status_text = "❌ REJECTED: Center on wall"
-                        font_scale = 0.8
-                        font_thickness = 2
-                        (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-                        cv2.rectangle(vis_fill_attempt, 
-                                     (x, y + height + 5), 
-                                     (x + text_width + 10, y + height + text_height + baseline + 10), 
-                                     (255, 255, 255), -1)
-                        cv2.putText(vis_fill_attempt, status_text, (x + 5, y + height + text_height + 5), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
-                        output_path = Path(steps_dir) / f"{debug_prefix}_02c_flood_fill_attempt_{box_idx + 1}.png"
-                        cv2.imwrite(str(output_path), vis_fill_attempt)
-                        print(f"         💾 Salvat: {output_path.name} (REJECTED: center on wall)")
                         
                         # Salvăm și imaginea cu detecția cu cel mai mare procent (chiar dacă nu s-a făcut flood fill)
-                        if text_boxes:
-                            best_box = text_boxes[0]
-                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box
+                        if best_box_all:
+                            best_x, best_y, best_width, best_height, best_text, best_conf = best_box_all
                             best_center_x = best_x + best_width // 2
                             best_center_y = best_y + best_height // 2
                             
@@ -1637,815 +1930,20 @@ def fill_room_by_ocr(walls_mask: np.ndarray, search_terms: list, room_name: str,
         print(f"         ❌ Eroare la detectarea/umplerea {room_name}: {e}")
         import traceback
         traceback.print_exc()
-    
-    return result
-
-
-def fill_terrace_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarray:
-    """
-    Detectează cuvântul "terasa" (sau variante în germană) în plan și umple camera respectivă cu flood fill.
-    
-    Args:
-        walls_mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-    
-    Returns:
-        Masca pereților cu camera terasei umplută (dacă a fost detectată)
-    """
-    # Variante ale cuvântului "terasa" (fără "erdgeschoss" care înseamnă parter)
-    search_terms = [
-        "terrasse", "Terrasse", "TERRASSE", "terasa", "Terasa", "TERASA",
-        "terrace", "Terrace", "TERRACE",  # engleză
-        "terrasa", "Terrasa", "TERRASA",  # variante
-        "terras", "Terras", "TERRAS"  # variante scurte
-    ]
-    
-    return fill_room_by_ocr(walls_mask, search_terms, "terasa", steps_dir, "02g")
-
-
-def fill_garage_room(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarray:
-    """
-    Detectează cuvintele "garage", "carport" (sau variante) în plan și umple camera respectivă cu flood fill.
-    
-    Args:
-        walls_mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-    
-    Returns:
-        Masca pereților cu garajul umplut (dacă a fost detectat)
-    """
-    # Variante ale cuvintelor pentru garaje/carport
-    search_terms = [
-        "garage", "Garage", "GARAGE", "garaj", "Garaj", "GARAJ",
-        "carport", "Carport", "CARPORT", "car-port", "Car-Port", "CAR-PORT",
-        "garagen", "Garagen", "GARAGEN"  # germană plural
-    ]
-    
-    return fill_room_by_ocr(walls_mask, search_terms, "garage", steps_dir, "02h")
-
-
-def fill_stairs_room(walls_mask: np.ndarray, stairs_bboxes: list, steps_dir: str = None) -> np.ndarray:
-    """
-    Detectează scările folosind detecțiile Roboflow și reconstruiește pereții din jurul lor.
-    NU face flood fill, doar reconstruiește pereții care lipsesc în jurul scărilor.
-    
-    Args:
-        walls_mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        stairs_bboxes: Lista de bounding boxes pentru scări detectate de Roboflow
-                      Format: [(x1, y1, x2, y2), ...]
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-    
-    Returns:
-        Masca pereților cu pereții reconstruiți în jurul scărilor (dacă au fost detectate)
-    """
-    h, w = walls_mask.shape[:2]
-    result = walls_mask.copy()
-    
-    if not stairs_bboxes:
-        print(f"      🏠 Nu s-au detectat scări. Skip reconstruirea pereților pentru scări.")
         return result
     
-    print(f"      🏠 Reconstruiesc pereții în jurul scărilor ({len(stairs_bboxes)} detectate)...")
-    
-    stairs_processed = 0
-    
-    for stair_idx, bbox in enumerate(stairs_bboxes):
-        x1, y1, x2, y2 = map(int, bbox)
-        
-        # Asigurăm că coordonatele sunt în limitele imaginii
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        
-        if x2 <= x1 or y2 <= y1:
-            print(f"         ⚠️ Scara #{stair_idx + 1}: bbox invalid. Skip.")
-            continue
-        
-        print(f"         🎯 Scara #{stair_idx + 1}: verific și reconstruiesc pereții în jurul scării...")
-        
-        # Calculăm o zonă buffer în jurul scării pentru a căuta pereți
-        width_bbox = x2 - x1
-        height_bbox = y2 - y1
-        # Buffer mai mic - doar pentru a detecta pereții imediat în jurul scării
-        buffer_size = max(20, int(max(width_bbox, height_bbox) * 0.3))  # 30% din dimensiunea scării
-        
-        # Creăm o zonă extinsă în jurul scării pentru a căuta pereți
-        search_x1 = max(0, x1 - buffer_size)
-        search_y1 = max(0, y1 - buffer_size)
-        search_x2 = min(w, x2 + buffer_size)
-        search_y2 = min(h, y2 + buffer_size)
-        
-        # Extragem zona de căutare din masca pereților
-        search_region = result[search_y1:search_y2, search_x1:search_x2]
-        
-        # Creăm o mască pentru scara (excludem scara din procesare)
-        stairs_mask_region = np.zeros((search_y2 - search_y1, search_x2 - search_x1), dtype=np.uint8)
-        local_x1 = x1 - search_x1
-        local_y1 = y1 - search_y1
-        local_x2 = x2 - search_x1
-        local_y2 = y2 - search_y1
-        cv2.rectangle(stairs_mask_region, (local_x1, local_y1), (local_x2, local_y2), 255, -1)
-        
-        # Excludem scara din zona de căutare
-        search_region_no_stairs = cv2.bitwise_and(search_region, cv2.bitwise_not(stairs_mask_region))
-        
-        # Detectăm pereții existenți în jurul scării
-        existing_walls = search_region_no_stairs > 0
-        
-        # Creăm o zonă buffer extinsă pentru a desena pereții
-        # Folosim conturul scării ca bază pentru reconstruirea pereților
-        stairs_contour_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.rectangle(stairs_contour_mask, (x1, y1), (x2, y2), 255, -1)
-        
-        # Dilatăm conturul scării pentru a crea o zonă buffer
-        # Grosimea peretelui va fi adaptivă
-        wall_thickness = max(3, int(min(w, h) * 0.003))
-        kernel_size = max(3, int(min(w, h) * 0.005))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        
-        # Dilatăm scara pentru a obține zona în care ar trebui să fie pereții
-        stairs_dilated = cv2.dilate(stairs_contour_mask, kernel, iterations=1)
-        
-        # Extragem conturul zonei dilatate (perimetrul scării + buffer)
-        contours, _ = cv2.findContours(stairs_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Găsim cel mai mare contur (scara principală)
-            largest_contour = max(contours, key=cv2.contourArea)
-            
-            # Creăm o mască pentru conturul perimetrului (unde ar trebui să fie pereții)
-            contour_perimeter_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(contour_perimeter_mask, [largest_contour], -1, 255, wall_thickness)
-            
-            # Identificăm golurile: unde conturul există dar pereții nu există
-            gaps = cv2.bitwise_and(contour_perimeter_mask, cv2.bitwise_not(result))
-            
-            gaps_area = np.count_nonzero(gaps)
-            
-            if gaps_area > 0:
-                # Adăugăm pereții noi (doar golurile) la masca finală
-                result = cv2.bitwise_or(result, gaps)
-                print(f"         ✅ Reconstruit {gaps_area} pixeli de pereți în jurul scării #{stair_idx + 1}")
-                stairs_processed += 1
-                
-                # Vizualizăm reconstruirea
-                if steps_dir:
-                    vis_reconstruction = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                    
-                    # Desenăm scara (magenta)
-                    cv2.rectangle(vis_reconstruction, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                    
-                    # Desenăm conturul perimetrului (albastru)
-                    cv2.drawContours(vis_reconstruction, [largest_contour], -1, (255, 0, 0), 2)
-                    
-                    # Desenăm pereții reconstruiți (verde)
-                    gaps_colored = np.zeros_like(vis_reconstruction)
-                    gaps_colored[gaps > 0] = [0, 255, 0]
-                    vis_reconstruction = cv2.addWeighted(vis_reconstruction, 0.7, gaps_colored, 0.3, 0)
-                    
-                    # Adăugăm text cu informații
-                    status_text = f"Gaps filled: {gaps_area}px ✅"
-                    font_scale = 0.8
-                    font_thickness = 2
-                    (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-                    cv2.rectangle(vis_reconstruction, 
-                                 (x1, y2 + 5), 
-                                 (x1 + text_width + 10, y2 + text_height + baseline + 10), 
-                                 (255, 255, 255), -1)
-                    cv2.putText(vis_reconstruction, status_text, (x1 + 5, y2 + text_height + 5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-                    
-                    output_path = Path(steps_dir) / f"02i_02_stairs_reconstruction_{stair_idx + 1}.png"
-                    cv2.imwrite(str(output_path), vis_reconstruction)
-                    print(f"         💾 Salvat: {output_path.name}")
-            else:
-                print(f"         ℹ️ Nu s-au găsit goluri în pereți în jurul scării #{stair_idx + 1}")
-                if steps_dir:
-                    vis_no_gaps = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-                    cv2.rectangle(vis_no_gaps, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                    status_text = "No gaps found"
-                    font_scale = 0.8
-                    font_thickness = 2
-                    (text_width, text_height), baseline = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-                    cv2.rectangle(vis_no_gaps, 
-                                 (x1, y2 + 5), 
-                                 (x1 + text_width + 10, y2 + text_height + baseline + 10), 
-                                 (255, 255, 255), -1)
-                    cv2.putText(vis_no_gaps, status_text, (x1 + 5, y2 + text_height + 5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (128, 128, 128), font_thickness)
-                    output_path = Path(steps_dir) / f"02i_02_stairs_reconstruction_{stair_idx + 1}.png"
-                    cv2.imwrite(str(output_path), vis_no_gaps)
-                    print(f"         💾 Salvat: {output_path.name}")
-        else:
-            print(f"         ⚠️ Nu s-au găsit contururi pentru scara #{stair_idx + 1}")
-    
-    if stairs_processed > 0:
-        print(f"         ✅ Reconstruit pereți pentru {stairs_processed} scări")
-    else:
-        print(f"         ℹ️ Nu s-au reconstruit pereți (nu s-au găsit goluri)")
-    
-    # Salvăm rezultatul final
-    if steps_dir:
-        vis_final = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
-        diff = cv2.subtract(result, walls_mask)
-        diff_colored = np.zeros_like(vis_final)
-        diff_colored[diff > 0] = [0, 255, 0]  # Verde pentru pereții noi
-        vis_final = cv2.addWeighted(vis_final, 0.7, diff_colored, 0.3, 0)
-        cv2.imwrite(str(Path(steps_dir) / "02i_03_final_result.png"), vis_final)
-        print(f"         💾 Salvat: 02i_03_final_result.png (verde=pereți noi)")
-    
     return result
 
 
-def detect_and_visualize_wall_closures(mask: np.ndarray, steps_dir: str = None) -> None:
-    """
-    Detectează camerele (spațiile libere închise de pereți) folosind Watershed cu Distance Transform.
-    
-    Această metodă detectează atât camerele complet închise cât și cele cu goluri în pereți,
-    fără a distorsiona structura prin operații morfologice agresive.
-    
-    Args:
-        mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-    """
-    h, w = mask.shape[:2]
-    
-    print(f"      🎨 Detectez camere folosind Watershed + Distance Transform...")
-    
-    # Creăm o imagine colorată (BGR) pentru vizualizare
-    vis_image = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    
-    # Masca: negru (0) = spațiu liber, alb (255) = perete
-    spaces_mask = cv2.bitwise_not(mask)
-    
-    # Paletă de culori (BGR format pentru OpenCV)
-    colors = [
-        (255, 0, 0),      # Albastru
-        (0, 255, 0),      # Verde
-        (0, 0, 255),      # Roșu
-        (255, 255, 0),    # Cyan
-        (255, 0, 255),    # Magenta
-        (0, 255, 255),    # Galben
-        (128, 0, 128),    # Mov
-        (255, 165, 0),    # Portocaliu
-        (0, 128, 255),    # Albastru deschis
-        (128, 255, 0),    # Verde deschis
-        (255, 192, 203),  # Roz
-        (0, 255, 127),    # Verde primăvară
-        (255, 20, 147),   # Roz adânc
-        (0, 191, 255),    # Albastru cer
-        (255, 140, 0),    # Portocaliu închis
-    ]
-    
-    # Pas 1: Calculează Distance Transform
-    # Distanța de la fiecare pixel la cel mai apropiat perete
-    dist_transform = cv2.distanceTransform(spaces_mask, cv2.DIST_L2, 5)
-    
-    # Normalizăm pentru vizualizare (opțional, pentru debug)
-    if steps_dir:
-        dist_vis = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        cv2.imwrite(str(Path(steps_dir) / "02c_distance_transform.png"), dist_vis)
-    
-    # Pas 2: Găsește maximale locale (centrele camerelor)
-    # Folosim o metodă mai robustă: găsim maximale locale în distance transform
-    # Threshold adaptiv bazat pe distribuția distanțelor
-    max_dist = np.max(dist_transform)
-    # Pentru camere cu goluri mari, folosim un threshold mai mic (30% din maxim)
-    min_distance_threshold = max(5, max_dist * 0.3)
-    
-    # Aplicăm threshold pentru a găsi zonele cu distanță mare (centrele camerelor)
-    _, sure_fg = cv2.threshold(dist_transform, min_distance_threshold, 255, cv2.THRESH_BINARY)
-    sure_fg = sure_fg.astype(np.uint8)
-    
-    # Găsim maximale locale folosind peak detection
-    # Folosim morphological operations pentru a găsi vârfurile locale
-    kernel_peak = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    local_maxima = cv2.morphologyEx(dist_transform, cv2.MORPH_TOPHAT, kernel_peak)
-    _, local_maxima = cv2.threshold(local_maxima, max_dist * 0.2, 255, cv2.THRESH_BINARY)
-    local_maxima = local_maxima.astype(np.uint8)
-    
-    # Combinăm threshold-ul simplu cu maximalele locale
-    sure_fg = cv2.bitwise_or(sure_fg, local_maxima)
-    
-    # Pas 3: Găsește maximale locale folosind connected components
-    num_markers, markers = cv2.connectedComponents(sure_fg)
-    
-    # Pas 4: Aplică Watershed
-    # Marcăm pereții ca fiind sigur fundal
-    sure_bg = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-    
-    # Adăugăm pereții la markeri (label 0 = fundal/pereți)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-    
-    # Aplică Watershed pe o copie a imaginii (watershed modifică imaginea)
-    watershed_image = vis_image.copy()
-    cv2.watershed(watershed_image, markers)
-    
-    # Pas 5: Desenează fiecare cameră detectată
-    room_count = 0
-    detected_rooms = []
-    # Mască pentru zonele deja desenate (pentru a evita suprapunerea)
-    drawn_mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # Colectăm toate camerele cu ariile lor pentru a le sorta și procesa corect
-    rooms_data = []
-    for label_id in range(2, num_markers + 1):  # Începem de la 2 (1 este pereții)
-        room_mask = (markers == label_id).astype(np.uint8) * 255
-        area = np.count_nonzero(room_mask)
-        
-        if area < 500:  # Ignorăm camere foarte mici
-            continue
-        
-        rooms_data.append((label_id, area, room_mask))
-    
-    # Sortăm camerele după arie (descrescător) pentru a procesa mai întâi camerele mari
-    rooms_data.sort(key=lambda x: x[1], reverse=True)
-    
-    # Procesăm fiecare cameră
-    for label_id, area, room_mask in rooms_data:
-        # Verificăm suprapunerea cu zonele deja desenate
-        overlap = cv2.bitwise_and(room_mask, drawn_mask)
-        overlap_area = np.count_nonzero(overlap)
-        overlap_ratio = overlap_area / area if area > 0 else 0
-        
-        # Dacă mai mult de 15% din cameră este deja desenată, o ignorăm
-        if overlap_ratio > 0.15:
-            continue
-        
-        # Detectăm conturul camerei
-        contours, _ = cv2.findContours(room_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if len(contours) == 0:
-            continue
-        
-        # Luăm cel mai mare contur
-        contour = max(contours, key=cv2.contourArea)
-        
-        if len(contour) < 3:
-            continue
-        
-        # Calculăm forma geometrică
-        x, y, w_box, h_box = cv2.boundingRect(contour)
-        bbox_area = w_box * h_box
-        area_ratio = area / bbox_area if bbox_area > 0 else 0
-        
-        # Determinăm forma de desenat
-        if area_ratio >= 0.6:  # Cameră bine definită
-            if len(contour) > 3:
-                shape_to_draw = cv2.convexHull(contour)
-            else:
-                shape_to_draw = contour
-        else:  # Cameră parțial închisă
-            if len(contour) > 3:
-                hull = cv2.convexHull(contour)
-                hull_area = cv2.contourArea(hull)
-                if hull_area > 0 and area / hull_area >= 0.6:
-                    shape_to_draw = hull
-                else:
-                    shape_to_draw = np.array([[x, y], [x + w_box, y], 
-                                             [x + w_box, y + h_box], [x, y + h_box]], dtype=np.int32)
-            else:
-                shape_to_draw = np.array([[x, y], [x + w_box, y], 
-                                         [x + w_box, y + h_box], [x, y + h_box]], dtype=np.int32)
-        
-        # Selectăm culoarea
-        color = colors[room_count % len(colors)]
-        
-        # Marcăm zona ca desenată ÎNAINTE de a desena (pentru a evita suprapunerea)
-        cv2.fillPoly(drawn_mask, [shape_to_draw], 255)
-        
-        # Desenăm camera
-        overlay = vis_image.copy()
-        cv2.fillPoly(overlay, [shape_to_draw], color)
-        cv2.addWeighted(overlay, 0.4, vis_image, 0.6, 0, vis_image)
-        cv2.polylines(vis_image, [shape_to_draw], True, color, 3)
-        
-        # Marcăm camera ca detectată
-        detected_rooms.append((label_id, area, room_mask))
-        room_count += 1
-    
-    # Salvăm imaginea colorată
-    if steps_dir:
-        output_path = Path(steps_dir) / "02c_wall_closures_visualized.png"
-        cv2.imwrite(str(output_path), vis_image)
-        print(f"      ✅ Detectat {room_count} camere, salvat în {output_path.name}")
-    else:
-        print(f"      ✅ Detectat {room_count} camere")
 
-def bridge_wall_gaps(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = None) -> np.ndarray:
-    """Umple DOAR gap-urile între pereți - îmbunătățit pentru VPS."""
-    h, w = image_dims
-    min_dim = min(h, w)
-    
-    # Mărit kernel size de la 1.6% la 2.0% pentru VPS
-    kernel_size = max(15, int(min_dim * 0.020))  # Mărit de la 0.016 la 0.020
-    if kernel_size % 2 == 0: kernel_size += 1
-    
-    print(f"      🌉 Bridging gaps between walls: kernel {kernel_size}x{kernel_size} (îmbunătățit pentru VPS)")
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    
-    original_walls = walls_raw.copy()
-    if steps_dir:
-        save_step("bridge_01_original", original_walls, steps_dir)
-    
-    # Mărit iterațiile de la 2 la 3 pentru VPS
-    walls_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=3)
-    if steps_dir:
-        save_step("bridge_02_closed", walls_closed, steps_dir)
-    
-    gaps_filled = cv2.subtract(walls_closed, original_walls)
-    if steps_dir:
-        save_step("bridge_03_gaps_only", gaps_filled, steps_dir)
-    
-    kernel_tiny = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    gaps_cleaned = cv2.morphologyEx(gaps_filled, cv2.MORPH_OPEN, kernel_tiny, iterations=1)
-    if steps_dir:
-        save_step("bridge_04_gaps_cleaned", gaps_cleaned, steps_dir)
-    
-    walls_final = cv2.bitwise_or(original_walls, gaps_cleaned)
-    if steps_dir:
-        save_step("bridge_05_final", walls_final, steps_dir)
-    
-    return walls_final
 
-def smart_wall_closing(walls_raw: np.ndarray, image_dims: tuple, steps_dir: str = None) -> np.ndarray:
-    """Closing inteligent - îmbunătățit pentru VPS."""
-    h, w = image_dims
-    min_dim = min(h, w)
-    
-    print(f"      🧠 Smart closing: detecting intentional openings (îmbunătățit pentru VPS)...")
-    
-    # Mărit kernel size de la 0.9% la 1.2% pentru VPS
-    kernel_large = max(9, int(min_dim * 0.012))  # Mărit de la 0.009 la 0.012
-    if kernel_large % 2 == 0: kernel_large += 1
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_large, kernel_large))
-    # Mărit iterațiile de la 2 la 3 pentru VPS
-    walls_fully_closed = cv2.morphologyEx(walls_raw, cv2.MORPH_CLOSE, kernel, iterations=3)
-    
-    if steps_dir:
-        save_step("smart_01_fully_closed", walls_fully_closed, steps_dir)
-    
-    gaps_filled = cv2.subtract(walls_fully_closed, walls_raw)
-    
-    if steps_dir:
-        save_step("smart_02_gaps_detected", gaps_filled, steps_dir)
-    
-    contours, _ = cv2.findContours(gaps_filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    DOOR_THRESHOLD = int(min_dim * 0.02)
-    
-    mask_small_gaps = np.zeros_like(walls_raw)
-    mask_large_openings = np.zeros_like(walls_raw)
-    
-    small_gap_count = 0
-    large_opening_count = 0
-    
-    for cnt in contours:
-        x, y, w_box, h_box = cv2.boundingRect(cnt)
-        max_size = max(w_box, h_box)
-        area = cv2.contourArea(cnt)
-        
-        if max_size < DOOR_THRESHOLD and area < (DOOR_THRESHOLD ** 2):
-            cv2.drawContours(mask_small_gaps, [cnt], -1, 255, -1)
-            small_gap_count += 1
-        else:
-            cv2.drawContours(mask_large_openings, [cnt], -1, 255, -1)
-            large_opening_count += 1
-    
-    print(f"         Found {small_gap_count} small gaps (will close) and {large_opening_count} large openings (will keep)")
-    
-    if steps_dir:
-        save_step("smart_03_small_gaps", mask_small_gaps, steps_dir)
-        save_step("smart_04_large_openings", mask_large_openings, steps_dir)
-    
-    walls_smart = cv2.bitwise_or(walls_raw, mask_small_gaps)
-    
-    if steps_dir:
-        save_step("smart_05_final", walls_smart, steps_dir)
-    
-    kernel_cleanup = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    walls_smart = cv2.morphologyEx(walls_smart, cv2.MORPH_CLOSE, kernel_cleanup, iterations=1)
-    
-    return walls_smart
+# Funcțiile mutate în wall_repair.py:
+# - repair_house_walls_with_floodfill
+# - bridge_wall_gaps
+# - smart_wall_closing
+# - get_strict_1px_outline
 
-def get_strict_1px_outline(mask):
-    if np.count_nonzero(mask) == 0:
-        return np.zeros_like(mask)
-    kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
-    eroded = cv2.erode(mask, kernel, iterations=1)
-    return cv2.subtract(mask, eroded)
-
-def smooth_walls_mask(mask):
-    """Netezire pentru eliminarea jitter-ului (nemodificată)."""
-    if np.count_nonzero(mask) == 0:
-        return mask
-    blurred = cv2.GaussianBlur(mask, (5, 5), 0)
-    _, smoothed = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    return smoothed
-
-def straighten_mask(mask, epsilon_factor=0.003):
-    """Îndreptare vizuală pentru overlay (nemodificată)."""
-    if np.count_nonzero(mask) == 0:
-        return mask
-    contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    clean_mask = np.zeros_like(mask)
-    for cnt in contours:
-        epsilon = epsilon_factor * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-        cv2.drawContours(clean_mask, [approx], -1, 255, -1)
-    return clean_mask
-
-def skeletonize_and_straighten_walls(walls_mask: np.ndarray, steps_dir: str = None) -> np.ndarray:
-    """
-    Skeletonizare, îndreptare și uniformizare grosime pereți.
-    
-    Pași:
-    1. Calculează media grosimii pereților
-    2. Aplică skeletonizarea pentru a obține linii de 1 pixel
-    3. Îndrepte liniile care nu sunt foarte drepte
-    4. Aplică aceeași grosime (media calculată) la toate liniile
-    
-    Args:
-        walls_mask: Masca pereților (255 = perete, 0 = spațiu liber)
-        steps_dir: Director pentru salvarea step-urilor de debug (opțional)
-    
-    Returns:
-        Masca pereților cu skeletonizare, îndreptare și grosime uniformă
-    """
-    if np.count_nonzero(walls_mask) == 0:
-        return walls_mask
-    
-    h, w = walls_mask.shape[:2]
-    print(f"      🦴 Skeletonizare și îndreptare pereți...")
-    
-    # Pas 1: Calculăm media grosimii pereților
-    print(f"         🔍 Pas 1: Calculez media grosimii pereților...")
-    
-    # Distance transform pe masca de pereți (distanța de la centru la margine)
-    # Aceasta ne dă distanța de la fiecare pixel de perete la marginea cea mai apropiată
-    dist_from_edge = cv2.distanceTransform(walls_mask, cv2.DIST_L2, 5)
-    
-    # Grosimea într-un punct = 2 * distanța (pentru că avem două margini)
-    wall_thicknesses = dist_from_edge[walls_mask > 0] * 2
-    
-    if len(wall_thicknesses) == 0:
-        print(f"         ⚠️ Nu s-au găsit pereți pentru calcul grosime")
-        return walls_mask
-    
-    # Calculăm media grosimii (folosim median pentru a fi mai robust la outliers)
-    avg_thickness = np.median(wall_thicknesses)
-    avg_thickness_int = max(3, int(round(avg_thickness)))
-    
-    print(f"         ✅ Media grosimii pereților: {avg_thickness:.2f}px (folosit: {avg_thickness_int}px)")
-    
-    if steps_dir:
-        # Vizualizăm distance transform pentru debug
-        dist_vis = cv2.normalize(dist_from_edge, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        cv2.imwrite(str(Path(steps_dir) / "02h_01_distance_transform.png"), dist_vis)
-        print(f"         💾 Salvat: 02h_01_distance_transform.png")
-    
-    # Pas 2: Skeletonizare
-    print(f"         🔍 Pas 2: Aplic skeletonizare...")
-    
-    # Convertim în format binar (0 și 1) pentru skeletonize
-    binary_norm = (walls_mask / 255).astype(bool)
-    
-    # Aplicăm Skeletonization
-    skeleton = skeletonize(binary_norm)
-    
-    # Convertim înapoi în format OpenCV (0-255)
-    skeleton_img = (skeleton.astype(np.uint8) * 255)
-    
-    # Conectăm liniile discontinue folosind morphological closing pe distanțe mici
-    # Folosim un kernel mic pentru a conecta doar liniile foarte apropiate
-    connect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    skeleton_img = cv2.morphologyEx(skeleton_img, cv2.MORPH_CLOSE, connect_kernel, iterations=1)
-    
-    skeleton_pixels = np.count_nonzero(skeleton_img)
-    print(f"         ✅ Schelet generat: {skeleton_pixels:,} pixeli (1px grosime)")
-    
-    if steps_dir:
-        cv2.imwrite(str(Path(steps_dir) / "02h_02_skeleton.png"), skeleton_img)
-        print(f"         💾 Salvat: 02h_02_skeleton.png")
-    
-    # Pas 3: Îndreptare liniilor
-    print(f"         🔍 Pas 3: Îndrept liniile (NU șterg pixeli, doar înlocuiesc liniile tremurate)...")
-    
-    # Pornim cu skeleton-ul original - NU ștergem nimic
-    skeleton_straight = skeleton_img.copy()
-    
-    # Folosim HoughLinesP pentru a detecta linii drepte
-    lines = cv2.HoughLinesP(
-        skeleton_img,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=30,
-        minLineLength=max(15, int(min(h, w) * 0.015)),
-        maxLineGap=max(10, int(min(h, w) * 0.008))
-    )
-    
-    if lines is None or len(lines) == 0:
-        print(f"         ⚠️ Nu s-au detectat linii cu HoughLinesP, păstrez skeleton-ul original")
-        # Păstrăm skeleton-ul original fără modificări
-    else:
-        print(f"         ✅ Detectat {len(lines)} linii cu HoughLinesP - înlocuiesc segmentele tremurate")
-        
-        # Pentru fiecare linie detectată, găsim pixeli din skeleton care sunt aproape
-        # și îi înlocuim cu linia dreaptă
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            
-            # Calculăm distanța de la fiecare pixel din skeleton la linia dreaptă
-            # Dacă distanța este mică, înlocuim pixelul cu linia dreaptă
-            line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            if line_length < 5:  # Ignorăm linii prea scurte
-                continue
-            
-            # Găsim toți pixelii din skeleton care sunt aproape de această linie
-            # Folosim o bandă de toleranță de ~3 pixeli
-            tolerance = 3
-            
-            # Creăm o mască temporară pentru linia dreaptă cu o bandă de toleranță
-            line_mask = np.zeros_like(skeleton_img)
-            cv2.line(line_mask, (x1, y1), (x2, y2), 255, tolerance * 2 + 1)
-            
-            # Găsim intersecția dintre skeleton și banda de toleranță
-            pixels_near_line = cv2.bitwise_and(skeleton_img, line_mask)
-            
-            # Dacă există pixeli aproape de linie, îi înlocuim cu linia dreaptă
-            if np.count_nonzero(pixels_near_line) > 0:
-                # Ștergem pixeli din skeleton care sunt în banda de toleranță
-                skeleton_straight = cv2.bitwise_and(skeleton_straight, cv2.bitwise_not(line_mask))
-                # Adăugăm linia dreaptă
-                cv2.line(skeleton_straight, (x1, y1), (x2, y2), 255, 1)
-    
-    # Aplicăm straighten_mask pentru a netezi colțurile (dar păstrăm toți pixelii)
-    skeleton_straight = straighten_mask(skeleton_straight, epsilon_factor=0.002)
-    
-    if steps_dir:
-        vis_straight = cv2.cvtColor(skeleton_straight, cv2.COLOR_GRAY2BGR)
-        if lines is not None and len(lines) > 0:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                cv2.line(vis_straight, (x1, y1), (x2, y2), (0, 255, 0), 1)
-        cv2.imwrite(str(Path(steps_dir) / "02h_03_straightened.png"), vis_straight)
-        print(f"         💾 Salvat: 02h_03_straightened.png")
-    
-    # Pas 4: Aplicăm aceeași grosime la toate liniile (grosimea calculată ÎNAINTE de skeletonizare)
-    print(f"         🔍 Pas 4: Aplic grosime uniformă ({avg_thickness_int}px - grosimea originală)...")
-    
-    # Creăm un kernel pătrat pentru a da grosime uniformă și pereți pătrați
-    # Pentru a obține grosimea avg_thickness_int, folosim un kernel mai mic (pentru a compensa)
-    # Când dilatezi cu un kernel pătrat de dimensiune N, adaugi (N-1)/2 pixeli pe fiecare parte
-    # Folosim kernel_size mai mic pentru a obține grosimea exactă
-    kernel_size = max(3, avg_thickness_int - 2)
-    # Asigurăm că e impar (pentru kernel-uri morfologice)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    
-    # Folosim MORPH_RECT pentru pereți pătrați (nu MORPH_ELLIPSE care face pereți rotunjiți)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    
-    # Dilatăm skeleton-ul îndreptat cu grosimea calculată inițial
-    # Folosim o singură iterație pentru a obține grosimea exactă
-    walls_final = cv2.dilate(skeleton_straight, kernel, iterations=1)
-    
-    # Verificăm grosimea rezultată pentru debug
-    if steps_dir:
-        # Calculăm grosimea efectivă a pereților rezultați
-        walls_final_inv = cv2.bitwise_not(walls_final)
-        dist_final = cv2.distanceTransform(walls_final_inv, cv2.DIST_L2, 5)
-        final_thicknesses = dist_final[walls_final > 0] * 2
-        if len(final_thicknesses) > 0:
-            final_avg_thickness = np.median(final_thicknesses)
-            print(f"         📊 Grosime efectivă rezultată: {final_avg_thickness:.2f}px (țintă: {avg_thickness_int}px, kernel: {kernel_size}px)")
-    
-    final_pixels = np.count_nonzero(walls_final)
-    print(f"         ✅ Pereți finalizați: {final_pixels:,} pixeli (grosime uniformă {avg_thickness_int}px)")
-    
-    if steps_dir:
-        # Vizualizare comparativă
-        vis_comparison = np.zeros((h, w * 3, 3), dtype=np.uint8)
-        
-        # Original
-        vis_comparison[:, :w] = cv2.cvtColor(walls_mask, cv2.COLOR_GRAY2BGR)
-        cv2.putText(vis_comparison, "Original", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # Skeleton
-        vis_comparison[:, w:2*w] = cv2.cvtColor(skeleton_img, cv2.COLOR_GRAY2BGR)
-        cv2.putText(vis_comparison, "Skeleton", (w + 10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # Final
-        vis_comparison[:, 2*w:] = cv2.cvtColor(walls_final, cv2.COLOR_GRAY2BGR)
-        cv2.putText(vis_comparison, "Final", (2*w + 10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        cv2.imwrite(str(Path(steps_dir) / "02h_04_comparison.png"), vis_comparison)
-        print(f"         💾 Salvat: 02h_04_comparison.png")
-        
-        # Rezultat final
-        cv2.imwrite(str(Path(steps_dir) / "02h_05_final_walls.png"), walls_final)
-        print(f"         💾 Salvat: 02h_05_final_walls.png")
-    
-    return walls_final
-
-def generate_interior_walls_skeleton(walls_mask: np.ndarray, outdoor_mask: np.ndarray) -> np.ndarray:
-    """
-    Generează scheletul (skeleton) pereților interiori cu grosime de 1 pixel.
-    
-    Args:
-        walls_mask: Masca cu pereții (alb = pereți, negru = spațiu liber)
-        outdoor_mask: Masca exterioară (alb = exterior, negru = interior)
-    
-    Returns:
-        Imagine binară cu scheletul pereților interiori (1 pixel grosime)
-    """
-    if np.count_nonzero(walls_mask) == 0:
-        return np.zeros_like(walls_mask)
-    
-    print("   🦴 Generez scheletul pereților interiori...")
-    
-    # 1. Pre-procesare: Curățăm imaginea de zgomot mic
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    walls_cleaned = cv2.morphologyEx(walls_mask, cv2.MORPH_OPEN, kernel_clean, iterations=1)
-    walls_cleaned = cv2.morphologyEx(walls_cleaned, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
-    
-    # 2. Convertim în format binar (0 și 1) pentru skeletonize
-    binary_norm = (walls_cleaned / 255).astype(bool)
-    
-    # 3. Aplicăm Skeletonization
-    skeleton = skeletonize(binary_norm)
-    
-    # 4. Convertim înapoi în format OpenCV (0-255)
-    skeleton_img = (skeleton.astype(np.uint8) * 255)
-    
-    # 5. Eliminăm pereții exteriori
-    # Mărim puțin masca exterioară (Dilation) ca să fim siguri că acoperim tot perimetrul
-    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    exterior_dilated = cv2.dilate(outdoor_mask, kernel_dilate, iterations=1)
-    
-    # Eliminăm perimetrul exterior din schelet
-    interior_skeleton = cv2.bitwise_and(skeleton_img, cv2.bitwise_not(exterior_dilated))
-    
-    # 6. Opțional: Eliminăm "crenguțe" mici (spur pixels) - pruning simplu
-    # Eliminăm componente conectate foarte mici (mai mici de 10 pixeli)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(interior_skeleton, connectivity=8)
-    cleaned_skeleton = np.zeros_like(interior_skeleton)
-    
-    min_component_size = 10  # Păstrăm doar componentele cu cel puțin 10 pixeli
-    for label_id in range(1, num_labels):  # Skip background (label 0)
-        component_size = stats[label_id, cv2.CC_STAT_AREA]
-        if component_size >= min_component_size:
-            cleaned_skeleton[labels == label_id] = 255
-    
-    skeleton_pixels = np.count_nonzero(cleaned_skeleton)
-    print(f"      ✅ Schelet generat: {skeleton_pixels:,} pixeli (1px grosime)")
-    
-    return cleaned_skeleton
-
-def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
-    """Flood fill pentru segmentare camere (nemodificată)."""
-    h, w = indoor_mask.shape[:2]
-    x0, y0 = seed_pt
-    x0 = max(0, min(w - 1, x0))
-    y0 = max(0, min(h - 1, y0))
-
-    if indoor_mask[y0, x0] == 0:
-        found = False
-        for dy in range(-search_radius, search_radius + 1):
-            yy = y0 + dy
-            if 0 <= yy < h:
-                for dx in range(-search_radius, search_radius + 1):
-                    xx = x0 + dx
-                    if 0 <= xx < w:
-                        if indoor_mask[yy, xx] > 0:
-                            x0, y0 = xx, yy
-                            found = True
-                            break
-                if found:
-                    break
-        if not found:
-            return np.zeros_like(indoor_mask), 0, seed_pt
-
-    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    temp = indoor_mask.copy()
-    try:
-        _, _, mask, _ = cv2.floodFill(
-            temp, mask, (x0, y0), 255,
-            loDiff=(0,), upDiff=(0,),
-            flags=cv2.FLOODFILL_MASK_ONLY | 4
-        )
-    except:
-        return np.zeros_like(indoor_mask), 0, (x0, y0)
-
-    room_mask = (mask[1:-1, 1:-1] != 0).astype(np.uint8) * 255
-    area_px = int(np.count_nonzero(room_mask))
-    return room_mask, area_px, (x0, y0)
+# Funcția flood_fill_room este folosită în scale_detection.py
 
 
 # ============================================
@@ -2453,8 +1951,9 @@ def flood_fill_room(indoor_mask, seed_pt, search_radius=10):
 # ============================================
 
 def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, height=1024):
-    """Randează o previzualizare 3D simplă."""
-    if not vertices_raw or not faces_raw: return
+    """Randează o previzualizare 3D simplă (PNG, statică)."""
+    if not vertices_raw or not faces_raw:
+        return
     print("   📸 Randez previzualizarea 3D...")
     
     verts = []
@@ -2467,9 +1966,9 @@ def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, 
     for f_line in faces_raw: 
         parts = f_line.split()
         faces.append([int(parts[1])-1, int(parts[2])-1, int(parts[3])-1, int(parts[4])-1])
-
-    angle_y = np.radians(45)
-    angle_x = np.radians(30)
+    
+    angle_y = np.radians(45.0)
+    angle_x = np.radians(30.0)
     
     Ry = np.array([[np.cos(angle_y), 0, np.sin(angle_y)], [0, 1, 0], [-np.sin(angle_y), 0, np.cos(angle_y)]])
     Rx = np.array([[1, 0, 0], [0, np.cos(angle_x), -np.sin(angle_x)], [0, np.sin(angle_x), np.cos(angle_x)]])
@@ -2479,7 +1978,8 @@ def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, 
     rotated_verts = verts_centered @ Ry.T @ Rx.T
     
     range_val = np.max(rotated_verts) - np.min(rotated_verts)
-    if range_val == 0: range_val = 1
+    if range_val == 0:
+        range_val = 1
     
     scale = min(width, height) / range_val * 0.7
     
@@ -2494,14 +1994,14 @@ def render_obj_to_image(vertices_raw, faces_raw, output_image_path, width=1024, 
     face_depths.sort(key=lambda x: x[0])
 
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
-    wall_color = (200, 200, 200)
-    edge_color = (50, 50, 50)
+    wall_color = (215, 215, 215)
+    edge_color = (60, 60, 60)
     
     for _, face_idx in face_depths:
         pts = projected_2d[faces[face_idx]].astype(np.int32)
         cv2.fillPoly(canvas, [pts], wall_color)
         cv2.polylines(canvas, [pts], True, edge_color, 1, cv2.LINE_AA)
-        
+    
     cv2.imwrite(str(output_image_path), canvas)
 
 
@@ -2554,197 +2054,6 @@ def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, 
     
     if image_output_path:
         render_obj_to_image(vertices_str_list, faces_str_list, image_output_path)
-
-
-# ============================================
-# GEMINI API (DIRECT REST) (nemodificată)
-# ============================================
-
-GEMINI_PROMPT_CROP = """
-Ești un expert în analiza planurilor arhitecturale. Din imaginea decupată, extrage:
-1. "room_name": Numele camerei.
-2. "area_m2": Suprafața numerică (folosește PUNCT pt zecimale).
-Dacă nu e clar, returnează JSON gol {}.
-Returnează DOAR JSON.
-"""
-
-GEMINI_PROMPT_TOTAL_SUM = """
-Analizează întregul plan al etajului.
-Identifică TOATE numerele care reprezintă suprafețe de camere (de obicei au m² lângă ele).
-Adună toate aceste valori pentru a obține Suprafața Totală Utilă (Suma Label-urilor).
-Returnează un JSON cu un singur câmp:
-{"total_sum_m2": <suma_tuturor_camerelor_float>}
-Returnează DOAR JSON.
-"""
-
-def call_gemini(image_path, prompt, api_key):
-    """API REST Direct (v1beta) (nemodificată)."""
-    try:
-        with open(image_path, 'rb') as f:
-            image_data = base64.b64encode(f.read()).decode('utf-8')
-        
-        ext = Path(image_path).suffix.lower()
-        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
-        mime_type = mime_map.get(ext, 'image/jpeg')
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-        
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": mime_type, "data": image_data}},
-                    {"text": prompt}
-                ]
-            }],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1000}
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if response.status_code != 200:
-            print(f"⚠️  Gemini HTTP {response.status_code}")
-            return None
-        
-        result = response.json()
-        if 'candidates' not in result or not result['candidates']: return None
-        
-        text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
-        if not text: return None
-        
-        if text.startswith("```"):
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start != -1 and end > start: text = text[start:end]
-        
-        return json.loads(text)
-        
-    except Exception as e:
-        print(f"⚠️  Gemini error: {e}")
-        return None
-
-
-# ============================================
-# SCALE DETECTION (nemodificată)
-# ============================================
-
-def detect_scale_from_room_labels(image_path, indoor_mask, walls_mask, steps_dir, min_room_area=1.0, max_room_area=300.0, api_key=None):
-    """Detectează scala din label-uri de camere."""
-    img_bgr = cv2.imread(str(image_path))
-    if img_bgr is None: return None
-    
-    h, w = img_bgr.shape[:2]
-
-    # A. SEGMENTARE CAMERE
-    room_candidates = []
-    min_dim = min(h, w)
-    kernel_size = max(3, int(min_dim / 100))
-    if kernel_size % 2 == 0: kernel_size += 1
-    
-    kernel_dynamic = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    walls_dilated = cv2.dilate(walls_mask, kernel_dynamic, iterations=1)
-    fillable_mask = cv2.bitwise_and(cv2.bitwise_not(walls_dilated), indoor_mask)
-    unvisited_mask = fillable_mask.copy()
-    
-    sample_stride = max(5, int(w / 200))
-    MIN_PIXEL_AREA = max(100, int((w * h) * 0.0005))
-    room_idx = 0
-    debug_iteration = img_bgr.copy()
-
-    print(f"   🔍 Segmentare camere (Kernel {kernel_size}px)...")
-    
-    for y in range(0, h, sample_stride):
-        for x in range(0, w, sample_stride):
-            if unvisited_mask[y, x] > 0:
-                room_mask, area_px, _ = flood_fill_room(unvisited_mask, (x, y))
-                
-                if area_px < MIN_PIXEL_AREA:
-                    unvisited_mask[room_mask > 0] = 0
-                    continue
-                
-                room_idx += 1
-                coords = np.where(room_mask > 0)
-                if not coords[0].size: continue
-                
-                y_min, y_max = coords[0].min(), coords[0].max()
-                x_min, x_max = coords[1].min(), coords[1].max()
-                
-                padding = max(5, int(min_dim / 100))
-                y_s, y_e = max(0, y_min - padding), min(h, y_max + 1 + padding)
-                x_s, x_e = max(0, x_min - padding), min(w, x_max + 1 + padding)
-                
-                crop_path = Path(steps_dir) / f"crop_{room_idx}.png"
-                cv2.imwrite(str(crop_path), img_bgr[y_s:y_e, x_s:x_e])
-                
-                print(f"      ⏳ Segment {room_idx} ({area_px} px)...")
-                
-                res = call_gemini(crop_path, GEMINI_PROMPT_CROP, api_key)
-                
-                if res and 'area_m2' in res:
-                    try:
-                        area_m2 = float(res['area_m2'])
-                        if min_room_area <= area_m2 <= max_room_area:
-                            room_candidates.append({
-                                "index": room_idx,
-                                "area_m2_label": area_m2,
-                                "area_px": int(area_px),
-                                "room_name": res.get('room_name', 'Unknown')
-                            })
-                            print(f"         ✅ {res.get('room_name')} -> {area_m2} m²")
-                            cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                        else:
-                            cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 0, 255), 1)
-                    except ValueError: pass
-                else:
-                    cv2.rectangle(debug_iteration, (x_min, y_min), (x_max, y_max), (0, 0, 255), 1)
-                
-                unvisited_mask[room_mask > 0] = 0
-    
-    save_step("debug_segmentation_final", debug_iteration, steps_dir)
-    
-    if not room_candidates:
-        print("      ❌ Nu s-au găsit camere valide")
-        return None
-
-    # B. CALCUL SCARĂ
-    area_labels = np.array([r["area_m2_label"] for r in room_candidates])
-    area_pixels = np.array([r["area_px"] for r in room_candidates])
-    
-    num = np.sum(area_pixels * area_labels)
-    den = np.sum(area_pixels ** 2)
-    
-    if den == 0: return None
-    
-    m_px_local = float(np.sqrt(num / den))
-    print(f"   📊 Scara Locală: {m_px_local:.9f} m/px")
-
-    total_indoor_px = int(np.count_nonzero(indoor_mask))
-    gemini_total = call_gemini(image_path, GEMINI_PROMPT_TOTAL_SUM, api_key)
-    
-    sum_labels_m2 = sum(area_labels)
-    if gemini_total and 'total_sum_m2' in gemini_total:
-        try: sum_labels_m2 = float(gemini_total['total_sum_m2'])
-        except: pass
-
-    m_px_target = math.sqrt(sum_labels_m2 / float(total_indoor_px)) if total_indoor_px > 0 else m_px_local
-    suprafata_cu_camere = total_indoor_px * (m_px_local ** 2)
-    
-    final_m_px = m_px_local
-    method_note = "Scară Locală"
-    
-    if suprafata_cu_camere < sum_labels_m2:
-        final_m_px = m_px_target
-        method_note = "Forțat pe Suma Totală"
-    
-    print(f"   ✅ Scară Finală: {final_m_px:.9f} m/px")
-
-    return {
-        "method": "cubicasa_gemini",
-        "meters_per_pixel": float(final_m_px),
-        "rooms_used": len(room_candidates),
-        "optimization_info": {"method_note": method_note},
-        "per_room": room_candidates
-    }
 
 
 # ============================================
@@ -2838,200 +2147,807 @@ def run_cubicasa_detection(
     output_dir: str,
     gemini_api_key: str,
     device: torch.device,
-    save_debug_steps: bool = True
+    save_debug_steps: bool = True,
+    run_phase: int = 0,
+    reused_model=None,
+    reused_device=None,
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
     ACUM cu Adaptive Strategy: Resize Inteligent pentru imagini mici, Tiling pentru imagini mari.
+
+    run_phase: 0 = tot pipeline-ul; 1 = doar faza 1 (Raster API + AI walls → 02_ai_walls_closed);
+               2 = doar faza 2 (brute force + crop + walls from coords). Pentru tandem: rulezi
+               faza 1 pentru toate planurile, apoi faza 2 pentru toate.
+    reused_model / reused_device: când run_phase=1, poți pasa model/device reîntors de un plan
+                                  anterior ca să nu reîncarci modelul.
     """
-    image_path = Path(image_path)
     output_dir = Path(output_dir)
-    model_weights_path = Path(model_weights_path)
-    
     steps_dir = output_dir / "cubicasa_steps"
-    ensure_dir(steps_dir)
-    
-    print(f"   🤖 CubiCasa: Procesez {image_path.name}")
-    
-    # 1. SETUP MODEL
-    print(f"   ⏳ Încarc AI pe {device.type}...")
-    model = hg_furukawa_original(n_classes=44)
-    
-    if not model_weights_path.exists():
-        print(f"⚠️  Lipsesc weights: {model_weights_path}. Continuu cu model non-funcțional.")
+    walls_result_from_coords = None
+
+    if run_phase == 2:
+        # Faza 2: nu încărcăm model sau imagine; folosim doar ce e deja pe disc în steps_dir
+        ensure_dir(steps_dir)
+        raster_dir = Path(steps_dir) / "raster"
+        ac_path = steps_dir / "02_ai_walls_closed.png"
+        ai_walls_closed = cv2.imread(str(ac_path), cv2.IMREAD_GRAYSCALE)
+        if ai_walls_closed is None:
+            raise RuntimeError(f"Lipsă 02_ai_walls_closed.png în {steps_dir} (rulează mai întâi faza 1)")
+        # Pentru scale detection etc. folosim 00_original.png din steps_dir
+        image_path = steps_dir / "00_original.png"
+        # Continuăm direct la secțiunea brute force (mai jos)
     else:
-        checkpoint = torch.load(str(model_weights_path), map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint)
-    
-    model.to(device)
-    model.eval()
+        # Faza 0 (all) sau 1 (doar Raster API + AI walls)
+        image_path = Path(image_path)
+        model_weights_path = Path(model_weights_path)
+        ensure_dir(steps_dir)
+        print(f"   🤖 CubiCasa: Procesez {image_path.name}")
+        # 1. SETUP MODEL (sau folosim cel reîntors)
+        if reused_model is not None and reused_device is not None:
+            model = reused_model
+            device = reused_device
+            print(f"   ⏳ Folosesc modelul deja încărcat pe {device.type}...")
+        else:
+            print(f"   ⏳ Încarc AI pe {device.type}...")
+            model = hg_furukawa_original(n_classes=44)
+            if not model_weights_path.exists():
+                print(f"⚠️  Lipsesc weights: {model_weights_path}. Continuu cu model non-funcțional.")
+            else:
+                checkpoint = torch.load(str(model_weights_path), map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint)
+            model.to(device)
+            model.eval()
 
-    # 2. LOAD IMAGE & DECIDE STRATEGY
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise RuntimeError(f"Nu pot citi imaginea: {image_path}")
-        
-    h_orig, w_orig = img.shape[:2]
-    save_step("00_original", img, str(steps_dir))
+        # 2. LOAD IMAGE & DECIDE STRATEGY
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise RuntimeError(f"Nu pot citi imaginea: {image_path}")
+        h_orig, w_orig = img.shape[:2]
+        save_step("00_original", img, str(steps_dir))
+        if run_phase != 2:
+            # 2a. RASTER TO VECTOR API CALL
+            if steps_dir:
+                try:
+                    print(f"   🔄 Apel RasterScan API pentru vectorizare...")
+            
+                    # Creăm folderul raster
+                    raster_dir = Path(steps_dir) / "raster"
+                    raster_dir.mkdir(parents=True, exist_ok=True)
+            
+                    # ✅ PREPROCESARE: Ștergem liniile foarte subțiri înainte de trimitere la RasterScan
+                    print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
+                    api_img = img.copy()
+            
+                    # Convertim la grayscale pentru procesare
+                    gray = cv2.cvtColor(api_img, cv2.COLOR_BGR2GRAY)
+            
+                    # Detectăm liniile subțiri folosind morphological operations
+                    # Folosim un kernel mic pentru a identifica liniile subțiri
+                    kernel_thin = np.ones((3, 3), np.uint8)
+                    thinned = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel_thin, iterations=1)
+            
+                    # Detectăm contururi și eliminăm cele foarte mici (linii subțiri)
+                    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+                    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+                    # Creăm o mască pentru liniile subțiri (contururi cu aria mică)
+                    thin_lines_mask = np.zeros_like(gray)
+                    min_line_area = (gray.shape[0] * gray.shape[1]) * 0.0001  # 0.01% din imagine
+            
+                    for contour in contours:
+                        area = cv2.contourArea(contour)
+                        if area < min_line_area:
+                            # Este o linie subțire - o eliminăm
+                            cv2.drawContours(thin_lines_mask, [contour], -1, 255, -1)
+            
+                    # Eliminăm liniile subțiri din imagine
+                    api_img = cv2.inpaint(api_img, thin_lines_mask, 3, cv2.INPAINT_TELEA)
+            
+                    # Salvăm copia preprocesată în folderul raster
+                    preprocessed_path = raster_dir / "00_original_preprocessed.png"
+                    cv2.imwrite(str(preprocessed_path), api_img)
+                    print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
+            
+                    # Redimensionăm imaginea dacă e prea mare (API limit ~4MB)
+                    MAX_API_DIM = 2048
+                    h_api, w_api = api_img.shape[:2]
+                    scale_factor = 1.0
+            
+                    if max(h_api, w_api) > MAX_API_DIM:
+                        scale_factor = MAX_API_DIM / max(h_api, w_api)
+                        new_w_api = int(w_api * scale_factor)
+                        new_h_api = int(h_api * scale_factor)
+                        api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
+                        print(f"      📐 Redimensionat pentru API: {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
+                    else:
+                        new_w_api, new_h_api = w_api, h_api
+            
+                    # Salvăm imaginea pentru API
+                    api_img_path = raster_dir / "input_resized.jpg"
+                    cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            
+                    # Convertim în base64 (folosim JPEG comprimat)
+                    _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    image_base64 = base64.b64encode(buffer).decode('utf-8')
+                    print(f"      📦 Dimensiune payload: {len(image_base64) / 1024 / 1024:.2f} MB")
+            
+                    # Apelăm API-ul RasterScan (cu retry dacă masca e invalidă – cameră inundată)
+                    raster_api_key = os.environ.get('RASTER_API_KEY', '')
+                    if raster_api_key:
+                        url = "https://backend.rasterscan.com/raster-to-vector-base64"
+                        payload = {"image": image_base64}
+                        headers = {
+                            "x-api-key": raster_api_key,
+                            "Content-Type": "application/json"
+                        }
+                        max_attempts = 3
+                        raster_valid = False
+                        for attempt in range(max_attempts):
+                            if attempt > 0:
+                                print(f"      🔄 Reîncerc RasterScan API ({attempt + 1}/{max_attempts})...")
+                            response = requests.post(url, json=payload, headers=headers, timeout=120)
+                            if response.status_code != 200:
+                                print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
+                                break
+                            result = response.json()
+                            print(f"      ✅ RasterScan API răspuns primit")
+                        
+                            # Salvăm răspunsul JSON
+                            json_path = raster_dir / "response.json"
+                            with open(json_path, 'w') as f:
+                                json.dump(result, f, indent=2)
+                            print(f"      📄 Salvat: {json_path.name}")
+                        
+                            # Dacă răspunsul conține SVG sau alte fișiere, le salvăm
+                            if isinstance(result, dict):
+                                # Salvăm fiecare câmp relevant
+                                for key, value in result.items():
+                                    if key == 'svg' and isinstance(value, str):
+                                        svg_path = raster_dir / "output.svg"
+                                        with open(svg_path, 'w') as f:
+                                            f.write(value)
+                                        print(f"      📄 Salvat: {svg_path.name}")
+                                    elif key == 'dxf' and isinstance(value, str):
+                                        # DXF poate fi base64 encoded
+                                        dxf_path = raster_dir / "output.dxf"
+                                        try:
+                                            dxf_data = base64.b64decode(value)
+                                            with open(dxf_path, 'wb') as f:
+                                                f.write(dxf_data)
+                                        except:
+                                            with open(dxf_path, 'w') as f:
+                                                f.write(value)
+                                        print(f"      📄 Salvat: {dxf_path.name}")
+                                    elif key == 'image' and isinstance(value, str):
+                                        # Imagine procesată (probabil base64)
+                                        try:
+                                            # Eliminăm prefixul data:image/... dacă există
+                                            img_str = value
+                                            if ',' in img_str:
+                                                img_str = img_str.split(',')[1]
+                                            img_data = base64.b64decode(img_str)
+                                            img_path = raster_dir / "processed_image.jpg"
+                                            with open(img_path, 'wb') as f:
+                                                f.write(img_data)
+                                            print(f"      📄 Salvat: {img_path.name}")
+                                        except Exception as e:
+                                            print(f"      ⚠️ Eroare salvare imagine: {e}")
+                            
+                                # Generăm imagini din datele vectoriale
+                                data = result.get('data', result)
+                            
+                                # Calculăm factorul de scalare invers pentru overlay pe original
+                                # Coordonatele din API sunt pentru imaginea redimensionată
+                                def scale_coord(x, y, for_original=False):
+                                    """Scalează coordonatele înapoi la original"""
+                                    if for_original:
+                                        # Scalăm înapoi la dimensiunile originale
+                                        orig_x = int(x / scale_factor)
+                                        orig_y = int(y / scale_factor)
+                                        return orig_x, orig_y
+                                    return int(x), int(y)
+                            
+                                # Dimensiunile pentru imaginile pe coordonate API
+                                raster_h, raster_w = new_h_api, new_w_api
+                            
+                                # 1. Imagine cu pereții (generați din contururile camerelor)
+                                # API-ul nu returnează walls separat, dar le putem genera din contururile rooms
+                                if 'rooms' in data and data['rooms']:
+                                    walls_img = np.zeros((raster_h, raster_w, 3), dtype=np.uint8)
+                                    walls_img.fill(255)  # Fundal alb
+                                
+                                    wall_count = 0
+                                    for room in data['rooms']:
+                                        points = []
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                points.append([int(point['x']), int(point['y'])])
+                                    
+                                        if len(points) >= 3:
+                                            pts = np.array(points, np.int32)
+                                            # Desenăm conturul camerei ca pereți
+                                            cv2.polylines(walls_img, [pts], True, (0, 0, 0), 3)
+                                            wall_count += len(points)
+                                
+                                    walls_path = raster_dir / "walls.png"
+                                    cv2.imwrite(str(walls_path), walls_img)
+                                    print(f"      📄 Salvat: {walls_path.name} ({wall_count} segmente perete din {len(data['rooms'])} camere)")
+                            
+                                # ⚠️ NU mai generăm rooms.png aici - va fi generat DUPĂ validarea pereților în raster_processing
+                            
+                                # 3. Imagine cu deschiderile (uși/ferestre - API nu face distincție)
+                                if 'doors' in data and data['doors']:
+                                    doors_img = np.zeros((raster_h, raster_w, 3), dtype=np.uint8)
+                                    doors_img.fill(255)  # Fundal alb
+                                
+                                    for idx, door in enumerate(data['doors']):
+                                        if 'bbox' in door and len(door['bbox']) == 4:
+                                            x1, y1, x2, y2 = map(int, door['bbox'])
+                                            width = x2 - x1
+                                            height = y2 - y1
+                                        
+                                            # Încercăm să determinăm tipul bazat pe dimensiuni
+                                            # Ferestrele tind să fie mai late și mai puțin înalte
+                                            aspect = width / max(1, height)
+                                            if aspect > 2.5 or (width > 60 and height < 30):
+                                                label = "Window"
+                                                color_fill = (200, 220, 255)  # Albastru deschis pentru ferestre
+                                                color_border = (150, 180, 220)
+                                            else:
+                                                label = "Door"
+                                                color_fill = (0, 150, 255)  # Portocaliu pentru uși
+                                                color_border = (0, 100, 200)
+                                        
+                                            cv2.rectangle(doors_img, (x1, y1), (x2, y2), color_fill, -1)
+                                            cv2.rectangle(doors_img, (x1, y1), (x2, y2), color_border, 2)
+                                        
+                                            # Adăugăm etichetă
+                                            font = cv2.FONT_HERSHEY_SIMPLEX
+                                            font_scale = 0.35
+                                            thickness = 1
+                                            cv2.putText(doors_img, label, (x1, y1 - 5 if y1 > 20 else y2 + 12),
+                                                       font, font_scale, (0, 0, 150), thickness)
+                                
+                                    doors_path = raster_dir / "doors.png"
+                                    cv2.imwrite(str(doors_path), doors_img)
+                                    print(f"      📄 Salvat: {doors_path.name} ({len(data['doors'])} deschideri uși/ferestre)")
+                            
+                                # 4. Imagine combinată (pereți + camere + uși)
+                                combined_img = np.zeros((raster_h, raster_w, 3), dtype=np.uint8)
+                                combined_img.fill(255)
+                            
+                                # Desenăm camerele mai întâi (fundal)
+                                if 'rooms' in data and data['rooms']:
+                                    for idx, room in enumerate(data['rooms']):
+                                        color = room_colors[idx % len(room_colors)] if 'room_colors' in dir() else (220, 220, 220)
+                                        points = []
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                points.append([int(point['x']), int(point['y'])])
+                                        if len(points) >= 3:
+                                            pts = np.array(points, np.int32)
+                                            cv2.fillPoly(combined_img, [pts], color)
+                            
+                                # Desenăm pereții (din contururile camerelor)
+                                if 'rooms' in data and data['rooms']:
+                                    for room in data['rooms']:
+                                        points = []
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                points.append([int(point['x']), int(point['y'])])
+                                        if len(points) >= 3:
+                                            pts = np.array(points, np.int32)
+                                            cv2.polylines(combined_img, [pts], True, (0, 0, 0), 3)
+                            
+                                # Desenăm ușile
+                                if 'doors' in data and data['doors']:
+                                    for door in data['doors']:
+                                        if 'bbox' in door and len(door['bbox']) == 4:
+                                            x1, y1, x2, y2 = map(int, door['bbox'])
+                                            cv2.rectangle(combined_img, (x1, y1), (x2, y2), (0, 150, 255), -1)
+                                            cv2.rectangle(combined_img, (x1, y1), (x2, y2), (0, 100, 200), 2)
+                            
+                                combined_path = raster_dir / "combined.png"
+                                cv2.imwrite(str(combined_path), combined_img)
+                                print(f"      📄 Salvat: {combined_path.name}")
+                            
+                                # 5. Overlay pe imaginea ORIGINALĂ (cu coordonate scalate corect)
+                                # Folosim imaginea originală, nu cea redimensionată
+                                overlay_img = img.copy()
+                            
+                                # Overlay camere cu transparență
+                                if 'rooms' in data and data['rooms']:
+                                    rooms_overlay = np.zeros_like(overlay_img)
+                                    for idx, room in enumerate(data['rooms']):
+                                        color = room_colors[idx % len(room_colors)] if 'room_colors' in dir() else (220, 220, 220)
+                                        points = []
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                ox, oy = scale_coord(point['x'], point['y'], for_original=True)
+                                                # Clamp la dimensiunile imaginii
+                                                ox = max(0, min(ox, h_orig - 1))
+                                                oy = max(0, min(oy, w_orig - 1))
+                                                points.append([ox, oy])
+                                        if len(points) >= 3:
+                                            pts = np.array(points, np.int32)
+                                            cv2.fillPoly(rooms_overlay, [pts], color)
+                                
+                                    # Blend cu original
+                                    mask = (rooms_overlay.sum(axis=2) > 0).astype(np.uint8)
+                                    mask = np.stack([mask, mask, mask], axis=2)
+                                    overlay_img = np.where(mask, cv2.addWeighted(overlay_img, 0.6, rooms_overlay, 0.4, 0), overlay_img)
+                            
+                                # Desenăm pereții din contururile camerelor (scalați la original)
+                                if 'rooms' in data and data['rooms']:
+                                    for room in data['rooms']:
+                                        points = []
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                ox, oy = scale_coord(point['x'], point['y'], for_original=True)
+                                                ox = max(0, min(ox, w_orig - 1))
+                                                oy = max(0, min(oy, h_orig - 1))
+                                                points.append([ox, oy])
+                                        if len(points) >= 3:
+                                            pts = np.array(points, np.int32)
+                                            cv2.polylines(overlay_img, [pts], True, (0, 0, 255), 2)
+                            
+                                # Desenăm deschiderile (uși/ferestre) scalate la original, cu etichete
+                                if 'doors' in data and data['doors']:
+                                    for door in data['doors']:
+                                        if 'bbox' in door and len(door['bbox']) == 4:
+                                            x1, y1, x2, y2 = door['bbox']
+                                            ox1, oy1 = scale_coord(x1, y1, for_original=True)
+                                            ox2, oy2 = scale_coord(x2, y2, for_original=True)
+                                        
+                                            # Determinăm tipul bazat pe dimensiuni
+                                            width = abs(ox2 - ox1)
+                                            height = abs(oy2 - oy1)
+                                            aspect = width / max(1, height)
+                                            if aspect > 2.5 or (width > 60 and height < 30):
+                                                label = "Win"
+                                                color = (220, 180, 0)  # Cyan pentru ferestre
+                                            else:
+                                                label = "Door"
+                                                color = (255, 100, 0)  # Portocaliu pentru uși
+                                        
+                                            cv2.rectangle(overlay_img, (ox1, oy1), (ox2, oy2), color, 2)
+                                        
+                                            # Etichetă
+                                            font = cv2.FONT_HERSHEY_SIMPLEX
+                                            cv2.putText(overlay_img, label, (ox1, oy1 - 5 if oy1 > 20 else oy2 + 15),
+                                                       font, 0.4, color, 1)
+                            
+                                overlay_path = raster_dir / "overlay.png"
+                                cv2.imwrite(str(overlay_path), overlay_img)
+                                print(f"      📄 Salvat: {overlay_path.name}")
+                            
+                                # 6. RENDER 3D IZOMETRIC (îmbunătățit)
+                                print(f"      🎨 Generez render 3D izometric...")
+                            
+                                # Parametri pentru proiecția izometrică
+                                wall_height = 60  # Înălțimea pereților în pixeli
+                            
+                                # Calculăm bounding box-ul datelor pentru centrare
+                                all_points = []
+                                if 'walls' in data and data['walls']:
+                                    for wall in data['walls']:
+                                        if 'position' in wall:
+                                            for pt in wall['position']:
+                                                all_points.append(pt)
+                                if 'rooms' in data and data['rooms']:
+                                    for room in data['rooms']:
+                                        for point in room:
+                                            if 'x' in point and 'y' in point:
+                                                all_points.append([point['x'], point['y']])
+                            
+                                if all_points:
+                                    all_points = np.array(all_points)
+                                    min_x, min_y = all_points.min(axis=0)
+                                    max_x, max_y = all_points.max(axis=0)
+                                
+                                    # Scalăm pentru a încăpea în canvas
+                                    data_w = max_x - min_x
+                                    data_h = max_y - min_y
+                                
+                                    # Canvas size
+                                    canvas_w = int(data_w * 1.5 + data_h * 0.5 + 200)
+                                    canvas_h = int(data_h * 0.7 + wall_height + 150)
+                                
+                                    # Offset pentru centrare
+                                    offset_x = 50
+                                    offset_y = wall_height + 30
+                                
+                                    # Funcție pentru transformare izometrică (proiecție oblică)
+                                    def to_iso_3d(x, y, z=0):
+                                        # Normalizăm coordonatele
+                                        nx = x - min_x
+                                        ny = y - min_y
+                                        # Proiecție izometrică simplificată
+                                        iso_x = int(offset_x + nx + ny * 0.4)
+                                        iso_y = int(offset_y + ny * 0.6 - z)
+                                        return (iso_x, iso_y)
+                                
+                                    # Canvas cu fundal gradient (cer)
+                                    iso_img = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+                                    for row in range(canvas_h):
+                                        ratio = row / canvas_h
+                                        b = int(250 - ratio * 20)
+                                        g = int(248 - ratio * 15)
+                                        r = int(245 - ratio * 10)
+                                        iso_img[row, :] = [b, g, r]
+                                
+                                    # Culori pentru podele camerelor
+                                    iso_room_colors = [
+                                        (210, 225, 210),  # Verde deschis
+                                        (210, 210, 225),  # Albastru deschis
+                                        (225, 210, 210),  # Roșu deschis
+                                        (225, 225, 210),  # Galben deschis
+                                        (210, 225, 225),  # Cyan deschis
+                                        (225, 210, 225),  # Magenta deschis
+                                        (220, 220, 220),  # Gri deschis
+                                    ]
+                                
+                                    # Desenăm podelele camerelor (sortate de la spate la față)
+                                    if 'rooms' in data and data['rooms']:
+                                        sorted_rooms = []
+                                        for idx, room in enumerate(data['rooms']):
+                                            points = []
+                                            for point in room:
+                                                if 'x' in point and 'y' in point:
+                                                    points.append([int(point['x']), int(point['y'])])
+                                            if len(points) >= 3:
+                                                # Folosim Y minim pentru sortare (spate -> față)
+                                                min_room_y = min(p[1] for p in points)
+                                                sorted_rooms.append((min_room_y, idx, points))
+                                    
+                                        sorted_rooms.sort(key=lambda x: x[0])
+                                    
+                                        for min_room_y, idx, points in sorted_rooms:
+                                            color = iso_room_colors[idx % len(iso_room_colors)]
+                                            floor_pts = np.array([to_iso_3d(p[0], p[1], 0) for p in points], np.int32)
+                                            cv2.fillPoly(iso_img, [floor_pts], color)
+                                            cv2.polylines(iso_img, [floor_pts], True, (180, 180, 180), 1)
+                                
+                                    # Desenăm pereții 3D (sortați de la spate la față)
+                                    if 'walls' in data and data['walls']:
+                                        sorted_walls = []
+                                        for wall in data['walls']:
+                                            if 'position' in wall and len(wall['position']) >= 2:
+                                                pt1 = wall['position'][0]
+                                                pt2 = wall['position'][1]
+                                                # Sortăm după Y minim
+                                                min_wall_y = min(pt1[1], pt2[1])
+                                                sorted_walls.append((min_wall_y, pt1, pt2))
+                                    
+                                        sorted_walls.sort(key=lambda x: x[0])
+                                    
+                                        for min_wall_y, pt1, pt2 in sorted_walls:
+                                            x1, y1 = int(pt1[0]), int(pt1[1])
+                                            x2, y2 = int(pt2[0]), int(pt2[1])
+                                        
+                                            # Punctele peretelui 3D
+                                            bl = to_iso_3d(x1, y1, 0)  # bottom-left
+                                            br = to_iso_3d(x2, y2, 0)  # bottom-right
+                                            tl = to_iso_3d(x1, y1, wall_height)  # top-left
+                                            tr = to_iso_3d(x2, y2, wall_height)  # top-right
+                                        
+                                            # Determinăm culoarea bazat pe orientare
+                                            dx = abs(x2 - x1)
+                                            dy = abs(y2 - y1)
+                                        
+                                            if dy < dx:  # Perete orizontal
+                                                wall_color = (230, 230, 230)  # Mai luminos
+                                            else:  # Perete vertical
+                                                wall_color = (200, 200, 200)  # Mai întunecat
+                                        
+                                            # Desenăm fața frontală a peretelui
+                                            wall_pts = np.array([bl, br, tr, tl], np.int32)
+                                            cv2.fillPoly(iso_img, [wall_pts], wall_color)
+                                            cv2.polylines(iso_img, [wall_pts], True, (120, 120, 120), 1)
+                                        
+                                            # Partea de sus a peretelui (opțional, pentru grosime)
+                                            thickness_offset = 6
+                                            if dy < dx:  # Perete orizontal - adăugăm grosime în Y
+                                                tl2 = to_iso_3d(x1, y1 + thickness_offset, wall_height)
+                                                tr2 = to_iso_3d(x2, y2 + thickness_offset, wall_height)
+                                                top_pts = np.array([tl, tr, tr2, tl2], np.int32)
+                                                cv2.fillPoly(iso_img, [top_pts], (240, 240, 240))
+                                                cv2.polylines(iso_img, [top_pts], True, (150, 150, 150), 1)
+                                            else:  # Perete vertical - adăugăm grosime în X
+                                                tl2 = to_iso_3d(x1 + thickness_offset, y1, wall_height)
+                                                tr2 = to_iso_3d(x2 + thickness_offset, y2, wall_height)
+                                                top_pts = np.array([tl, tr, tr2, tl2], np.int32)
+                                                cv2.fillPoly(iso_img, [top_pts], (240, 240, 240))
+                                                cv2.polylines(iso_img, [top_pts], True, (150, 150, 150), 1)
+                                
+                                    iso_path = raster_dir / "render_3d.png"
+                                    cv2.imwrite(str(iso_path), iso_img)
+                                    print(f"      📄 Salvat: {iso_path.name}")
+                            
+                                # Afișăm statistici
+                                if 'area' in data:
+                                    print(f"      📊 Arie totală: {data['area']}")
+                                if 'perimeter' in data:
+                                    print(f"      📊 Perimetru: {data['perimeter']:.2f}")
+                            
+                                # Notă: Brute force pentru api_walls_mask va fi executat mai târziu,
+                                # după generarea 02_ai_walls_closed.png (vezi linia ~2801)
+                                # Aici doar generăm api_walls_mask.png
+                                api_walls_mask = None
+                                try:
+                                    # 1. Generăm api_walls_mask.png din imaginea procesată de API
+                                    if 'image' in result.get('data', result):
+                                        img_str = result['data']['image']
+                                        if ',' in img_str:
+                                            img_str = img_str.split(',')[1]
+                                        img_data = base64.b64decode(img_str)
+                                        nparr = np.frombuffer(img_data, np.uint8)
+                                        api_processed_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                    
+                                        # Detectăm pereții din imaginea API (gri, nu colorați)
+                                        api_gray = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2GRAY)
+                                        api_hsv = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2HSV)
+                                        saturation = api_hsv[:, :, 1]
+                                    
+                                        # Pixelii cu saturație mică și gri mediu sunt pereți
+                                        api_walls_mask = ((api_gray > 100) & (api_gray < 180) & (saturation < 30)).astype(np.uint8) * 255
+                                    
+                                        api_walls_path = raster_dir / "api_walls_mask.png"
+                                        cv2.imwrite(str(api_walls_path), api_walls_mask)
+                                        print(f"      📄 Salvat: {api_walls_path.name}")
+                                        # Notă: Brute force pentru api_walls_mask va fi executat mai târziu,
+                                        # după generarea 02_ai_walls_closed.png (vezi linia ~2814)
+                                        
+                                except Exception as e:
+                                    import traceback
+                                    print(f"      ⚠️ Eroare brute force: {e}")
+                                    traceback.print_exc()
+                            
+                                # Validare mască: camere nu trebuie „inundate” de pixeli pereți
+                                if api_walls_mask is not None and data.get('rooms'):
+                                    raster_valid, msg = validate_api_walls_mask(
+                                        api_walls_mask, data.get('rooms', [])
+                                    )
+                                    if raster_valid:
+                                        break
+                                    if attempt < max_attempts - 1:
+                                        print(f"      ⚠️ Raster mască invalidă ({msg}). Reîncerc...")
+                                    else:
+                                        raise RuntimeError(
+                                            f"RasterScan a returnat mască invalidă de {max_attempts} ori: {msg}"
+                                        )
+                                else:
+                                    break
+                            else:
+                                print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
+                    else:
+                        print(f"      ⚠️ RASTER_API_KEY nu este setat în environment")
+                
+                except requests.exceptions.Timeout:
+                    print(f"      ⚠️ RasterScan API timeout (120s)")
+                except Exception as e:
+                    print(f"      ⚠️ RasterScan API eroare: {e}")
     
-    # ✅ ADAPTIVE STRATEGY
-    LARGE_IMAGE_THRESHOLD = 3000  # px
-    USE_TILING = h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD
+        # ✅ ADAPTIVE STRATEGY (tot în run_phase != 2)
+        LARGE_IMAGE_THRESHOLD = 3000  # px
+        USE_TILING = h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD
+        
+        if USE_TILING:
+            print(f"   🚀 LARGE IMAGE ({w_orig}x{h_orig}) -> Folosesc TILING ADAPTIV")
+            pred_mask = _process_with_adaptive_tiling(
+                img, 
+                model, 
+                device, 
+                tile_size=512,
+                overlap=64
+            )
+        else:
+            print(f"   🚀 SMALL IMAGE ({w_orig}x{h_orig}) -> Resize Standard la 2048px")
+            max_dim = 2048
+            scale = min(max_dim / w_orig, max_dim / h_orig, 1.0)
+            new_w = int(w_orig * scale)
+            new_h = int(h_orig * scale)
+            print(f"      Resize: {w_orig}x{h_orig} -> {new_w}x{new_h}")
+            input_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
+            tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
+            with torch.no_grad():
+                output = model(tensor)
+                pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
+            pred_mask = cv2.resize(
+                pred_mask_small.astype('uint8'),
+                (w_orig, h_orig),
+                interpolation=cv2.INTER_NEAREST
+            )
     
-    if USE_TILING:
-        print(f"   🚀 LARGE IMAGE ({w_orig}x{h_orig}) -> Folosesc TILING ADAPTIV")
+    if run_phase != 2:
+        # 3. EXTRACT WALLS & FILTER THIN LINES (doar phase 0/1; phase 2 are deja ai_walls_closed pe disc)
+        ai_walls_raw = (pred_mask == 2).astype('uint8') * 255
+        save_step("01_ai_walls_raw", ai_walls_raw, str(steps_dir))
         
-        pred_mask = _process_with_adaptive_tiling(
-            img, 
-            model, 
-            device, 
-            tile_size=512,
-            overlap=64
-        )
+        # ============================================================================
+        # FILTRARE LINII SUBȚIRI + CLOSING ADAPTIV (UNIFIED & ULTRA-PUTERNIC)
+        # ============================================================================
         
-    else:
-        print(f"   🚀 SMALL IMAGE ({w_orig}x{h_orig}) -> Resize Standard la 2048px")
-        
-        max_dim = 2048
-        scale = min(max_dim / w_orig, max_dim / h_orig, 1.0)
-        
-        new_w = int(w_orig * scale)
-        new_h = int(h_orig * scale)
-        
-        print(f"      Resize: {w_orig}x{h_orig} -> {new_w}x{new_h}")
-        
-        input_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        
-        norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
-        tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            output = model(tensor)
-            pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
-        
-        pred_mask = cv2.resize(
-            pred_mask_small.astype('uint8'),
-            (w_orig, h_orig),
-            interpolation=cv2.INTER_NEAREST
-        )
+        min_dim = min(h_orig, w_orig)
     
-    # 3. EXTRACT WALLS & FILTER THIN LINES
-    ai_walls_raw = (pred_mask == 2).astype('uint8') * 255
-    save_step("01_ai_walls_raw", ai_walls_raw, str(steps_dir))
+        # ✅ FILTRARE LINII SUBȚIRI ADAPTIVĂ
+        print("      🧹 Filtrez linii subțiri false-positive...")
+        
+        # ADAPTIVE THRESHOLD: Imagini mici = filtrare BALANCED
+        if min_dim > 2500:
+            # Imagini mari: filtrare normală (0.4%)
+            min_wall_thickness = max(3, int(min_dim * 0.004))
+            iterations = 1
+            print(f"         Mode: LARGE IMAGE → Thin filter: {min_wall_thickness}px (0.4%), iter={iterations}")
+        else:
+            # Imagini mici: filtrare BALANCED (0.7%)
+            min_wall_thickness = max(5, int(min_dim * 0.007))
+            iterations = 1
+            print(f"         Mode: SMALL IMAGE → Balanced filter: {min_wall_thickness}px (0.7%), iter={iterations}")
     
-    # ============================================================================
-    # FILTRARE LINII SUBȚIRI + CLOSING ADAPTIV (UNIFIED & ULTRA-PUTERNIC)
-    # ============================================================================
+        filter_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_wall_thickness, min_wall_thickness))
+        walls_eroded = cv2.erode(ai_walls_raw, filter_kernel, iterations=iterations)
+        ai_walls_raw = cv2.dilate(walls_eroded, filter_kernel, iterations=iterations)
+        
+        pixels_removed_pct = 100 * (1 - np.count_nonzero(ai_walls_raw) / (np.count_nonzero(((pred_mask == 2).astype('uint8') * 255)) + 1))
+        print(f"         Eliminat {pixels_removed_pct:.1f}% pixeli (linii subțiri)")
+        save_step("01a_walls_filtered", ai_walls_raw, str(steps_dir))
     
-    min_dim = min(h_orig, w_orig)
-
-    # ✅ FILTRARE LINII SUBȚIRI ADAPTIVĂ
-    print("      🧹 Filtrez linii subțiri false-positive...")
+        # ✅ CLOSING ADAPTIV ULTRA-PUTERNIC (UNIFICAT) - ÎMBUNĂTĂȚIT PENTRU VPS
+        print("      🔗 Închid găuri (closing adaptiv)...")
     
-    # ADAPTIVE THRESHOLD: Imagini mici = filtrare BALANCED
-    if min_dim > 2500:
-        # Imagini mari: filtrare normală (0.4%)
-        min_wall_thickness = max(3, int(min_dim * 0.004))
-        iterations = 1
-        print(f"         Mode: LARGE IMAGE → Thin filter: {min_wall_thickness}px (0.4%), iter={iterations}")
-    else:
-        # Imagini mici: filtrare BALANCED (0.7%)
-        min_wall_thickness = max(5, int(min_dim * 0.007))
-        iterations = 1
-        print(f"         Mode: SMALL IMAGE → Balanced filter: {min_wall_thickness}px (0.7%), iter={iterations}")
-
-    filter_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_wall_thickness, min_wall_thickness))
-    walls_eroded = cv2.erode(ai_walls_raw, filter_kernel, iterations=iterations)
-    ai_walls_raw = cv2.dilate(walls_eroded, filter_kernel, iterations=iterations)
+        if min_dim > 2500:
+            # Imagini mari: closing redus pentru a nu uni pereți paraleli
+            close_kernel_size = max(5, int(min_dim * 0.003))  # Redus înapoi la 0.3%
+            close_iterations = 2  # Redus înapoi la 2 iterații
+            print(f"         Mode: LARGE IMAGE → Close: {close_kernel_size}px (0.3%), iter={close_iterations}")
+        else:
+            # Imagini mici: closing redus pentru a nu uni pereți paraleli
+            close_kernel_size = max(12, int(min_dim * 0.010))  # Redus înapoi la 1.0%
+            close_iterations = 5  # Redus înapoi la 5 iterații
+            print(f"         Mode: SMALL IMAGE → Close: {close_kernel_size}px (1.0%), iter={close_iterations}")
     
-    pixels_removed_pct = 100 * (1 - np.count_nonzero(ai_walls_raw) / (np.count_nonzero(((pred_mask == 2).astype('uint8') * 255)) + 1))
-    print(f"         Eliminat {pixels_removed_pct:.1f}% pixeli (linii subțiri)")
-    save_step("01a_walls_filtered", ai_walls_raw, str(steps_dir))
-
-    # ✅ CLOSING ADAPTIV ULTRA-PUTERNIC (UNIFICAT) - ÎMBUNĂTĂȚIT PENTRU VPS
-    print("      🔗 Închid găuri (closing adaptiv ULTRA-PUTERNIC - îmbunătățit pentru VPS)...")
-
-    if min_dim > 2500:
-        # Imagini mari: closing mai puternic pentru VPS (mărit de la 0.3% la 0.5%)
-        close_kernel_size = max(5, int(min_dim * 0.005))  # 0.5% (mărit de la 0.3%)
-        close_iterations = 3  # Mărit de la 2 la 3 iterații
-        print(f"         Mode: LARGE IMAGE → Close: {close_kernel_size}px (0.5%), iter={close_iterations}")
-    else:
-        # Imagini mici: closing ULTRA-PUTERNIC (mărit de la 1.0% la 1.5% + mai multe iterații)
-        close_kernel_size = max(12, int(min_dim * 0.015))  # 1.5% (mărit de la 1.0%)
-        close_iterations = 7  # Mărit de la 5 la 7 iterații
-        print(f"         Mode: SMALL IMAGE → ULTRA STRONG close: {close_kernel_size}px (1.5%), iter={close_iterations}")
-
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel_size, close_kernel_size))
-    ai_walls_raw = cv2.morphologyEx(ai_walls_raw, cv2.MORPH_CLOSE, close_kernel, iterations=close_iterations)
-    save_step("01b_walls_closed_adaptive", ai_walls_raw, str(steps_dir))
-
-    # ✅ PENTRU IMAGINI MARI: Erodăm pereții groși detectați de AI
-    if h_orig > 1000 or w_orig > 1000:
-        print("      🔪 Subțiez pereții detectați de AI (Large Image)...")
-        thin_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        ai_walls_raw = cv2.erode(ai_walls_raw, thin_kernel, iterations=1)
-        save_step("01c_ai_walls_thinned", ai_walls_raw, str(steps_dir))
-
-    # 4. REPARARE PEREȚI (FINALA)
-    print("   📐 Repar pereții...")
-
-    LARGE_IMAGE_THRESHOLD = 1000
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel_size, close_kernel_size))
+        ai_walls_raw = cv2.morphologyEx(ai_walls_raw, cv2.MORPH_CLOSE, close_kernel, iterations=close_iterations)
+        save_step("01b_walls_closed_adaptive", ai_walls_raw, str(steps_dir))
     
-    # Acum, `ai_walls_raw` conține deja closing-ul ULTRA-PUTERNIC (îmbunătățit pentru VPS)
-    if h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD:
-        print(f"      🔧 LARGE IMAGE MODE: Bridging gaps between walls (no wall thickening)")
-        # Menținem bridge_wall_gaps DOAR pentru imaginile mari, unde closing-ul a fost îmbunătățit (0.5%)
-        ai_walls_closed = bridge_wall_gaps(ai_walls_raw, (h_orig, w_orig), str(steps_dir))
-    else:
-        # Pentru imagini mici: SKIP extra bridging (adaptive closing-ul ULTRA-PUTERNIC de mai sus e suficient)
-        print(f"      🔧 SMALL IMAGE MODE: Skip extra bridging (adaptive closing is enough)")
+        # ✅ PENTRU IMAGINI MARI: Erodăm pereții groși detectați de AI
+        if h_orig > 1000 or w_orig > 1000:
+            print("      🔪 Subțiez pereții detectați de AI (Large Image)...")
+            thin_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            ai_walls_raw = cv2.erode(ai_walls_raw, thin_kernel, iterations=1)
+            save_step("01c_ai_walls_thinned", ai_walls_raw, str(steps_dir))
+    
+        # 4. REPARARE PEREȚI (FINALA)
+        print("   📐 Repar pereții...")
+    
+        LARGE_IMAGE_THRESHOLD = 1000
+        
+        # Acum, `ai_walls_raw` conține deja closing-ul adaptiv
+        # Redus agresivitatea: skip bridge_wall_gaps pentru a nu uni pereți paraleli
+        print(f"      🔧 Skip extra bridging (adaptive closing is enough, bridge_wall_gaps e prea agresiv)")
         ai_walls_closed = ai_walls_raw.copy()
+        
+        save_step("02_ai_walls_closed", ai_walls_closed, str(steps_dir))
+        if run_phase == 1:
+            return {"model": model, "device": device}
     
-    save_step("02_ai_walls_closed", ai_walls_closed, str(steps_dir))
-    
-    # 4a. GENEREZ IMAGINE SUPrapusă: 02_ai_walls_closed + 00_original (cu transparență)
+    # ============================================================
+    # 🔥 BRUTE FORCE ALGORITM PENTRU TRANSFORMARE COORDONATE
+    # (După generarea 02_ai_walls_closed.png)
+    # Folosim cache pentru a evita rularea de mai multe ori
+    # ============================================================
+    best_config = None
     if steps_dir:
-        try:
-            original_path = Path(steps_dir) / "00_original.png"
-            if original_path.exists():
-                original_img = cv2.imread(str(original_path), cv2.IMREAD_GRAYSCALE)
-                if original_img is not None:
-                    # Redimensionăm dacă este necesar
-                    if original_img.shape[:2] != ai_walls_closed.shape[:2]:
-                        original_img = cv2.resize(original_img, (ai_walls_closed.shape[1], ai_walls_closed.shape[0]))
+        raster_dir = Path(steps_dir) / "raster"
+        if raster_dir.exists():
+            # Verificăm dacă există deja configurația salvată (cache)
+            config_path = raster_dir / "brute_force_best_config.json"
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r') as f:
+                        best_config = json.load(f)
+                    print(f"\n      ✅ Folosesc configurația brute force din cache")
+                except Exception as e:
+                    print(f"      ⚠️ Eroare la citirea cache-ului: {e}")
+                    best_config = None
+            
+            # Dacă nu există cache, rulăm brute force pentru api_walls_mask
+            if best_config is None:
+                try:
+                    api_walls_path = raster_dir / "api_walls_mask.png"
+                    orig_walls_path = Path(steps_dir) / "02_ai_walls_closed.png"
                     
-                    # Facem invert la original (negru devine alb, alb devine negru)
-                    original_inverted = cv2.bitwise_not(original_img)
+                    if api_walls_path.exists() and orig_walls_path.exists():
+                        api_walls_mask = cv2.imread(str(api_walls_path), cv2.IMREAD_GRAYSCALE)
+                        orig_walls = cv2.imread(str(orig_walls_path), cv2.IMREAD_GRAYSCALE)
+                        
+                        if api_walls_mask is not None and orig_walls is not None:
+                            best_config = brute_force_alignment(
+                                api_walls_mask,
+                                orig_walls,
+                                raster_dir,
+                                str(steps_dir)
+                            )
+                except Exception as e:
+                    import traceback
+                    print(f"      ⚠️ Eroare brute force pentru api_walls_mask: {e}")
+                    traceback.print_exc()
+            
+            # Dacă avem configurația, aplicăm transformarea și generăm crop-ul
+            if best_config is not None:
+                try:
+                    # Aplicăm transformarea și generăm overlay-ul pe original
+                    original_path = Path(steps_dir) / "00_original.png"
+                    response_json_path = raster_dir / "response.json"
                     
-                    # Convertim la BGR pentru suprapunere
-                    original_bgr = cv2.cvtColor(original_inverted, cv2.COLOR_GRAY2BGR)
-                    walls_bgr = cv2.cvtColor(ai_walls_closed, cv2.COLOR_GRAY2BGR)
-                    
-                    # Suprapunem cu transparență 50% (original) + 50% (walls_closed)
-                    overlay = cv2.addWeighted(original_bgr, 0.5, walls_bgr, 0.5, 0)
-                    
-                    # Salvăm rezultatul
-                    output_path = Path(steps_dir) / "02d_walls_closed_overlay.png"
-                    cv2.imwrite(str(output_path), overlay)
-                    print(f"      📸 Generat overlay: {output_path.name}")
-                    
-                    # 4a.2. OVERLAY GENERAT - Nu mai facem reparări cu Hough Lines sau skeleton
-                    # Overlay-ul este generat doar pentru a fi folosit de fill_terrace_room
-        except Exception as e:
-            print(f"      ⚠️ Nu s-a putut genera overlay: {e}")
+                    if original_path.exists() and response_json_path.exists():
+                        original_img = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+                        if original_img is not None:
+                            # Folosim funcția existentă pentru overlay și crop
+                            api_result = {'raster_dir': raster_dir}
+                            api_walls_mask = cv2.imread(str(raster_dir / "api_walls_mask.png"), cv2.IMREAD_GRAYSCALE)
+                            
+                            if api_walls_mask is not None:
+                                # Aplicăm transformarea și generăm overlay-ul
+                                apply_alignment_and_generate_overlay(
+                                    best_config,
+                                    api_result,
+                                    original_img,
+                                    str(steps_dir)
+                                )
+                                
+                                # Generăm crop-ul
+                                generate_crop_from_raster(
+                                    best_config,
+                                    api_walls_mask,
+                                    original_img,
+                                    api_result
+                                )
+                                
+                                # ============================================================
+                                # GENEREZ PEREȚI DIN COORDONATELE CAMERELOR
+                                # (folosind coordonatele din overlay_on_original.png)
+                                # ============================================================
+                                from .raster_processing import generate_walls_from_room_coordinates
+                                
+                                # ✅ Wrap în try-except pentru a permite workflow-ul să continue chiar dacă generarea pereților eșuează
+                                walls_result = None
+                                try:
+                                    walls_result = generate_walls_from_room_coordinates(
+                                        original_img,
+                                        best_config,
+                                        raster_dir,
+                                        str(steps_dir),
+                                        gemini_api_key
+                                    )
+                                except Exception as walls_error:
+                                    import traceback
+                                    print(f"      ⚠️ Eroare la generarea pereților din coordonate: {walls_error}")
+                                    traceback.print_exc()
+                                    # ✅ Verificăm dacă room_scales.json a fost salvat în ciuda erorii
+                                    room_scales_path = Path(steps_dir) / "raster_processing" / "walls_from_coords" / "room_scales.json"
+                                    if room_scales_path.exists():
+                                        print(f"      ✅ room_scales.json a fost salvat în ciuda erorii, workflow-ul poate continua")
+                                    else:
+                                        print(f"      ⚠️ room_scales.json nu există, workflow-ul va folosi fallback-ul")
+                                
+                                if walls_result:
+                                    print(f"      ✅ Generat pereți din coordonatele camerelor")
+                                    # Stocăm walls_result pentru a-l folosi la calculul măsurătorilor
+                                    walls_result_from_coords = walls_result
+                except Exception as e:
+                    import traceback
+                    print(f"      ⚠️ Eroare aplicare transformare: {e}")
+                    traceback.print_exc()
     
     # 4b. WORKFLOW REORGANIZAT:
-    # 1. Detectare terasa + flood fill + completare pereți terasa
+    # 1. Detectare scări + completare pereți scări
     # 2. Umplere găuri mici dintre pereți
     
-    print("   🏡 Pas 1: Detectare terasa, garaje și scări + completare pereți...")
-    # Detectează terasa, face flood fill și completează pereții terasei
-    ai_walls_terrace = fill_terrace_room(ai_walls_closed, steps_dir=str(steps_dir))
-    
-    # Detectează garajele, face flood fill și completează pereții garajelor
-    ai_walls_garage = fill_garage_room(ai_walls_terrace, steps_dir=str(steps_dir))
-    
+    print("   🏡 Pas 1: Detectare scări + completare pereți...")
     # Detectează scările folosind detecțiile Roboflow și completează pereții
     # Încercăm să citim detecțiile pentru scări din export_objects/detections.json
     stairs_bboxes = []
@@ -3071,104 +2987,364 @@ def run_cubicasa_detection(
         print(f"         ⚠️ Eroare la citirea detecțiilor pentru scări: {e}")
     
     # Detectează scările și completează pereții
-    ai_walls_stairs = fill_stairs_room(ai_walls_garage, stairs_bboxes, steps_dir=str(steps_dir))
+    ai_walls_stairs = fill_stairs_room(ai_walls_closed, stairs_bboxes, steps_dir=str(steps_dir))
+    if ai_walls_stairs is None:
+        print(f"      ⚠️ fill_stairs_room a returnat None. Folosesc ai_walls_closed.")
+        ai_walls_stairs = ai_walls_closed.copy()
     
-    # Pas nou: Skeletonizare, îndreptare și uniformizare grosime pereți
-    print("   🦴 Pas 2: Skeletonizare, îndreptare și uniformizare grosime pereți...")
-    ai_walls_skeletonized = skeletonize_and_straighten_walls(ai_walls_stairs, steps_dir=str(steps_dir))
+    # Pas 1b: Repar pereții exteriori folosind envelope-ul casei (doar completare pereți, nu final)
+    # Acest pas completează golurile din pereții exteriori înainte de pașii normali de procesare
+    # ai_walls_stairs include deja pereții adăugați pentru terasă/garaj/scări, deci envelope-ul
+    # va include automat aceste zone în calcul
+    ai_walls_repaired_house = repair_house_walls_with_floodfill(ai_walls_stairs, steps_dir=str(steps_dir))
+    if ai_walls_repaired_house is None:
+        print("      ⚠️ repair_house_walls_with_floodfill a eșuat. Folosesc ai_walls_stairs.")
+        ai_walls_repaired_house = ai_walls_stairs.copy()
     
-    # Folosim rezultatul de la skeletonizare
-    ai_walls_final = ai_walls_skeletonized.copy()
+    # Folosim direct rezultatul de la reparare
+    ai_walls_final = ai_walls_repaired_house.copy()
     
-    # 4d. DETECTARE ȘI VIZUALIZARE ÎNCHIDERI PEREȚI
-    detect_and_visualize_wall_closures(ai_walls_final, steps_dir=str(steps_dir))
+    # Verificăm dacă există crop-ul generat de RasterScan
+    raster_dir = Path(steps_dir) / "raster" if steps_dir else None
+    crop_path = raster_dir / "00_original_crop.png" if raster_dir and raster_dir.exists() else None
+    crop_info_path = raster_dir / "crop_info.json" if raster_dir and raster_dir.exists() else None
     
-    # Kernel repair pentru restul procesării
-    min_dim = min(h_orig, w_orig) 
-    rep_k = max(3, int(min_dim * 0.005))
-    if rep_k % 2 == 0: rep_k += 1
-    kernel_repair = cv2.getStructuringElement(cv2.MORPH_RECT, (rep_k, rep_k))
+    use_crop = False
+    crop_img = None
+    crop_info = None
+    api_walls_mask_crop = None
     
-    # 5. NETEZIRE
-    ai_walls_smoothed = smooth_walls_mask(ai_walls_final)
-    save_step("03_ai_walls_smoothed", ai_walls_smoothed, str(steps_dir))
+    if crop_path and crop_path.exists() and crop_info_path and crop_info_path.exists():
+        try:
+            crop_img = cv2.imread(str(crop_path), cv2.IMREAD_COLOR)
+            if crop_img is not None:
+                with open(crop_info_path, 'r') as f:
+                    crop_info = json.load(f)
+                
+                # Încărcăm și api_walls_mask pentru a-l folosi în loc de ai_walls_final
+                api_walls_path = raster_dir / "api_walls_mask.png"
+                if api_walls_path.exists():
+                    api_walls_mask_crop = cv2.imread(str(api_walls_path), cv2.IMREAD_GRAYSCALE)
+                    if api_walls_mask_crop is not None:
+                        use_crop = True
+                        print(f"   ✅ Folosesc crop-ul generat de RasterScan ({crop_info['width']}x{crop_info['height']}px)")
+                        # Folosim api_walls_mask_crop în loc de ai_walls_final pentru calcule
+                        ai_walls_final = api_walls_mask_crop.copy()
+                        h_orig, w_orig = crop_img.shape[:2]
+                        # Actualizăm și img pentru a folosi crop-ul
+                        img = crop_img.copy()
+                    else:
+                        print(f"   ⚠️ Nu am putut încărca api_walls_mask.png, folosesc workflow-ul normal")
+                else:
+                    print(f"   ⚠️ api_walls_mask.png nu există, folosesc workflow-ul normal")
+            else:
+                print(f"   ⚠️ Nu am putut încărca crop-ul, folosesc workflow-ul normal")
+        except Exception as e:
+            print(f"   ⚠️ Eroare la încărcarea crop-ului: {e}, folosesc workflow-ul normal")
     
-    # 6. ÎNDREPTARE
-    ai_walls_straight = straighten_mask(ai_walls_final, 0.003)
-    save_step("03_ai_walls_straight", ai_walls_straight, str(steps_dir))
+    if use_crop:
+        # WORKFLOW CU RASTERSCAN CROP
+        print(f"   🔄 Workflow cu RasterScan crop...")
+        
+        # 1. Generez imagine cu masca RasterScan peste crop
+        if crop_img is not None and api_walls_mask_crop is not None:
+            # Salvăm în folderul raster (unde sunt și celelalte imagini RasterScan)
+            raster_output_path = raster_dir / "walls_overlay_on_crop.png"
+            generate_raster_walls_overlay(
+                crop_img,
+                api_walls_mask_crop,
+                raster_output_path
+            )
+            print(f"      ✅ Generat overlay: {raster_output_path.name}")
+        
+        # ⚠️ NU mai generăm rooms_overlay_on_crop.png aici - rooms.png nu mai este generat la pasul 1
+        # rooms.png va fi generat DUPĂ validarea pereților în raster_processing
+        
+        # 2. Detectare interior/exterior folosind masca RasterScan
+        indoor_mask, outdoor_mask = detect_interior_exterior_from_raster(
+            api_walls_mask_crop,
+            steps_dir=str(steps_dir)
+        )
+        
+        # 3. Citim scala din room_scales.json generat de RasterScan (NU calculăm din nou!)
+        if crop_img is not None:
+            # ✅ Scala a fost deja calculată de RasterScan în generate_walls_from_room_coordinates
+            # Citim direct din room_scales.json
+            room_scales_path = Path(steps_dir) / "raster_processing" / "walls_from_coords" / "room_scales.json"
+            
+            if room_scales_path.exists():
+                try:
+                    with open(room_scales_path, 'r', encoding='utf-8') as f:
+                        room_scales_data = json.load(f)
+                    
+                    # Încercăm să citim m_px direct
+                    m_px = room_scales_data.get('m_px')
+                    
+                    # Dacă nu există m_px, calculăm din total_area_m2 și total_area_px
+                    if m_px is None or m_px <= 0:
+                        total_area_m2 = room_scales_data.get('total_area_m2', 0)
+                        total_area_px = room_scales_data.get('total_area_px', 0)
+                        if total_area_px > 0 and total_area_m2 > 0:
+                            m_px = np.sqrt(total_area_m2 / total_area_px)
+                            print(f"   ✅ Calculat m_px din total_area: {m_px:.9f} m/px")
+                        else:
+                            raise RuntimeError("Nu am putut determina scala din room_scales.json (lipsesc total_area_m2 sau total_area_px)")
+                    else:
+                        print(f"   ✅ Scala din RasterScan (room_scales.json): {m_px:.9f} m/px")
+                    
+                    # Verificăm că avem m_px valid
+                    if m_px is None or m_px <= 0:
+                        raise RuntimeError("m_px invalid din room_scales.json")
+                    
+                    # Numărăm camerele folosite pentru calcularea scalei
+                    room_scales = room_scales_data.get('room_scales', {})
+                    rooms_used = len(room_scales) if isinstance(room_scales, dict) else 0
+                    
+                    # ✅ Construim scale_result pentru return (compatibil cu workflow-ul normal)
+                    scale_result = {
+                        "meters_per_pixel": float(m_px),
+                        "method": "raster_scan",
+                        "confidence": "high" if rooms_used >= 3 else "medium",
+                        "source": "room_scales.json",
+                        "rooms_used": rooms_used,  # ✅ Necesar pentru scale/jobs.py
+                        "optimization_info": {
+                            "method": "raster_scan_direct",
+                            "rooms_count": rooms_used
+                        },
+                        "per_room": []  # Listă goală pentru compatibilitate
+                    }
+                    
+                except Exception as e:
+                    import traceback
+                    print(f"   ⚠️ Eroare la citirea room_scales.json: {e}")
+                    traceback.print_exc()
+                    # ✅ Încercăm să creăm un fișier minimal pentru a permite workflow-ul să continue
+                    try:
+                        output_dir = Path(steps_dir) / "raster_processing" / "walls_from_coords"
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        minimal_data = {
+                            'rooms': {},
+                            'total_area_m2': 0.0,
+                            'total_area_px': 0,
+                            'm_px': None,
+                            'weighted_average_m_px': None,
+                            'room_scales': {},
+                            'error': f"Eroare la citire: {str(e)}"
+                        }
+                        with open(room_scales_path, 'w', encoding='utf-8') as f:
+                            json.dump(minimal_data, f, indent=2, ensure_ascii=False)
+                        print(f"   ⚠️ Creat room_scales.json minimal pentru compatibilitate")
+                    except Exception as e2:
+                        print(f"   ❌ Nu am putut crea room_scales.json minimal: {e2}")
+                    raise RuntimeError(f"Nu am putut citi scala din RasterScan: {e}")
+            else:
+                # ✅ În loc să aruncăm eroare imediat, încercăm să creăm un fișier minimal
+                print(f"   ⚠️ room_scales.json nu există la {room_scales_path}")
+                try:
+                    output_dir = Path(steps_dir) / "raster_processing" / "walls_from_coords"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    minimal_data = {
+                        'rooms': {},
+                        'total_area_m2': 0.0,
+                        'total_area_px': 0,
+                        'm_px': None,
+                        'weighted_average_m_px': None,
+                        'room_scales': {},
+                        'error': 'Fișierul nu a fost generat de RasterScan'
+                    }
+                    with open(room_scales_path, 'w', encoding='utf-8') as f:
+                        json.dump(minimal_data, f, indent=2, ensure_ascii=False)
+                    print(f"   ⚠️ Creat room_scales.json minimal pentru compatibilitate")
+                    print(f"   ⚠️ Workflow-ul va continua, dar scale-ul va trebui calculat altfel")
+                except Exception as e2:
+                    print(f"   ❌ Nu am putut crea room_scales.json minimal: {e2}")
+                raise RuntimeError(f"room_scales.json nu există la {room_scales_path}. RasterScan trebuie să genereze acest fișier înainte.")
+        else:
+            raise RuntimeError("crop_img este None!")
+        
+        # 4. Generez pereți interiori și exteriori cu 1px
+        walls_int_1px, walls_ext_1px = generate_walls_interior_exterior(
+            api_walls_mask_crop,
+            indoor_mask,
+            outdoor_mask,
+            steps_dir=str(steps_dir)
+        )
+        
+        # 5. Generez structură pereți interiori
+        walls_int_structure = generate_interior_structure_walls(
+            api_walls_mask_crop,
+            walls_int_1px,
+            steps_dir=str(steps_dir)
+        )
+        
+        # Actualizăm ai_walls_final pentru măsurători
+        ai_walls_final = api_walls_mask_crop.copy()
+        
+        # Variabile pentru măsurători (folosim pereții cu 1px)
+        walls_int_1px_for_measurements = walls_int_1px
+        walls_ext_1px_for_measurements = walls_ext_1px
+        walls_int_structure_for_measurements = walls_int_structure
+        
+    else:
+        # WORKFLOW NORMAL (FĂRĂ CROP RASTERSCAN)
+        print(f"   ℹ️ Folosesc workflow-ul normal (fără crop RasterScan)")
+        
+        # Kernel repair pentru restul procesării
+        min_dim = min(h_orig, w_orig) 
+        rep_k = max(3, int(min_dim * 0.005))
+        if rep_k % 2 == 0: rep_k += 1
+        kernel_repair = cv2.getStructuringElement(cv2.MORPH_RECT, (rep_k, rep_k))
 
-    # 7. ZONE
-    print("   🌊 Analizez zonele...")
-    
-    walls_thick = cv2.dilate(ai_walls_final, kernel_repair, iterations=3)
-    
-    h_pad, w_pad = h_orig + 2, w_orig + 2
-    pad_walls = np.zeros((h_pad, w_pad), dtype=np.uint8)
-    pad_walls[1:h_orig+1, 1:w_orig+1] = walls_thick
-    
-    inv_pad_walls = cv2.bitwise_not(pad_walls)
-    flood_mask = np.zeros((h_pad+2, w_pad+2), dtype=np.uint8)
-    cv2.floodFill(inv_pad_walls, flood_mask, (0, 0), 128)
-    
-    outdoor_mask = (inv_pad_walls[1:h_orig+1, 1:w_orig+1] == 128).astype(np.uint8) * 255
-    
-    kernel_grow = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    free_space = cv2.bitwise_not(ai_walls_final)
-    
-    for _ in range(30):
-        outdoor_mask = cv2.bitwise_and(cv2.dilate(outdoor_mask, kernel_grow), free_space)
-    
-    save_step("03_outdoor_mask", outdoor_mask, str(steps_dir))
-    
-    total_space = np.ones_like(outdoor_mask) * 255
-    occupied = cv2.bitwise_or(outdoor_mask, ai_walls_final)
-    indoor_mask = cv2.subtract(total_space, occupied)
-    
-    vis_indoor = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-    vis_indoor[indoor_mask > 0] = [0, 255, 255]
-    save_step("debug_zone_interior", vis_indoor, str(steps_dir))
+        # 7. ZONE
+        print("   🌊 Analizez zonele...")
+        
+        walls_thick = cv2.dilate(ai_walls_final, kernel_repair, iterations=3)
+        
+        h_pad, w_pad = h_orig + 2, w_orig + 2
+        pad_walls = np.zeros((h_pad, w_pad), dtype=np.uint8)
+        pad_walls[1:h_orig+1, 1:w_orig+1] = walls_thick
+        
+        inv_pad_walls = cv2.bitwise_not(pad_walls)
+        flood_mask = np.zeros((h_pad+2, w_pad+2), dtype=np.uint8)
+        cv2.floodFill(inv_pad_walls, flood_mask, (0, 0), 128)
+        
+        outdoor_mask = (inv_pad_walls[1:h_orig+1, 1:w_orig+1] == 128).astype(np.uint8) * 255
+        
+        kernel_grow = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        free_space = cv2.bitwise_not(ai_walls_final)
+        
+        for _ in range(30):
+            outdoor_mask = cv2.bitwise_and(cv2.dilate(outdoor_mask, kernel_grow), free_space)
+        
+        save_step("03_outdoor_mask", outdoor_mask, str(steps_dir))
+        
+        total_space = np.ones_like(outdoor_mask) * 255
+        occupied = cv2.bitwise_or(outdoor_mask, ai_walls_final)
+        indoor_mask = cv2.subtract(total_space, occupied)
+        
+        vis_indoor = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+        vis_indoor[indoor_mask > 0] = [0, 255, 255]
+        save_step("debug_zone_interior", vis_indoor, str(steps_dir))
 
-    # 8. SCALE DETECTION
-    print("   🔍 Determin scala...")
-    scale_result = detect_scale_from_room_labels(
-        str(image_path),
-        indoor_mask,
-        ai_walls_final,
-        str(steps_dir),
-        api_key=gemini_api_key
-    )
-    
-    if not scale_result:
-        raise RuntimeError("Nu am putut determina scala!")
-    
-    m_px = scale_result["meters_per_pixel"]
+        # 8. SCALE DETECTION
+        print("   🔍 Determin scala...")
+        image_for_scale = str(image_path)
+        scale_result = detect_scale_from_room_labels(
+            image_for_scale,
+            indoor_mask,
+            ai_walls_final,
+            str(steps_dir),
+            api_key=gemini_api_key
+        )
+        
+        if not scale_result:
+            raise RuntimeError("Nu am putut determina scala!")
+        
+        m_px = scale_result["meters_per_pixel"]
+        
+        # Variabile pentru măsurători (workflow normal)
+        walls_int_1px_for_measurements = None
+        walls_ext_1px_for_measurements = None
+        walls_int_structure_for_measurements = None
 
     # 9. MĂSURĂTORI
     print("   📏 Calculez măsurători...")
-    outline = get_strict_1px_outline(ai_walls_final)
-    touch_zone = cv2.dilate(outdoor_mask, kernel_grow, iterations=2)
     
-    outline_ext_mask = cv2.bitwise_and(outline, touch_zone)
-    outline_int_mask = cv2.subtract(outline, outline_ext_mask)
+    # Inițializăm variabilele pentru măsurători
+    px_len_ext = 0
+    px_len_int = 0
+    px_len_skeleton_ext = 0
+    px_len_skeleton_structure_int = 0
     
-    # 9a. GENERARE SCHELET PEREȚI INTERIORI
-    print("   🦴 Generez scheletul pereților interiori...")
-    interior_walls_skeleton = generate_interior_walls_skeleton(ai_walls_final, outdoor_mask)
-    save_step("04_interior_walls_skeleton", interior_walls_skeleton, str(steps_dir))
+    # Verificăm dacă avem rezultate din raster_processing (pereți din coordonatele camerelor)
+    use_raster_measurements = False
+    if walls_result_from_coords and walls_result_from_coords.get('m_px'):
+        use_raster_measurements = True
+        print(f"      ✅ Folosesc măsurătorile din raster_processing (pereți din coordonatele camerelor)")
+        
+        # Încărcăm imaginile generate
+        raster_processing_dir = Path(steps_dir) / "raster_processing" / "walls_from_coords"
+        
+        # Lungimi structură (din imagini 11 și 12)
+        interior_structure_img_path = raster_processing_dir / "11_interior_structure.png"
+        exterior_structure_img_path = raster_processing_dir / "12_exterior_structure.png"
+        
+        # Suprafete finisaje (din imagini 07 și 08)
+        walls_interior_img_path = raster_processing_dir / "07_walls_interior.png"
+        walls_exterior_img_path = raster_processing_dir / "08_walls_exterior.png"
+        
+        # Metri per pixel din room_scales.json
+        m_px_raster = walls_result_from_coords.get('m_px')
+        
+        if m_px_raster and interior_structure_img_path.exists() and exterior_structure_img_path.exists():
+            # Încărcăm imaginile
+            interior_structure_img = cv2.imread(str(interior_structure_img_path), cv2.IMREAD_GRAYSCALE)
+            exterior_structure_img = cv2.imread(str(exterior_structure_img_path), cv2.IMREAD_GRAYSCALE)
+            
+            if interior_structure_img is not None and exterior_structure_img is not None:
+                # Calculăm lungimile structurii (număr de pixeli * m_px)
+                px_len_skeleton_structure_int = int(np.count_nonzero(interior_structure_img > 0))
+                px_len_skeleton_ext = int(np.count_nonzero(exterior_structure_img > 0))
+                
+                # Folosim m_px din room_scales.json
+                m_px = m_px_raster
+                
+                # Calculăm lungimile structurii în metri
+                walls_skeleton_structure_int_m = px_len_skeleton_structure_int * m_px
+                walls_skeleton_ext_m = px_len_skeleton_ext * m_px
+                
+                print(f"         📐 Structură interior: {px_len_skeleton_structure_int} px = {walls_skeleton_structure_int_m:.2f} m")
+                print(f"         📐 Structură exterior: {px_len_skeleton_ext} px = {walls_skeleton_ext_m:.2f} m")
+        
+        # Suprafete finisaje (din imagini 07 și 08)
+        if walls_interior_img_path.exists() and walls_exterior_img_path.exists():
+            walls_interior_img = cv2.imread(str(walls_interior_img_path), cv2.IMREAD_GRAYSCALE)
+            walls_exterior_img = cv2.imread(str(walls_exterior_img_path), cv2.IMREAD_GRAYSCALE)
+            
+            if walls_interior_img is not None and walls_exterior_img is not None:
+                # Calculăm lungimile pentru finisaje (număr de pixeli * m_px)
+                px_len_int = int(np.count_nonzero(walls_interior_img > 0))
+                px_len_ext = int(np.count_nonzero(walls_exterior_img > 0))
+                
+                # Calculăm lungimile în metri
+                walls_int_m = px_len_int * m_px
+                walls_ext_m = px_len_ext * m_px
+                
+                print(f"         🎨 Finisaje interior: {px_len_int} px = {walls_int_m:.2f} m")
+                print(f"         🎨 Finisaje exterior: {px_len_ext} px = {walls_ext_m:.2f} m")
+        
+        # Suprafete camere din room_scales.json
+        room_scales = walls_result_from_coords.get('room_scales', {})
+        if room_scales:
+            total_area_m2_raster = walls_result_from_coords.get('total_area_m2', 0.0)
+            total_area_px_raster = walls_result_from_coords.get('total_area_px', 0)
+            
+            print(f"         🏠 Suprafete camere: {total_area_m2_raster:.2f} m² ({len(room_scales)} camere)")
     
-    # Calculăm lungimea skeleton-ului pereților interiori (din imaginea generată)
-    px_len_skeleton_int = int(np.count_nonzero(interior_walls_skeleton))
-    
-    # Calculăm lungimea pereților exteriori (din outline)
-    px_len_skeleton_ext = int(np.count_nonzero(outline_ext_mask))
-    
-    # Lungimea structurii pereților interiori = skeleton interior - exterior
-    # (scădem exteriorul pentru că skeleton-ul interior poate conține și pereții exteriori)
-    px_len_skeleton_structure_int = max(0, px_len_skeleton_int - px_len_skeleton_ext)
-    
-    # Lungimi din outline (pentru finisaje)
-    px_len_ext = int(np.count_nonzero(outline_ext_mask))
-    px_len_int = int(np.count_nonzero(outline_int_mask))
+    if not use_raster_measurements:
+        if use_crop:
+            # Folosim pereții cu 1px generați anterior
+            px_len_ext = int(np.count_nonzero(walls_ext_1px_for_measurements))
+            px_len_int = int(np.count_nonzero(walls_int_1px_for_measurements))
+            px_len_skeleton_ext = px_len_ext  # Pentru consistență
+            px_len_skeleton_structure_int = int(np.count_nonzero(walls_int_structure_for_measurements))
+        else:
+            # Workflow normal - calculăm outline
+            outline = get_strict_1px_outline(ai_walls_final)
+            touch_zone = cv2.dilate(outdoor_mask, kernel_grow, iterations=2)
+            
+            outline_ext_mask = cv2.bitwise_and(outline, touch_zone)
+            outline_int_mask = cv2.subtract(outline, outline_ext_mask)
+            
+            # Calculăm lungimea pereților exteriori (din outline)
+            px_len_skeleton_ext = int(np.count_nonzero(outline_ext_mask))
+            
+            # Lungimea structurii pereților interiori (folosim outline interior)
+            px_len_skeleton_structure_int = int(np.count_nonzero(outline_int_mask))
+            
+            # Lungimi din outline (pentru finisaje)
+            px_len_ext = int(np.count_nonzero(outline_ext_mask))
+            px_len_int = int(np.count_nonzero(outline_int_mask))
     
     # Arii
     px_area_indoor = int(np.count_nonzero(indoor_mask))
@@ -3180,8 +3356,7 @@ def run_cubicasa_detection(
     
     # Lungimi din skeleton (pentru structură)
     walls_skeleton_ext_m = px_len_skeleton_ext * m_px
-    walls_skeleton_int_m = px_len_skeleton_int * m_px  # Skeleton interior (din imagine)
-    walls_skeleton_structure_int_m = px_len_skeleton_structure_int * m_px  # Structură pereți interiori (skeleton - exterior)
+    walls_skeleton_structure_int_m = px_len_skeleton_structure_int * m_px  # Structură pereți interiori (din outline)
     
     area_indoor_m2 = px_area_indoor * (m_px ** 2)
     area_total_m2 = px_area_total * (m_px ** 2)
@@ -3191,7 +3366,6 @@ def run_cubicasa_detection(
             "walls_len_ext": int(px_len_ext),
             "walls_len_int": int(px_len_int),
             "walls_skeleton_ext": int(px_len_skeleton_ext),
-            "walls_skeleton_int": int(px_len_skeleton_int),
             "walls_skeleton_structure_int": int(px_len_skeleton_structure_int),
             "indoor_area": int(px_area_indoor),
             "total_area": int(px_area_total)
@@ -3201,7 +3375,6 @@ def run_cubicasa_detection(
             "walls_ext_m": float(round(walls_ext_m, 2)),  # Pentru finisaje
             "walls_int_m": float(round(walls_int_m, 2)),  # Pentru finisaje
             "walls_skeleton_ext_m": float(round(walls_skeleton_ext_m, 2)),
-            "walls_skeleton_int_m": float(round(walls_skeleton_int_m, 2)),
             "walls_skeleton_structure_int_m": float(round(walls_skeleton_structure_int_m, 2)),  # Pentru structură pereți interiori
             "area_indoor_m2": float(round(area_indoor_m2, 2)),
             "area_total_m2": float(round(area_total_m2, 2))
@@ -3213,9 +3386,26 @@ def run_cubicasa_detection(
     print(f"   📏 Lungimi pereți:")
     print(f"      - Exterior (outline): {walls_ext_m:.2f} m (pentru finisaje)")
     print(f"      - Interior (outline): {walls_int_m:.2f} m (pentru finisaje)")
-    print(f"      - Skeleton interior (din imagine): {walls_skeleton_int_m:.2f} m")
     print(f"      - Skeleton exterior (din outline): {walls_skeleton_ext_m:.2f} m")
-    print(f"      - Structură interior (skeleton - exterior): {walls_skeleton_structure_int_m:.2f} m")
+    print(f"      - Structură interior (din outline): {walls_skeleton_structure_int_m:.2f} m")
+    
+    # ✅ Salvează walls_measurements într-un fișier separat pentru pricing (FĂRĂ dependență de CubiCasa)
+    if steps_dir:
+        raster_processing_dir = Path(steps_dir) / "raster_processing" / "walls_from_coords"
+        raster_processing_dir.mkdir(parents=True, exist_ok=True)
+        walls_measurements_file = raster_processing_dir / "walls_measurements.json"
+        walls_measurements_data = {
+            "estimations": {
+                "average_result": {
+                    "interior_meters": float(round(walls_int_m, 2)),
+                    "exterior_meters": float(round(walls_ext_m, 2)),
+                    "interior_meters_structure": float(round(walls_skeleton_structure_int_m, 2))
+                }
+            }
+        }
+        with open(walls_measurements_file, "w", encoding="utf-8") as f:
+            json.dump(walls_measurements_data, f, indent=2, ensure_ascii=False)
+        print(f"   💾 Salvat: walls_measurements.json (pentru pricing)")
     
     # 10. FILTRARE ZGOMOT CU MASCĂ ZONĂ INTERIOARĂ (înainte de generarea 3D)
     print("   🎨 Filtrez zgomotul de fundal cu masca zonei interioare...")
@@ -3233,12 +3423,12 @@ def run_cubicasa_detection(
             interior_zone_mask = (g > 128).astype(np.uint8) * 255
             
             # Redimensionăm dacă e necesar
-            if interior_zone_mask.shape[:2] != ai_walls_smoothed.shape[:2]:
-                interior_zone_mask = cv2.resize(interior_zone_mask, (ai_walls_smoothed.shape[1], ai_walls_smoothed.shape[0]), interpolation=cv2.INTER_NEAREST)
+            if interior_zone_mask.shape[:2] != ai_walls_final.shape[:2]:
+                interior_zone_mask = cv2.resize(interior_zone_mask, (ai_walls_final.shape[1], ai_walls_final.shape[0]), interpolation=cv2.INTER_NEAREST)
             
             # Calculăm grosimea medie a pereților pentru marjă de eroare
-            dist_from_edge = cv2.distanceTransform(ai_walls_smoothed, cv2.DIST_L2, 5)
-            wall_thicknesses = dist_from_edge[ai_walls_smoothed > 0] * 2
+            dist_from_edge = cv2.distanceTransform(ai_walls_final, cv2.DIST_L2, 5)
+            wall_thicknesses = dist_from_edge[ai_walls_final > 0] * 2
             if len(wall_thicknesses) > 0:
                 avg_thickness = np.median(wall_thicknesses)
                 margin_size = max(3, int(round(avg_thickness)))
@@ -3250,21 +3440,21 @@ def run_cubicasa_detection(
                 interior_zone_mask_dilated = cv2.dilate(interior_zone_mask, kernel_margin, iterations=1)
                 
                 # Aplicăm masca pe pereți: păstrăm doar pereții din zona interioară (cu marjă)
-                ai_walls_smoothed_filtered = cv2.bitwise_and(ai_walls_smoothed, interior_zone_mask_dilated)
+                ai_walls_final_filtered = cv2.bitwise_and(ai_walls_final, interior_zone_mask_dilated)
                 
                 # Folosim pereții filtrați pentru generarea 3D
-                ai_walls_for_3d = ai_walls_smoothed_filtered
+                ai_walls_for_3d = ai_walls_final_filtered
                 
-                removed_pixels = np.count_nonzero(ai_walls_smoothed) - np.count_nonzero(ai_walls_smoothed_filtered)
+                removed_pixels = np.count_nonzero(ai_walls_final) - np.count_nonzero(ai_walls_final_filtered)
                 print(f"      ✅ Eliminat {removed_pixels:,} pixeli de zgomot din afara zonei interioare")
             else:
-                ai_walls_for_3d = ai_walls_smoothed
+                ai_walls_for_3d = ai_walls_final
                 print(f"      ⚠️ Nu s-a putut calcula grosimea, folosesc pereții fără filtrare")
         else:
-            ai_walls_for_3d = ai_walls_smoothed
+            ai_walls_for_3d = ai_walls_final
             print(f"      ⚠️ Nu s-a putut încărca masca, folosesc pereții fără filtrare")
     else:
-        ai_walls_for_3d = ai_walls_smoothed
+        ai_walls_for_3d = ai_walls_final
         print(f"      ⚠️ Mască lipsă, folosesc pereții fără filtrare")
     
     # 10. GENERARE 3D (cu pereții filtrați - zgomotul a fost eliminat înainte)
@@ -3277,9 +3467,24 @@ def run_cubicasa_detection(
 
     # 11. VIZUALIZĂRI
     overlay = img.copy()
-    overlay[outline_ext_mask > 0] = [255, 0, 0]
-    overlay[outline_int_mask > 0] = [0, 255, 0]
-    cv2.imwrite(str(output_dir / "visualization_overlay.png"), overlay)
+    # Verificăm dacă outline_ext_mask și outline_int_mask sunt definite
+    try:
+        if 'outline_ext_mask' in locals() and outline_ext_mask is not None:
+            overlay[outline_ext_mask > 0] = [255, 0, 0]
+        if 'outline_int_mask' in locals() and outline_int_mask is not None:
+            overlay[outline_int_mask > 0] = [0, 255, 0]
+        cv2.imwrite(str(output_dir / "visualization_overlay.png"), overlay)
+    except (NameError, UnboundLocalError):
+        # Dacă nu sunt definite (workflow cu RasterScan crop), folosim pereții direct dacă există
+        try:
+            if 'walls_ext_1px_for_measurements' in locals() and walls_ext_1px_for_measurements is not None:
+                overlay[walls_ext_1px_for_measurements > 0] = [255, 0, 0]
+            if 'walls_int_1px_for_measurements' in locals() and walls_int_1px_for_measurements is not None:
+                overlay[walls_int_1px_for_measurements > 0] = [0, 255, 0]
+            cv2.imwrite(str(output_dir / "visualization_overlay.png"), overlay)
+        except (NameError, UnboundLocalError):
+            # Dacă niciunul nu este disponibil, salvăm overlay-ul fără modificări
+            cv2.imwrite(str(output_dir / "visualization_overlay.png"), overlay)
     
     return {
         "scale_result": scale_result,

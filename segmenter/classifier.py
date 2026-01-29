@@ -819,23 +819,24 @@ def detect_and_remove_duplicates(
     ai_client
 ) -> list[DuplicateGroup]:
     """
-    Detectează și elimină clusterele duplicate prin comparație AI directă.
+    Detectează și elimină blueprint-urile duplicate prin comparație AI directă.
     Compară fiecare pereche de imagini și elimină cele mai mici.
+    Acum compară DOAR blueprint-urile finale sortate, nu toate clusterele.
     """
     
-    print("\n[STEP 7B] Detectare și eliminare duplicate clusters...")
+    print("\n[STEP 7B] Detectare și eliminare duplicate blueprint-uri finale...")
     
     image_files = sorted(crops_dir.glob("*.jpg")) + sorted(crops_dir.glob("*.png"))
     
     if len(image_files) < 2:
-        print("ℹ️ Prea puține clustere pentru verificare duplicate.")
+        print("ℹ️ Prea puține blueprint-uri pentru verificare duplicate.")
         return []
     
     if not ai_client:
         print("⚠️ Niciun client AI disponibil - skip detectare duplicate.")
         return []
     
-    print(f"📊 Verificare {len(image_files)} clustere pentru duplicate...")
+    print(f"📊 Verificare {len(image_files)} blueprint-uri pentru duplicate...")
     print(f"🔍 Total combinații de verificat: {len(image_files) * (len(image_files) - 1) // 2}\n")
     
     # Obținem dimensiunile fișierelor
@@ -1044,15 +1045,6 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
     else:
         print(f"✅ Clienți activi: {', '.join(clients)}")
     
-    # DETECTARE ȘI ELIMINARE DUPLICATE
-    # Folosim primul client disponibil (prioritate GPT)
-    ai_client = gpt_client if gpt_client else gemini_client
-    
-    duplicate_groups = detect_and_remove_duplicates(
-        crops_dir=crops_dir,
-        ai_client=ai_client
-    )
-    
     # CLASIFICARE
     print("[STEP 8] Clasificare cu Dual-Model Validation (GPT-4o + Gemini)...")
     
@@ -1104,6 +1096,26 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
               f"{result.label:20} | {img_file.name}")
     
     print("\n✅ Clasificare finalizată!\n")
+    
+    # DETECTARE ȘI ELIMINARE DUPLICATE (DOAR PENTRU BLUEPRINT-URI FINALE)
+    # Folosim primul client disponibil (prioritate GPT)
+    ai_client = gpt_client if gpt_client else gemini_client
+    
+    if ai_client and bp_dir.exists():
+        blueprint_files = list(bp_dir.glob("*.jpg")) + list(bp_dir.glob("*.png"))
+        if len(blueprint_files) >= 2:
+            print(f"[STEP 7B] Detectare duplicate în blueprint-uri finale ({len(blueprint_files)} fișiere)...")
+            duplicate_groups = detect_and_remove_duplicates(
+                crops_dir=bp_dir,
+                ai_client=ai_client
+            )
+        else:
+            print(f"[STEP 7B] Prea puține blueprint-uri ({len(blueprint_files)}) pentru verificare duplicate.")
+    else:
+        if not ai_client:
+            print("[STEP 7B] ⚠️ Niciun client AI disponibil - skip detectare duplicate.")
+        if not bp_dir.exists():
+            print(f"[STEP 7B] ⚠️ Folder blueprint-uri nu există: {bp_dir}")
     
     # POST-VALIDARE
     print("[STEP 8B] Post-validare folder 'blueprints' cu heuristici...")

@@ -43,8 +43,14 @@ def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) ->
     scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
     scale_json = scale_dir / "scale_result.json"
     
+    # Prioritate: folosim openings_measurements.json din raster_processing (workflow nou)
+    # Fallback: exterior_doors.json (workflow vechi)
+    raster_openings_json = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "openings_measurements.json"
     exterior_doors_dir = work_dir.parent.parent / "exterior_doors" / plan.plan_id
     exterior_doors_json = exterior_doors_dir / "exterior_doors.json"
+    
+    # Folosim raster_processing dacă există, altfel fallback la exterior_doors
+    status_source_json = raster_openings_json if raster_openings_json.exists() else exterior_doors_json
     
     # Verificări
     if not detections_all_json.exists():
@@ -90,7 +96,7 @@ def _run_for_single_plan(run_id: str, index: int, total: int, plan: PlanInfo) ->
         total_openings = create_openings_all(
             detections_all_json,
             measurements_output,
-            exterior_doors_json,
+            status_source_json,
             openings_all_output
         )
         

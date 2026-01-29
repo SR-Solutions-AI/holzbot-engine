@@ -48,8 +48,40 @@ def _run_for_single_plan(
     metadata_file = job_root / "plan_metadata" / f"{original_name}.json"
     
     # Fișiere input
+    # Perimetrul este acum în cubicasa_result.json din scale (STEP 6)
+    scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
+    cubicasa_result_path = scale_dir / "cubicasa_result.json"
+    
+    # Fallback la perimeter pentru compatibilitate (dacă există)
     perimeter_dir = work_dir.parent.parent / "perimeter" / plan.plan_id
     walls_json = perimeter_dir / "walls_measurements_gemini.json"
+    
+    # Prioritate: cubicasa_result.json din scale
+    if cubicasa_result_path.exists():
+        try:
+            with open(cubicasa_result_path, "r", encoding="utf-8") as f:
+                cubicasa_result = json.load(f)
+            measurements = cubicasa_result.get("measurements", {}).get("metrics", {})
+            # Construim formatul așteptat din datele existente
+            walls_json_data = {
+                "estimations": {
+                    "average_result": {
+                        "interior_meters": measurements.get("walls_int_m", 0.0),
+                        "exterior_meters": measurements.get("walls_ext_m", 0.0),
+                        "interior_meters_structure": measurements.get("walls_skeleton_structure_int_m", measurements.get("walls_int_m", 0.0)),
+                        "skeleton_ext_meters": measurements.get("walls_skeleton_ext_m", 0.0),
+                        "skeleton_int_meters": measurements.get("walls_skeleton_structure_int_m", 0.0),
+                        "skeleton_structure_int_meters": measurements.get("walls_skeleton_structure_int_m", 0.0),
+                        "total_perimeter_meters": measurements.get("walls_ext_m", 0.0)
+                    }
+                }
+            }
+            walls_json = None  # Nu mai folosim fișierul din perimeter
+        except Exception as e:
+            print(f"⚠️ Eroare la citirea cubicasa_result.json: {e}, folosesc fallback")
+            walls_json_data = None
+    else:
+        walls_json_data = None
     
     measure_dir = work_dir.parent.parent / "measure_objects" / plan.plan_id
     openings_json = measure_dir / "openings_all.json"
@@ -59,8 +91,9 @@ def _run_for_single_plan(
     scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
     cubicasa_cache = scale_dir / "cubicasa_result.json"
 
-    if not walls_json.exists():
-        return AreaJobResult(plan.plan_id, work_dir, False, f"Missing walls: {walls_json.name}")
+    # Verificăm dacă avem date din cubicasa_result.json sau fallback la perimeter
+    if walls_json_data is None and (walls_json is None or not walls_json.exists()):
+        return AreaJobResult(plan.plan_id, work_dir, False, f"Missing walls data: nu există cubicasa_result.json sau walls_measurements_gemini.json")
     if not openings_json.exists():
         return AreaJobResult(plan.plan_id, work_dir, False, f"Missing openings: {openings_json.name}")
     
@@ -72,8 +105,27 @@ def _run_for_single_plan(
         area_gross_m2 = 0.0
         source_type = "unknown"
         
-        # 1. EXTRAGERE ARII DIN CUBICASA (PRIORITATE MAXIMĂ)
-        if cubicasa_cache.exists():
+        # 0. VERIFICĂM DACĂ AVEM ROOM_SCALES.JSON DIN RASTER_PROCESSING (PRIORITATE MAXIMĂ)
+        raster_room_scales = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+        use_raster_areas = False
+        
+        if raster_room_scales.exists():
+            try:
+                with open(raster_room_scales, "r", encoding="utf-8") as f:
+                    room_scales_data = json.load(f)
+                total_area_m2_raster = room_scales_data.get('total_area_m2', 0.0)
+                if total_area_m2_raster > 0:
+                    area_net_m2 = float(total_area_m2_raster)
+                    area_gross_m2 = float(total_area_m2_raster)  # Pentru moment, folosim aceeași valoare
+                    use_raster_areas = True
+                    source_type = "raster_processing_room_scales"
+                    num_rooms = len(room_scales_data.get('rooms', {}))
+                    print(f"       ✅ Folosesc suprafetele din room_scales.json: {area_net_m2:.2f} m² ({num_rooms} camere)")
+            except Exception as e:
+                print(f"       ⚠️ Eroare la citirea room_scales.json: {e}")
+        
+        # 1. EXTRAGERE ARII DIN CUBICASA (DOAR DACĂ NU AM FOLOSIT ROOM_SCALES.JSON)
+        if not use_raster_areas and cubicasa_cache.exists():
             try:
                 with open(cubicasa_cache, "r", encoding="utf-8") as f:
                     cc_data = json.load(f)
@@ -124,7 +176,12 @@ def _run_for_single_plan(
                 if not is_top_floor:
                     is_top_floor = (floor_type == "top_floor")
 
-        with open(walls_json, "r", encoding="utf-8") as f: walls_data = json.load(f)
+        # Folosim walls_json_data dacă există (din cubicasa_result.json), altfel citim din walls_json
+        if walls_json_data is not None:
+            walls_data = walls_json_data
+        else:
+            with open(walls_json, "r", encoding="utf-8") as f: 
+                walls_data = json.load(f)
         with open(openings_json, "r", encoding="utf-8") as f: openings_data = json.load(f)
         
         stairs_area_m2 = None

@@ -14,21 +14,20 @@ import json
 import shutil
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT
+from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo
 from config.frontend_loader import load_frontend_data_for_run
+from typing import List, Tuple
 
 # ✅ IMPORT SEGMENTER JOBS
 from segmenter.jobs import run_segmentation_for_documents, get_all_classification_results
 
 from floor_classifier import run_floor_classification, FloorClassificationResult
 from detections.jobs import run_detections_for_run
+from cubicasa_detector.jobs import run_cubicasa_for_plan, run_cubicasa_phase1, run_cubicasa_phase2
 from scale import run_scale_detection_for_run
 from count_objects import run_count_objects_for_run
-from exterior_doors.jobs import run_exterior_doors_for_run
-from measure_objects.jobs import run_measure_objects_for_run
-from perimeter.jobs import run_perimeter_for_run
-from area.jobs import run_area_for_run
 from roof.jobs import run_roof_for_run
 from pricing.jobs import run_pricing_for_run, PricingJobResult
 from offer_builder import build_final_offer
@@ -49,6 +48,45 @@ def notify_ui(stage_tag: str, image_path: Path | str | None = None):
             print(f"⚠️ [UI] Image path not found: {abs_path}", flush=True)
     print(msg, flush=True)
     sys.stdout.flush()
+
+
+def _check_raster_complete(plans: List[PlanInfo]) -> Tuple[bool, List[str]]:
+    """
+    Verifică că toate planurile au camerele calculate:
+    - room_scales.json există, total_area_m2 > 0, total_area_px > 0
+    - cel puțin o cameră în room_scales/rooms
+    - rooms.png există (masca camerelor)
+    Returns (all_ok, failed_plan_ids).
+    """
+    failed: List[str] = []
+    for plan in plans:
+        base = plan.stage_work_dir / "cubicasa_steps"
+        room_scales_path = base / "raster_processing" / "walls_from_coords" / "room_scales.json"
+        # rooms.png poate fi în raster/rooms.png sau raster_processing/rooms.png
+        rooms_png_path_raster = base / "raster" / "rooms.png"
+        rooms_png_path_processing = base / "raster_processing" / "rooms.png"
+        rooms_png_path = rooms_png_path_raster if rooms_png_path_raster.exists() else rooms_png_path_processing
+
+        if not room_scales_path.exists():
+            failed.append(plan.plan_id)
+            continue
+        try:
+            data = json.loads(room_scales_path.read_text(encoding="utf-8"))
+            m2 = float(data.get("total_area_m2") or 0)
+            px = int(data.get("total_area_px") or 0)
+            rooms_data = data.get("room_scales") or data.get("rooms") or {}
+            num_rooms = len(rooms_data) if isinstance(rooms_data, dict) else 0
+
+            if m2 <= 0 or px <= 0:
+                failed.append(plan.plan_id)
+            elif num_rooms < 1:
+                failed.append(plan.plan_id)
+            elif not rooms_png_path.exists():
+                failed.append(plan.plan_id)
+        except Exception:
+            failed.append(plan.plan_id)
+    return (len(failed) == 0, failed)
+
 
 # =========================================================
 # TIMER UTILITIES
@@ -83,6 +121,30 @@ class PipelineTimer:
     
     def finish(self): 
         self.total_end = time.time()
+        self.print_summary()
+    
+    def print_summary(self):
+        """Afișează rezumatul timpilor pentru fiecare pas."""
+        if not self.steps:
+            return
+        
+        total_duration = self.total_end - self.total_start if self.total_start and self.total_end else 0
+        
+        print("\n" + "="*70)
+        print("⏱️  REZUMAT TIMPI PENTRU FIECARE PAS")
+        print("="*70)
+        
+        # Sortăm după durată (descrescător)
+        sorted_steps = sorted(self.steps, key=lambda x: x["duration"], reverse=True)
+        
+        for step in sorted_steps:
+            duration = step["duration"]
+            percentage = (duration / total_duration * 100) if total_duration > 0 else 0
+            print(f"  {step['name']:.<40} {duration:>7.2f}s ({percentage:>5.1f}%)")
+        
+        print("-"*70)
+        print(f"  {'TOTAL':.<40} {total_duration:>7.2f}s (100.0%)")
+        print("="*70 + "\n")
 
 pipeline_timer = PipelineTimer()
 
@@ -232,149 +294,154 @@ def run_segmentation_and_classification_for_document(
         
         with Timer("STEP 5: Detections") as t:
             run_detections_for_run(run_id)
-            notify_ui("detections")
+            # Notificarea UI pentru detections este trimisă direct din raster_processing.py
+            # după generarea 01_openings.png (în timpul scale detection - STEP 6)
         pipeline_timer.add_step("Detections", t.end_time - t.start_time)
         
-        with Timer("STEP 6: Scale") as t:
-            run_scale_detection_for_run(run_id)
-            notify_ui("scale")
-        pipeline_timer.add_step("Scale", t.end_time - t.start_time)
-
-        with Timer("STEP 7: Count Objects") as t:
-            run_count_objects_for_run(run_id)
-            out_dir = RUNNER_ROOT / "output" / run_id / "count_objects"
-            if out_dir.exists():
-                for img in out_dir.rglob("*plan_detected_all_hybrid.jpg"):
-                    notify_ui("count_objects", img)
-            else:
-                notify_ui("count_objects")
-        pipeline_timer.add_step("Count Objects", t.end_time - t.start_time)
-
-        with Timer("STEP 8-9: Exterior Doors") as t:
-            run_exterior_doors_for_run(run_id)
-            out_dir = RUNNER_ROOT / "output" / run_id / "exterior_doors"
-            if out_dir.exists():
-                for img in out_dir.rglob("*blue_overlay.jpg"):
-                    notify_ui("exterior_doors", img)
-            else:
-                notify_ui("exterior_doors")
-        pipeline_timer.add_step("Exterior Doors", t.end_time - t.start_time)
-
-        with Timer("STEP 10: Measure") as t:
-            run_measure_objects_for_run(run_id)
-            notify_ui("measure_objects")
-        pipeline_timer.add_step("Measure", t.end_time - t.start_time)
-
-        with Timer("STEP 11: Perimeter") as t:
-            run_perimeter_for_run(run_id)
-            notify_ui("perimeter")
-        pipeline_timer.add_step("Perimeter", t.end_time - t.start_time)
-
-        with Timer("STEP 12: Area") as t:
-            # Încărcăm frontend_data pentru a folosi înălțimea pereților din formular
-            frontend_data = load_frontend_data_for_run(run_id, job_root)
-            run_area_for_run(run_id, frontend_data=frontend_data)
+        # ✅ STEP 5.5: RasterScan Processing (generează room_scales.json)
+        # Acest pas apelează RasterScan API și generează pereții corecți + lista de camere + room_scales.json
+        # DUPĂ ce avem lista de camere, putem calcula scale detection (STEP 6)
+        with Timer("STEP 5.5: RasterScan Processing") as t:
+            print(f"\n{'='*60}")
+            print(f"[RasterScan] Starting RasterScan processing for run: {run_id}")
+            print(f"{'='*60}\n")
             
-            area_out_dir = RUNNER_ROOT / "output" / run_id / "scale"
-            
-            found_any_image = False
-            if area_out_dir.exists():
-                for plan_dir in area_out_dir.iterdir():
-                    if plan_dir.is_dir():
-                        img_3d = plan_dir / "walls_3d_view.png"
-                        if img_3d.exists():
-                            notify_ui("area", img_3d)
-                            found_any_image = True
-                            continue
-                        
-                        img_2d = plan_dir / "final_viz.png"
-                        if img_2d.exists():
-                            notify_ui("area", img_2d)
-                            found_any_image = True
-            
-            if not found_any_image:
-                notify_ui("area")
-                
-        pipeline_timer.add_step("Area", t.end_time - t.start_time)
-        
-        with Timer("STEP 13: Roof") as t:
-            run_roof_for_run(run_id)
-            notify_ui("roof")
-        pipeline_timer.add_step("Roof", t.end_time - t.start_time)
-
-        frontend_data = load_frontend_data_for_run(run_id, job_root)
-        
-        with Timer("STEP 14-15: Pricing") as t:
-            pricing_results = run_pricing_for_run(run_id, frontend_data_override=frontend_data)
-            notify_ui("pricing")
-        pipeline_timer.add_step("Pricing", t.end_time - t.start_time)
-
-        with Timer("STEP 16-17: Offer Generation") as t:
-            # Offer level should follow user intent. If the form doesn't include `nivelOferta`,
-            # fall back to calc_mode/offer_type selection coming from the API.
-            nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta")
-            if not nivel_oferta:
-                cm = (frontend_data.get("calc_mode") or "").lower()
-                if cm in ("structure", "structura"):
-                    nivel_oferta = "Structură"
-                elif cm in ("structure_windows", "structura_ferestre", "structura+ferestre"):
-                    nivel_oferta = "Structură + ferestre"
-                elif cm in ("full_house", "full_house_premium", "casa_completa", "casacompleta"):
-                    nivel_oferta = "Casă completă"
-                else:
-                    nivel_oferta = "Structură"
-            print(f"📋 [OFFER] Level: {nivel_oferta}")
-            
-            for res in pricing_results:
-                if res.success and res.result_data:
+            # Încărcăm planurile pentru acest run
+            plans = load_plan_infos(run_id, "scale")  # Folosim "scale" pentru că output_dir va fi în scale/
+            raster_scan_failed = False
+            # Phase 1 în paralel pentru toate planurile (Raster API + AI walls → 02_ai_walls_closed)
+            def do_phase1(plan):
+                print(f"[RasterScan] Phase 1 {plan.plan_id} → Raster API + 02_ai_walls_closed", flush=True)
+                run_cubicasa_phase1(
+                    plan_image=plan.plan_image,
+                    output_dir=plan.stage_work_dir,
+                )
+                print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK", flush=True)
+            with ThreadPoolExecutor(max_workers=len(plans) or 1) as executor:
+                futs = {executor.submit(do_phase1, plan): plan for plan in plans}
+                for fut in as_completed(futs):
+                    plan = futs[fut]
                     try:
-                        build_final_offer(
-                            res.result_data, 
-                            nivel_oferta, 
-                            res.work_dir / "final_offer.json"
-                        )
+                        fut.result()
                     except Exception as e:
-                        print(f"⚠️ Error building offer for {res.plan_id}: {e}")
+                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        raster_scan_failed = True
+            if not raster_scan_failed:
+                # Phase 2 în paralel pentru toate planurile (brute force + room_scales.json)
+                def do_phase2(plan):
+                    print(f"[RasterScan] Phase 2 {plan.plan_id} → brute force + room_scales.json", flush=True)
+                    run_cubicasa_phase2(output_dir=plan.stage_work_dir)
+                    print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes", flush=True)
+                with ThreadPoolExecutor(max_workers=len(plans) or 1) as executor:
+                    futs = {executor.submit(do_phase2, plan): plan for plan in plans}
+                    for fut in as_completed(futs):
+                        plan = futs[fut]
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
+                            import traceback
+                            traceback.print_exc()
+                            raster_scan_failed = True
             
-            notify_ui("offer_generation")
-        pipeline_timer.add_step("Offer Generation", t.end_time - t.start_time)
+            raster_ok, failed_plan_ids = _check_raster_complete(plans)
+            if failed_plan_ids:
+                print(f"⚠️ [RasterScan] Planuri fără camere calculate (room_scales.json + rooms.png): {failed_plan_ids}", flush=True)
+            raster_ok = raster_ok and not raster_scan_failed
+            
+            print(f"\n{'='*60}")
+            print(f"[RasterScan] RasterScan Processing Complete")
+            print(f"{'='*60}\n")
+        pipeline_timer.add_step("RasterScan Processing", t.end_time - t.start_time)
         
-        with Timer("STEP 18-19: PDF GENERATION") as t:
-            pdf_path = None
-            admin_pdf_path = None
-            calc_method_pdf_path = None
-            try:
-                # Generate user PDF (with branding)
-                pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None)
-                print(f"✅ [PDF] User PDF generated: {pdf_path}")
-                notify_ui("pdf_generation", pdf_path)
-                
-                # Generate admin PDF (strict, no branding)
-                admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None)
-                print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
-                notify_ui("pdf_generation", admin_pdf_path)
-                
-                # Generate calculation method PDF (English, detailed explanations)
+        if not raster_ok:
+            print(f"\n⛔ [Pipeline] Camerele nu sunt calculate pentru toate planurile.", flush=True)
+            print(f"   Se sar pașii: Scale, Count Objects, Roof, Pricing, Offer, PDF.", flush=True)
+            print(f"   Asigură-te că RasterScan finalizează (room_scales.json + rooms.png) pentru fiecare etaj în ordine, apoi rulează din nou.\n", flush=True)
+        
+        if raster_ok:
+            with Timer("STEP 6: Scale") as t:
+                run_scale_detection_for_run(run_id)
+            pipeline_timer.add_step("Scale", t.end_time - t.start_time)
+
+            with Timer("STEP 7: Count Objects") as t:
+                run_count_objects_for_run(run_id)
+            pipeline_timer.add_step("Count Objects", t.end_time - t.start_time)
+
+            with Timer("STEP 13: Roof") as t:
+                run_roof_for_run(run_id)
+                notify_ui("roof")
+            pipeline_timer.add_step("Roof", t.end_time - t.start_time)
+
+            frontend_data = load_frontend_data_for_run(run_id, job_root)
+
+            with Timer("STEP 14-15: Pricing") as t:
+                pricing_results = run_pricing_for_run(run_id, frontend_data_override=frontend_data)
+                notify_ui("pricing")
+            pipeline_timer.add_step("Pricing", t.end_time - t.start_time)
+
+            with Timer("STEP 16-17: Offer Generation") as t:
+                nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta")
+                if not nivel_oferta:
+                    cm = (frontend_data.get("calc_mode") or "").lower()
+                    if cm in ("structure", "structura"):
+                        nivel_oferta = "Structură"
+                    elif cm in ("structure_windows", "structura_ferestre", "structura+ferestre"):
+                        nivel_oferta = "Structură + ferestre"
+                    elif cm in ("full_house", "full_house_premium", "casa_completa", "casacompleta"):
+                        nivel_oferta = "Casă completă"
+                    else:
+                        nivel_oferta = "Structură"
+                print(f"📋 [OFFER] Level: {nivel_oferta}")
+                for res in pricing_results:
+                    if res.success and res.result_data:
+                        try:
+                            build_final_offer(
+                                res.result_data,
+                                nivel_oferta,
+                                res.work_dir / "final_offer.json"
+                            )
+                        except Exception as e:
+                            print(f"⚠️ Error building offer for {res.plan_id}: {e}")
+                notify_ui("offer_generation")
+            pipeline_timer.add_step("Offer Generation", t.end_time - t.start_time)
+
+            with Timer("STEP 18-19: PDF GENERATION") as t:
+                pdf_path = None
+                admin_pdf_path = None
+                calc_method_pdf_path = None
                 try:
-                    calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None)
-                    print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
-                    notify_ui("pdf_generation", calc_method_pdf_path)
-                except Exception as calc_err:
-                    print(f"⚠️ Calculation Method PDF Error: {calc_err}")
+                    pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None)
+                    print(f"✅ [PDF] User PDF generated: {pdf_path}")
+                    notify_ui("pdf_generation", pdf_path)
+                    admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None)
+                    print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
+                    notify_ui("pdf_generation", admin_pdf_path)
+                    try:
+                        calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None)
+                        print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
+                        notify_ui("pdf_generation", calc_method_pdf_path)
+                    except Exception as calc_err:
+                        print(f"⚠️ Calculation Method PDF Error: {calc_err}")
+                        import traceback
+                        traceback.print_exc()
+                except Exception as e:
+                    print(f"⚠️ PDF Error: {e}")
                     import traceback
                     traceback.print_exc()
-            except Exception as e:
-                print(f"⚠️ PDF Error: {e}")
-                import traceback
-                traceback.print_exc()
-                notify_ui("pdf_generation")
-        pipeline_timer.add_step("PDF", t.end_time - t.start_time)
-        
-        time.sleep(2.0)
-        # Notify completion with user PDF (for backward compatibility)
-        notify_ui("computation_complete", pdf_path if pdf_path and Path(pdf_path).exists() else None)
+                    notify_ui("pdf_generation")
+            pipeline_timer.add_step("PDF", t.end_time - t.start_time)
 
-    pipeline_timer.finish()
+            time.sleep(2.0)
+            notify_ui("computation_complete", pdf_path if pdf_path and Path(pdf_path).exists() else None)
+
+        pipeline_timer.finish()
+    else:
+        # 0 house blueprints → no PDF generated; signal API to mark offer as failed
+        pipeline_timer.finish()
+        sys.exit(2)
     return job_root, plans, floor_results
 
 if __name__ == "__main__":

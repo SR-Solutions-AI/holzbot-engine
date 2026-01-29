@@ -12,8 +12,7 @@ from typing import List
 # ✅ IMPORT CORECT
 from config.settings import load_plan_infos, PlanInfo, get_output_root_for_run
 
-# ✅ IMPORT CubiCasa
-from cubicasa_detector.jobs import run_cubicasa_for_plan
+# ⚠️ NU mai folosim CubiCasa - doar RasterScan este folosit
 
 STAGE_NAME = "scale"
 
@@ -44,7 +43,8 @@ def _run_for_single_plan(
     plan: PlanInfo
 ) -> ScaleJobResult:
     """
-    Rulează detecția scării pentru un singur plan folosind CubiCasa + Gemini.
+    Rulează detecția scării pentru un singur plan.
+    Folosește DOAR scale-ul calculat de RasterScan (nu mai există fallback la CubiCasa).
     """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -52,59 +52,85 @@ def _run_for_single_plan(
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → CubiCasa scale detection",
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → Scale detection",
             flush=True,
         )
         
-        # 🔥 FOLOSIM CUBICASA
-        cubicasa_result = run_cubicasa_for_plan(
-            plan_image=plan.plan_image,
-            output_dir=work_dir
-        )
+        # ✅ Verificăm dacă există scale calculat de RasterScan
+        # Calea corectă: walls_from_coords/room_scales.json (nu rooms/room_scales.json)
+        raster_room_scales_path = work_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
         
-        scale_info = cubicasa_result["scale_result"]
-        meters_per_pixel = float(scale_info["meters_per_pixel"])
+        if raster_room_scales_path.exists():
+            try:
+                with open(raster_room_scales_path, "r", encoding="utf-8") as f:
+                    raster_data = json.load(f)
+                
+                weighted_m_px = raster_data.get("weighted_average_m_px")
+                if weighted_m_px and weighted_m_px > 0:
+                    print(f"       ✅ Folosesc scale-ul din RasterScan: {weighted_m_px:.9f} m/px", flush=True)
+                    
+                    # Construim rezultatul în același format ca CubiCasa
+                    room_scales = raster_data.get("room_scales", {})
+                    rooms_used = len(room_scales)
+                    
+                    result = {
+                        "meters_per_pixel": float(weighted_m_px),
+                        "method": "raster_scan_gemini",
+                        "confidence": "high" if rooms_used >= 3 else "medium",
+                        "rooms_analyzed": rooms_used,
+                        "optimization_info": {
+                            "method": "weighted_average",
+                            "rooms_count": rooms_used
+                        },
+                        "per_room_details": [
+                            {
+                                "room_id": str(room_id),
+                                "room_name": room_data.get("room_name", "Unknown"),
+                                "area_m2": room_data.get("area_m2", 0.0),
+                                "m_px": room_data.get("m_px", 0.0)
+                            }
+                            for room_id, room_data in room_scales.items()
+                        ]
+                    }
+                    
+                    # Adaugă metadata
+                    result["meta"] = {
+                        "plan_id": plan.plan_id,
+                        "plan_image": str(plan.plan_image),
+                        "generated_at": datetime.utcnow().isoformat() + "Z",
+                        "stage": STAGE_NAME
+                    }
+                    
+                    # Salvează rezultatul
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                    
+                    print(
+                        f"✅ [{STAGE_NAME}] {plan.plan_id}: "
+                        f"{weighted_m_px:.6f} m/px ({rooms_used} camere) [RasterScan]",
+                        flush=True
+                    )
+                    
+                    return ScaleJobResult(
+                        plan_id=plan.plan_id,
+                        work_dir=work_dir,
+                        success=True,
+                        message=f"Scară detectată: {weighted_m_px:.6f} m/px ({rooms_used} camere) [RasterScan]",
+                        meters_per_pixel=float(weighted_m_px)
+                    )
+            except Exception as e:
+                print(f"       ⚠️ Eroare la citirea room_scales.json: {e}", flush=True)
         
-        # Adaptăm output-ul la formatul așteptat de pipeline
-        result = {
-            "meters_per_pixel": meters_per_pixel,
-            "method": "cubicasa_gemini",
-            "confidence": "high" if scale_info["rooms_used"] >= 3 else "medium",
-            "rooms_analyzed": scale_info["rooms_used"],
-            "optimization_info": scale_info["optimization_info"],
-            "per_room_details": scale_info.get("per_room", [])
-        }
-        
-        # Adaugă metadata
-        result["meta"] = {
-            "plan_id": plan.plan_id,
-            "plan_image": str(plan.plan_image),
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "stage": STAGE_NAME
-        }
-        
-        # Salvează rezultatul (ACELAȘI FORMAT ca înainte)
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        
-        # ✅ Salvează și rezultatul complet CubiCasa pentru cache
-        # FOLOSEȘTE PathEncoder pentru a converti Path → string
-        cache_file = work_dir / "cubicasa_result.json"
-        with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(cubicasa_result, f, indent=2, ensure_ascii=False, cls=PathEncoder)
-        
-        print(
-            f"✅ [{STAGE_NAME}] {plan.plan_id}: "
-            f"{meters_per_pixel:.6f} m/px ({scale_info['rooms_used']} camere)",
-            flush=True
-        )
+        # ⚠️ NU mai folosim fallback la CubiCasa - doar RasterScan este folosit
+        error_msg = f"Nu există scale calculat de RasterScan pentru {plan.plan_id}"
+        print(f"❌ [{STAGE_NAME}] {error_msg}", flush=True)
         
         return ScaleJobResult(
             plan_id=plan.plan_id,
             work_dir=work_dir,
-            success=True,
-            message=f"Scară detectată: {meters_per_pixel:.6f} m/px ({scale_info['rooms_used']} camere)",
-            meters_per_pixel=meters_per_pixel
+            success=False,
+            message=error_msg,
+            meters_per_pixel=None
         )
         
     except Exception as e:

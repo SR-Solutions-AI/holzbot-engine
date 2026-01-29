@@ -12,9 +12,6 @@ from typing import List
 # ✅ IMPORT CORECT
 from config.settings import load_plan_infos, PlanInfo, get_output_root_for_run
 
-# ✅ IMPORT NOU: CubiCasa Detector
-from cubicasa_detector.jobs import run_cubicasa_for_plan
-
 STAGE_NAME = "perimeter"
 
 
@@ -36,41 +33,39 @@ def _run_for_single_plan(
     plan: PlanInfo
 ) -> PerimeterJobResult:
     """
-    Rulează măsurarea perimetrului pentru un singur plan folosind CubiCasa.
+    Calculează perimetrul folosind datele deja existente din STEP 6 (Scale Detection).
     
-    Încearcă mai întâi să refolosească rezultatul de la etapa 'scale' (cache).
-    Dacă nu există, rulează CubiCasa din nou.
+    Nu rulează CubiCasa din nou - folosește datele calculate deja în cubicasa_result.json.
     """
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
-    # Verifică dacă avem deja rezultatul CubiCasa de la scale
+    # Citim datele deja calculate din STEP 6 (Scale Detection)
     scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
-    cubicasa_cache = scale_dir / "cubicasa_result.json"
+    cubicasa_result_path = scale_dir / "cubicasa_result.json"
     
     try:
         print(
-            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → perimeter from CubiCasa",
+            f"[{STAGE_NAME}] ({index}/{total}) {plan.plan_id} → perimeter from existing data",
             flush=True,
         )
         
-        # Încercăm să refolosim rezultatul de la scale (dacă există)
-        if cubicasa_cache.exists():
-            print(f"       ♻️  Refolosesc rezultatul CubiCasa din cache", flush=True)
-            with open(cubicasa_cache, "r", encoding="utf-8") as f:
-                cubicasa_result = json.load(f)
-        else:
-            # Rulăm CubiCasa din nou
-            print(f"       🔄 Rulare CubiCasa (cache lipsește)", flush=True)
-            cubicasa_result = run_cubicasa_for_plan(
-                plan_image=plan.plan_image,
-                output_dir=work_dir
+        if not cubicasa_result_path.exists():
+            error_msg = f"Nu există cubicasa_result.json pentru {plan.plan_id}. Rulează mai întâi STEP 6 (Scale Detection)."
+            print(f"❌ [{STAGE_NAME}] {error_msg}", flush=True)
+            return PerimeterJobResult(
+                plan_id=plan.plan_id,
+                work_dir=work_dir,
+                success=False,
+                message=error_msg,
+                exterior_meters=None,
+                interior_meters=None
             )
-            
-            # Salvăm pentru cache (pentru viitor)
-            cubicasa_cache.parent.mkdir(parents=True, exist_ok=True)
-            with open(cubicasa_cache, "w", encoding="utf-8") as f:
-                json.dump(cubicasa_result, f, indent=2, ensure_ascii=False)
+        
+        # Citim datele existente
+        print(f"       ✅ Folosesc datele din STEP 6 (Scale Detection)", flush=True)
+        with open(cubicasa_result_path, "r", encoding="utf-8") as f:
+            cubicasa_result = json.load(f)
         
         # Extragem măsurătorile
         measurements = cubicasa_result["measurements"]["metrics"]

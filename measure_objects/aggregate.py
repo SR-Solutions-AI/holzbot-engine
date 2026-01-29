@@ -48,28 +48,30 @@ def create_openings_all(
 
     # 3. Încărcăm statusul Exterior/Interior
     ext_doors_map = {} 
+    openings_status_map = {}  # Mapare idx -> status pentru workflow nou
     
     if exterior_doors_path.exists():
         try:
             with open(exterior_doors_path, "r", encoding="utf-8") as f:
                 ext_data = json.load(f)
-                
-            ext_list = ext_data.get("exterior_doors", [])
-            int_list = ext_data.get("interior_doors", [])
             
-            # Cheile în harta de status sunt bazate pe formatul [x1, y1, x2, y2]
-            for d in ext_list:
-                if "box_2d" in d:
-                    box_key = tuple(map(int, d["box_2d"]))
-                    ext_doors_map[box_key] = "exterior"
-            
-            for d in int_list:
-                if "box_2d" in d:
-                    box_key = tuple(map(int, d["box_2d"]))
-                    ext_doors_map[box_key] = "interior"
+            # Format nou: openings_measurements.json din raster_processing
+            if "openings" in ext_data:
+                for opening in ext_data.get("openings", []):
+                    bbox = opening.get("bbox", [])
+                    if bbox and len(bbox) == 4:
+                        box_key = tuple(map(int, bbox))
+                        status = opening.get("status", "unknown")
+                        if status in ["exterior", "interior"]:
+                            ext_doors_map[box_key] = status
+                    # De asemenea, mapăm pe idx pentru matching mai ușor
+                    idx = opening.get("idx")
+                    if idx is not None:
+                        openings_status_map[idx] = opening.get("status", "unknown")
+            # Format vechi ELIMINAT - nu mai folosim exterior_doors.json vechi
                     
         except Exception as e:
-            print(f"⚠️ Warning loading exterior_doors.json: {e}")
+            print(f"⚠️ Warning loading status source: {e}")
 
     # 4. Construim lista finală
     final_list = []

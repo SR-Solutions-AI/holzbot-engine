@@ -6,7 +6,7 @@ MODULE_DIR = Path(__file__).parent
 WEIGHTS_FILE = MODULE_DIR / "model_weights.pth"
 
 # Configurări Gemini
-GEMINI_MODEL = "gemini-2.0-flash-exp"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # Parametri detectare camere
 MIN_ROOM_AREA_M2 = 1.0

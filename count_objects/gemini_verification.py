@@ -15,7 +15,7 @@ def _init_gemini():
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY missing")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash-exp")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 
 def ask_gemini_comparison(gemini_model, reference_path: Path, candidate_path: Path, label: str, temp_dir: Path) -> bool:

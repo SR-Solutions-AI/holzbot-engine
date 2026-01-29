@@ -570,6 +570,789 @@ Answer ONLY: YES or NO"""
         return False
 
 
+def _detect_sub_clusters_in_image(crop_img: np.ndarray) -> list[list[int]]:
+    """
+    Detectează sub-clustere în imagine folosind morphological operations și analiză avansată.
+    Returnează o listă de box-uri [x1, y1, x2, y2] pentru fiecare zonă de interes detectată.
+    NU folosește gap-uri pentru a nu tăia conținutul.
+    """
+    # Convertim la grayscale și binarizăm
+    gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY) if len(crop_img.shape) == 3 else crop_img
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+    
+    h, w = binary.shape
+    print(f"     📐 Dimensiuni imagine: {w}x{h}px")
+
+    def _clip_box(box: list[int]) -> list[int]:
+        x1, y1, x2, y2 = box
+        x1 = int(max(0, min(w, x1)))
+        y1 = int(max(0, min(h, y1)))
+        x2 = int(max(0, min(w, x2)))
+        y2 = int(max(0, min(h, y2)))
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        return [x1, y1, x2, y2]
+
+    def _box_area(box: list[int]) -> int:
+        x1, y1, x2, y2 = box
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    def _content_area_in_box(box: list[int]) -> int:
+        x1, y1, x2, y2 = box
+        if x2 <= x1 or y2 <= y1:
+            return 0
+        region = binary[y1:y2, x1:x2]
+        return int(np.sum(region > 0))
+
+    def _is_inside(inner: list[int], outer: list[int], margin: int = 0) -> bool:
+        ix1, iy1, ix2, iy2 = inner
+        ox1, oy1, ox2, oy2 = outer
+        return (
+            ix1 >= ox1 + margin and iy1 >= oy1 + margin and
+            ix2 <= ox2 - margin and iy2 <= oy2 - margin
+        )
+
+    def _postprocess_nested_boxes(raw_boxes: list[list[int]], reason: str) -> list[list[int]]:
+        """
+        Heuristic:
+        - If we got 2+ boxes and the largest is basically the whole image while another is nested inside it,
+          then "subtract" the nested box from the big one by choosing the best remaining rectangle
+          around the nested box (top/bottom/left/right).
+        - If the top 2 boxes are approximate peers (similar area), do NOT subtract.
+        """
+        if not raw_boxes:
+            return raw_boxes
+
+        boxes = [_clip_box(b) for b in raw_boxes]
+        boxes = [b for b in boxes if _box_area(b) > 0]
+        if len(boxes) < 2:
+            return boxes
+
+        # Sort by area desc
+        boxes.sort(key=_box_area, reverse=True)
+        big = boxes[0]
+        small = None
+
+        big_area = _box_area(big)
+        img_area = w * h
+        big_ratio = big_area / float(img_area + 1e-9)
+
+        print(f"     🔍 Postprocess({reason}): Analizez {len(boxes)} box-uri")
+        print(f"        📦 Box mare: {big} (aria={big_area}px, ratio={big_ratio:.2f})")
+
+        # Find a clearly nested smaller box
+        # Strategy: if big covers most of the image (>80%) and we have a significantly smaller box,
+        # treat it as nested even if it touches the edges
+        for cand in boxes[1:]:
+            cand_area = _box_area(cand)
+            cand_ratio = cand_area / float(img_area + 1e-9)
+            peer_ratio_check = max(cand_area, 1) / float(max(big_area, 1))
+            
+            print(f"        📦 Candidat: {cand} (aria={cand_area}px, ratio={cand_ratio:.2f}, small/big={peer_ratio_check:.2f})")
+            
+            # Check if candidate is significantly smaller (not a peer)
+            if peer_ratio_check >= 0.55:
+                print(f"        ⚠️  Candidat este peer (small/big={peer_ratio_check:.2f} >= 0.55) → skip")
+                continue
+            
+            # If big covers most of the image, be more lenient with edge detection
+            is_strictly_inside = _is_inside(cand, big, margin=2)
+            is_loosely_inside = _is_inside(cand, big, margin=0)
+            
+            # Check if candidate overlaps significantly with big (at least 80% of small is inside big)
+            cx1, cy1, cx2, cy2 = cand
+            bx1, by1, bx2, by2 = big
+            
+            # Calculate intersection
+            inter_x1 = max(cx1, bx1)
+            inter_y1 = max(cy1, by1)
+            inter_x2 = min(cx2, bx2)
+            inter_y2 = min(cy2, by2)
+            
+            if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                overlap_ratio = inter_area / float(cand_area + 1e-9)
+                
+                print(f"        🔍 Overlap: {overlap_ratio:.2f} (strict={is_strictly_inside}, loose={is_loosely_inside})")
+                
+                # If big covers most of image AND small overlaps significantly with big, treat as nested
+                if big_ratio >= 0.80 and overlap_ratio >= 0.80:
+                    small = cand
+                    print(f"        ✅ Detectat ca inclus (big_ratio={big_ratio:.2f} >= 0.80, overlap={overlap_ratio:.2f} >= 0.80)")
+                    break
+                elif is_strictly_inside:
+                    small = cand
+                    print(f"        ✅ Detectat ca inclus (strict check cu margin=2)")
+                    break
+                elif is_loosely_inside:
+                    small = cand
+                    print(f"        ✅ Detectat ca inclus (loose check fără margin)")
+                    break
+            else:
+                print(f"        ❌ Nu se intersectează cu box-ul mare")
+
+        if small is None:
+            print(f"     ℹ️  Postprocess({reason}): Nu am găsit box mic inclus în box-ul mare → păstrez toate box-urile.")
+            return boxes
+
+        small_area = _box_area(small)
+        # If the top 2 are approximate peers, keep them (no subtraction).
+        peer_ratio = max(small_area, 1) / float(max(big_area, 1))
+        if peer_ratio >= 0.55:
+            print(f"     ℹ️  Postprocess({reason}): 2 box-uri aproximative (small/big={peer_ratio:.2f}) → NU scot din cluster.")
+            return boxes
+
+        # Only do subtraction when big is "almost whole image" (or very dominant).
+        if big_ratio < 0.80:
+            print(f"     ℹ️  Postprocess({reason}): big_ratio={big_ratio:.2f} (<0.80) → NU scot din cluster.")
+            return boxes
+
+        print(
+            f"     🧩 Postprocess({reason}): detectat box mare + box mic inclus → scot box-ul mic din box-ul mare\n"
+            f"        - big={big} (ratio={big_ratio:.2f})\n"
+            f"        - small={small} (small/big={peer_ratio:.2f})"
+        )
+
+        bx1, by1, bx2, by2 = big
+        sx1, sy1, sx2, sy2 = small
+
+        pad = max(10, min(w, h) // 80)  # small pad to avoid cutting near the boundary
+
+        candidates = []
+        # Top region
+        top_box = _clip_box([bx1, by1, bx2, sy1 - pad])
+        candidates.append(("top", top_box))
+        # Bottom region
+        bottom_box = _clip_box([bx1, sy2 + pad, bx2, by2])
+        candidates.append(("bottom", bottom_box))
+        # Left region
+        left_box = _clip_box([bx1, by1, sx1 - pad, by2])
+        candidates.append(("left", left_box))
+        # Right region
+        right_box = _clip_box([sx2 + pad, by1, bx2, by2])
+        candidates.append(("right", right_box))
+
+        print(f"        🔍 Generez 4 candidați pentru 'big minus small':")
+        for name, c in candidates:
+            a = _box_area(c)
+            print(f"          - {name}: {c} (aria={a}px)")
+
+        # Score candidates by (content_area, area) and keep the best one(s)
+        scored = []
+        min_keep_area = max(5000, img_area // 200)  # 0.5% of image or 5k px
+        print(f"        📊 Min area pentru candidat valid: {min_keep_area}px")
+        
+        for name, c in candidates:
+            a = _box_area(c)
+            if a < min_keep_area:
+                print(f"          ❌ {name}: aria={a}px < {min_keep_area}px → REJECTED")
+                continue
+            ca = _content_area_in_box(c)
+            if ca < min_keep_area:
+                print(f"          ❌ {name}: content_area={ca}px < {min_keep_area}px → REJECTED")
+                continue
+            scored.append((ca, a, name, c))
+            print(f"          ✅ {name}: content_area={ca}px, aria={a}px → ACCEPTED")
+
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+        if not scored:
+            print(f"     ⚠️  Postprocess({reason}): nu am găsit o zonă validă după scădere → păstrez box-urile originale.")
+            return boxes
+
+        best_name = scored[0][2]
+        best_big_minus_small = scored[0][3]
+        print(
+            f"        ✅ big_minus_small ales ({best_name}): {best_big_minus_small} "
+            f"(content={scored[0][0]}px, area={scored[0][1]}px)"
+        )
+
+        # Return: small (explicit) + big-minus-small (replacing big).
+        # Also keep any other boxes that are neither big nor small, to allow overlaps if present.
+        # IMPORTANT: Exclude 'big' explicitly since we're replacing it with 'best_big_minus_small'
+        others = [b for b in boxes[1:] if b != small and b != big and not _is_inside(b, small, margin=0)]
+        out = [small, best_big_minus_small] + others
+        
+        print(f"        📤 Return: {len(out)} box-uri (small={small}, big_minus_small={best_big_minus_small}, others={len(others)})")
+        
+        # Dedup (stable)
+        dedup = []
+        for b in out:
+            if b not in dedup:
+                dedup.append(b)
+        
+        print(f"        ✅ Final: {len(dedup)} box-uri unice returnate")
+        return dedup
+    
+    # Strategie 1: Folosim morphological operations pentru a separa zonele conectate
+    # Aplicăm eroziune pentru a separa zonele care sunt conectate doar prin linii subțiri
+    print(f"     🔍 Strategie 1: Separare zone folosind morphological operations...")
+    kernel_size = max(15, min(w, h) // 30)  # Kernel adaptiv pentru separare
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    print(f"        ⚙️  Kernel size: {kernel_size}x{kernel_size}px")
+    
+    # MORPH_OPEN pentru a separa zonele conectate prin linii subțiri
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+    
+    # MORPH_CLOSE pentru a umple găurile mici în fiecare zonă
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Connected components pe imaginea procesată
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    print(f"        🔗 Găsite {num_labels-1} componente conectate")
+    
+    components = []
+    min_area = max(5000, (w * h) // 100)  # Minim 1% din imagine pentru a fi considerat zonă de interes
+    print(f"        📊 Min area pentru zonă de interes: {min_area}px")
+    
+    for i in range(1, num_labels):
+        x, y, w_comp, h_comp, area = stats[i]
+        if area > min_area:
+            # Extindem bounding box-ul pentru a include conținutul complet din zona originală
+            margin = max(20, min(w, h) // 30)
+            x_expanded = max(0, x - margin)
+            y_expanded = max(0, y - margin)
+            x2_expanded = min(w, x + w_comp + margin)
+            y2_expanded = min(h, y + h_comp + margin)
+            
+            # Verificăm dacă există conținut în zona extinsă din imaginea originală
+            expanded_region = binary[y_expanded:y2_expanded, x_expanded:x2_expanded]
+            content_area = np.sum(expanded_region > 0)
+            if content_area > min_area:
+                components.append((i, area, content_area, x_expanded, y_expanded, x2_expanded, y2_expanded))
+                print(f"        ✅ Componentă {i}: bbox=[{x_expanded}, {y_expanded}, {x2_expanded}, {y2_expanded}], comp_area={area}px, content_area={content_area}px")
+    
+    components.sort(key=lambda x: x[2], reverse=True)  # Sortăm după content_area
+    
+    boxes = []
+    padding = max(10, min(w, h) // 50)
+    
+    # Luăm primele 2-3 componente mari
+    for i, (label_idx, comp_area, content_area, x1, y1, x2, y2) in enumerate(components[:3]):
+        box = [
+            max(0, x1 - padding),
+            max(0, y1 - padding),
+            min(w, x2 + padding),
+            min(h, y2 + padding)
+        ]
+        boxes.append(box)
+        print(f"        📦 Zone {i+1}: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, content_area={content_area}px")
+    
+    if len(boxes) >= 2:
+        print(f"     ✅ Strategie 1 SUCCES: Detectat {len(boxes)} zone de interes folosind morphological separation.")
+        return boxes
+    else:
+        print(f"     ⚠️  Strategie 1 FAILED: Găsite doar {len(boxes)} zone (necesare minim 2)")
+    
+    # Strategie 2: Folosim Watershed algorithm pentru separare avansată
+    print(f"     🔍 Strategie 2: Watershed algorithm pentru separare avansată...")
+    try:
+        # Distance transform pentru a găsi centroidele zonelor
+        dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        
+        # Găsim maximurile locale (centroidele zonelor)
+        _, sure_fg = cv2.threshold(dist_transform, 0.7 * dist_transform.max(), 255, 0)
+        sure_fg = np.uint8(sure_fg)
+        
+        # Marker-based watershed
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers = markers + 1
+        markers[binary == 0] = 0
+        
+        # Aplicăm watershed
+        markers = cv2.watershed(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), markers)
+        
+        # Extragem zonele unice (excludem marker-ul -1 care reprezintă granițele)
+        unique_markers = np.unique(markers)
+        unique_markers = unique_markers[unique_markers > 1]  # Excludem background (0) și granițe (-1)
+        print(f"        🔗 Găsite {len(unique_markers)} zone distincte cu watershed")
+        
+        boxes = []
+        padding = max(10, min(w, h) // 50)
+        min_area = max(5000, (w * h) // 100)
+        
+        for marker_id in unique_markers:
+            mask = (markers == marker_id).astype(np.uint8) * 255
+            coords = np.where(mask > 0)
+            if coords[0].size > min_area:
+                y_min, y_max = coords[0].min(), coords[0].max()
+                x_min, x_max = coords[1].min(), coords[1].max()
+                area = coords[0].size
+                box = [
+                    max(0, x_min - padding),
+                    max(0, y_min - padding),
+                    min(w, x_max + padding),
+                    min(h, y_max + padding)
+                ]
+                boxes.append((area, box))
+                print(f"        📦 Zone watershed {marker_id}: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, area={area}px")
+        
+        # Sortăm după arie și luăm primele 2-3
+        boxes.sort(key=lambda x: x[0], reverse=True)
+        boxes = [box for _, box in boxes[:3]]
+        
+        if len(boxes) >= 2:
+            print(f"     ✅ Strategie 2 SUCCES: Detectat {len(boxes)} zone de interes folosind watershed.")
+            return boxes
+        else:
+            print(f"     ⚠️  Strategie 2 FAILED: Găsite doar {len(boxes)} zone (necesare minim 2)")
+    except Exception as e:
+        print(f"     ⚠️  Strategie 2 FAILED: Eroare la watershed - {e}")
+    
+    # Strategie 3 (Fallback): Folosim contururi pentru a găsi zonele de conținut
+    print(f"     🔍 Strategie 3: Folosesc contururi pentru a găsi zonele de conținut...")
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    print(f"        🔗 Găsite {len(contours)} contururi")
+    
+    # Sortăm contururile după arie
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    boxes = []
+    padding = max(10, min(w, h) // 50)
+    min_area = max(5000, (w * h) // 100)  # Minim 1% din imagine
+    print(f"        📊 Min area pentru contur: {min_area}px")
+    
+    # Luăm primele 2-3 contururi mari
+    for i, contour in enumerate(contours[:5]):  # Verificăm primele 5 pentru a avea opțiuni
+        area = cv2.contourArea(contour)
+        if area > min_area:
+            x, y, w_cont, h_cont = cv2.boundingRect(contour)
+            box = [
+                max(0, x - padding),
+                max(0, y - padding),
+                min(w, x + w_cont + padding),
+                min(h, y + h_cont + padding)
+            ]
+            boxes.append((area, box))
+            print(f"        📦 Contur {i+1}: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, aria={area}px")
+    
+    # Sortăm după arie și luăm primele 2-3
+    boxes.sort(key=lambda x: x[0], reverse=True)
+    boxes = [box for _, box in boxes[:3]]
+    
+    if len(boxes) >= 2:
+        print(f"     ✅ Strategie 3 SUCCES: Detectat {len(boxes)} zone de interes folosind contururi.")
+        return boxes
+    else:
+        print(f"     ⚠️  Strategie 3 FAILED: Găsite doar {len(boxes)} zone (necesare minim 2)")
+    
+    # Strategie 4 (Ultim fallback): folosim analiza densității pentru a găsi zonele de conținut maxim
+    # NU folosim gap-uri, ci doar identificăm zonele cu conținut maxim pe fiecare jumătate
+    print(f"     🔍 Strategie 4: Analiză densitate pentru zone de conținut maxim (fără gap-uri)...")
+    
+    # Analizăm densitatea pe axe
+    col_density = np.sum(binary > 0, axis=0)
+    row_density = np.sum(binary > 0, axis=1)
+    
+    boxes = []
+    padding = max(10, min(w, h) // 50)
+    
+    # Găsim zonele cu densitate maximă pe fiecare jumătate a imaginii
+    if w > h:
+        # Vertical: analizăm stânga și dreapta
+        print(f"        📐 Imagine lată ({w}x{h}), analizez stânga și dreapta")
+        left_half = col_density[:w//2]
+        right_half = col_density[w//2:]
+        
+        # Găsim zonele cu conținut în fiecare jumătate (nu folosim gap-uri, ci doar conținutul)
+        left_max = np.max(left_half) if len(left_half) > 0 else 0
+        right_max = np.max(right_half) if len(right_half) > 0 else 0
+        threshold = 0.3  # 30% din maxim pentru a identifica zonele cu conținut
+        
+        left_content = np.where(left_half > left_max * threshold)[0] if left_max > 0 else []
+        right_content = np.where(right_half > right_max * threshold)[0] if right_max > 0 else []
+        
+        print(f"        📊 Stânga: max_density={left_max}, content_zones={len(left_content)}")
+        print(f"        📊 Dreapta: max_density={right_max}, content_zones={len(right_content)}")
+        
+        if len(left_content) > 0 and len(right_content) > 0:
+            # Zona stânga - luăm întreaga zonă cu conținut
+            left_band = binary[:, :w//2]
+            left_coords = np.where(left_band > 0)
+            if left_coords[0].size > 0:
+                y_min, y_max = left_coords[0].min(), left_coords[0].max()
+                x_min, x_max = left_coords[1].min(), left_coords[1].max()
+                box = [
+                    max(0, x_min - padding),
+                    max(0, y_min - padding),
+                    min(w, x_max + padding),
+                    min(h, y_max + padding)
+                ]
+                boxes.append((left_coords[0].size, box))
+                print(f"        📦 Zone stânga: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, area={left_coords[0].size}px")
+            
+            # Zona dreapta - luăm întreaga zonă cu conținut
+            right_band = binary[:, w//2:]
+            right_coords = np.where(right_band > 0)
+            if right_coords[0].size > 0:
+                y_min, y_max = right_coords[0].min(), right_coords[0].max()
+                x_min, x_max = right_coords[1].min(), right_coords[1].max()
+                box = [
+                    max(0, w//2 + x_min - padding),
+                    max(0, y_min - padding),
+                    min(w, w//2 + x_max + padding),
+                    min(h, y_max + padding)
+                ]
+                boxes.append((right_coords[0].size, box))
+                print(f"        📦 Zone dreapta: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, area={right_coords[0].size}px")
+    else:
+        # Orizontal: analizăm sus și jos
+        print(f"        📐 Imagine înaltă ({w}x{h}), analizez sus și jos")
+        top_half = row_density[:h//2]
+        bottom_half = row_density[h//2:]
+        
+        top_max = np.max(top_half) if len(top_half) > 0 else 0
+        bottom_max = np.max(bottom_half) if len(bottom_half) > 0 else 0
+        threshold = 0.3
+        
+        top_content = np.where(top_half > top_max * threshold)[0] if top_max > 0 else []
+        bottom_content = np.where(bottom_half > bottom_max * threshold)[0] if bottom_max > 0 else []
+        
+        print(f"        📊 Sus: max_density={top_max}, content_zones={len(top_content)}")
+        print(f"        📊 Jos: max_density={bottom_max}, content_zones={len(bottom_content)}")
+        
+        if len(top_content) > 0 and len(bottom_content) > 0:
+            # Zona de sus - luăm întreaga zonă cu conținut
+            top_band = binary[:h//2, :]
+            top_coords = np.where(top_band > 0)
+            if top_coords[0].size > 0:
+                y_min, y_max = top_coords[0].min(), top_coords[0].max()
+                x_min, x_max = top_coords[1].min(), top_coords[1].max()
+                box = [
+                    max(0, x_min - padding),
+                    max(0, y_min - padding),
+                    min(w, x_max + padding),
+                    min(h, y_max + padding)
+                ]
+                boxes.append((top_coords[0].size, box))
+                print(f"        📦 Zone sus: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, area={top_coords[0].size}px")
+            
+            # Zona de jos - luăm întreaga zonă cu conținut
+            bottom_band = binary[h//2:, :]
+            bottom_coords = np.where(bottom_band > 0)
+            if bottom_coords[0].size > 0:
+                y_min, y_max = bottom_coords[0].min(), bottom_coords[0].max()
+                x_min, x_max = bottom_coords[1].min(), bottom_coords[1].max()
+                box = [
+                    max(0, x_min - padding),
+                    max(0, h//2 + y_min - padding),
+                    min(w, x_max + padding),
+                    min(h, h//2 + y_max + padding)
+                ]
+                boxes.append((bottom_coords[0].size, box))
+                print(f"        📦 Zone jos: bbox={box}, dimensiuni={box[2]-box[0]}x{box[3]-box[1]}px, area={bottom_coords[0].size}px")
+    
+    # Sortăm după arie
+    boxes.sort(key=lambda x: x[0], reverse=True)
+    boxes = [box for _, box in boxes]
+    
+    if len(boxes) >= 2:
+        print(f"     ✅ Strategie 4 SUCCES: Detectat {len(boxes)} zone de interes folosind analiza densității pe jumătăți.")
+        return boxes
+    else:
+        print(f"     ⚠️  Strategie 4 FAILED: Găsite doar {len(boxes)} zone (necesare minim 2)")
+    
+    # Dacă tot nu găsim, returnăm întreaga imagine ca o singură zonă
+    print(f"     ⚠️ Nu am putut detecta zone separate. Returnez întreaga imagine.")
+    return [[0, 0, w, h]]
+
+
+def _check_blueprint_and_sideview_in_cluster(crop_img: np.ndarray) -> bool:
+    """
+    Verifică dacă cluster-ul conține atât un blueprint cât și un sideview.
+    Folosește același sistem robust de clasificare ca pentru clustere, dar cu prompt explicit
+    care verifică dacă există ambele tipuri în imagine.
+    """
+    try:
+        from .classifier import prep_for_vlm, pil_to_base64, parse_label, setup_gemini_client
+        import os
+        from openai import OpenAI
+        from PIL import Image
+        import tempfile
+        
+        # Setup clients pentru clasificare
+        gpt_client = None
+        gemini_client = None
+        
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            try:
+                gpt_client = OpenAI(api_key=openai_key)
+            except:
+                pass
+        
+        gemini_client = setup_gemini_client()
+        
+        if not gpt_client and not gemini_client:
+            print("     ⚠️ Nu pot clasifica - lipsesc API keys. Presupun că nu are blueprint + sideview.")
+            return False
+        
+        # Salvăm temporar crop-ul pentru clasificare
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            cv2.imwrite(str(tmp_path), crop_img)
+        
+        try:
+            # Prompt explicit care întreabă dacă există ambele tipuri
+            PROMPT_MIXED = """You are an EXPERT architectural drawing classifier.
+
+This image may contain MULTIPLE types of architectural drawings side by side.
+
+Analyze the image carefully and determine if it contains BOTH:
+1. A FLOOR PLAN (house_blueprint or site_blueprint) - showing rooms, walls, or property layout from above
+2. A SIDE VIEW/ELEVATION (side_view) - showing the building facade from the side
+
+If the image contains BOTH types, respond with: "mixed_blueprint_sideview"
+If it contains ONLY a floor plan, respond with: "blueprint_only"
+If it contains ONLY a side view, respond with: "sideview_only"
+If it contains NEITHER (or is text_area), respond with: "neither"
+
+Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sideview_only | neither"""
+            
+            # Încercăm mai întâi cu GPT
+            has_both = False
+            if gpt_client:
+                try:
+                    pil_img = prep_for_vlm(tmp_path)
+                    b64 = pil_to_base64(pil_img)
+                    
+                    response = gpt_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": PROMPT_MIXED},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                                    }
+                                ]
+                            }
+                        ],
+                        temperature=0.0,
+                        max_tokens=50
+                    )
+                    
+                    result = response.choices[0].message.content.strip().lower()
+                    print(f"     📋 GPT mixed classification: {result}")
+                    
+                    if "mixed_blueprint_sideview" in result:
+                        has_both = True
+                        print(f"     ✅ GPT detectat blueprint + sideview în același cluster!")
+                        return True
+                except Exception as e:
+                    print(f"     ⚠️ GPT mixed classification failed: {e}")
+            
+            # Dacă GPT nu a detectat, încercăm cu Gemini
+            if not has_both and gemini_client:
+                try:
+                    pil_img = prep_for_vlm(tmp_path)
+                    
+                    response = gemini_client.generate_content(
+                        [PROMPT_MIXED, pil_img],
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_output_tokens": 50,
+                        }
+                    )
+                    
+                    if response.parts:
+                        result = response.text.strip().lower()
+                        print(f"     📋 Gemini mixed classification: {result}")
+                        
+                        if "mixed_blueprint_sideview" in result:
+                            has_both = True
+                            print(f"     ✅ Gemini detectat blueprint + sideview în același cluster!")
+                            return True
+                except Exception as e:
+                    print(f"     ⚠️ Gemini mixed classification failed: {e}")
+            
+            # Dacă niciunul nu a detectat mixed, folosim metoda de detectare cluster:
+            # analizăm densitatea pentru a găsi gap-uri și să împărțim inteligent
+            if not has_both:
+                from .classifier import classify_image_robust
+                
+                # Detectăm clustere în imagine folosind analiza densității
+                sub_clusters = _detect_sub_clusters_in_image(crop_img)
+                
+                if len(sub_clusters) >= 2:
+                    print(f"     🔍 Detectat {len(sub_clusters)} sub-clustere în imagine")
+                    
+                    # Clasificăm fiecare sub-cluster
+                    tmp_paths = []
+                    try:
+                        for idx, (x1, y1, x2, y2) in enumerate(sub_clusters):
+                            # Crop la sub-cluster
+                            sub_crop = crop_img[y1:y2, x1:x2]
+                            
+                            # Salvăm temporar
+                            with tempfile.NamedTemporaryFile(suffix=f'_sub{idx}.jpg', delete=False) as tmp_sub:
+                                tmp_sub_path = Path(tmp_sub.name)
+                                cv2.imwrite(str(tmp_sub_path), sub_crop)
+                                tmp_paths.append(tmp_sub_path)
+                            
+                            # Clasificăm sub-cluster-ul
+                            result_sub = classify_image_robust(tmp_sub_path, gpt_client, gemini_client)
+                            label_sub = result_sub.label if result_sub else None
+                            
+                            print(f"     📋 Sub-cluster {idx+1} ({x1},{y1}-{x2},{y2}): {label_sub}")
+                            
+                            # Verificăm dacă avem blueprint și sideview în sub-clustere diferite
+                            if label_sub in ("house_blueprint", "site_blueprint"):
+                                # Căutăm sideview în celelalte sub-clustere
+                                for idx2, (x1_2, y1_2, x2_2, y2_2) in enumerate(sub_clusters):
+                                    if idx2 == idx:
+                                        continue
+                                    
+                                    with tempfile.NamedTemporaryFile(suffix=f'_sub{idx2}.jpg', delete=False) as tmp_sub2:
+                                        tmp_sub2_path = Path(tmp_sub2.name)
+                                        sub_crop2 = crop_img[y1_2:y2_2, x1_2:x2_2]
+                                        cv2.imwrite(str(tmp_sub2_path), sub_crop2)
+                                    
+                                    result_sub2 = classify_image_robust(tmp_sub2_path, gpt_client, gemini_client)
+                                    label_sub2 = result_sub2.label if result_sub2 else None
+                                    
+                                    if label_sub2 == "side_view":
+                                        print(f"     ✅ Detectat blueprint + sideview în sub-clustere separate!")
+                                        # Ștergem fișierele temporare
+                                        for tp in tmp_paths:
+                                            try:
+                                                tp.unlink()
+                                            except:
+                                                pass
+                                        try:
+                                            tmp_sub2_path.unlink()
+                                        except:
+                                            pass
+                                        return True
+                                    
+                                    try:
+                                        tmp_sub2_path.unlink()
+                                    except:
+                                        pass
+                            
+                            elif label_sub == "side_view":
+                                # Căutăm blueprint în celelalte sub-clustere
+                                for idx2, (x1_2, y1_2, x2_2, y2_2) in enumerate(sub_clusters):
+                                    if idx2 == idx:
+                                        continue
+                                    
+                                    with tempfile.NamedTemporaryFile(suffix=f'_sub{idx2}.jpg', delete=False) as tmp_sub2:
+                                        tmp_sub2_path = Path(tmp_sub2.name)
+                                        sub_crop2 = crop_img[y1_2:y2_2, x1_2:x2_2]
+                                        cv2.imwrite(str(tmp_sub2_path), sub_crop2)
+                                    
+                                    result_sub2 = classify_image_robust(tmp_sub2_path, gpt_client, gemini_client)
+                                    label_sub2 = result_sub2.label if result_sub2 else None
+                                    
+                                    if label_sub2 in ("house_blueprint", "site_blueprint"):
+                                        print(f"     ✅ Detectat blueprint + sideview în sub-clustere separate!")
+                                        # Ștergem fișierele temporare
+                                        for tp in tmp_paths:
+                                            try:
+                                                tp.unlink()
+                                            except:
+                                                pass
+                                        try:
+                                            tmp_sub2_path.unlink()
+                                        except:
+                                            pass
+                                        return True
+                                    
+                                    try:
+                                        tmp_sub2_path.unlink()
+                                    except:
+                                        pass
+                        
+                        print(f"     ℹ️ Cluster nu conține blueprint + sideview în sub-clustere separate.")
+                        
+                    finally:
+                        # Ștergem fișierele temporare
+                        for tp in tmp_paths:
+                            try:
+                                tp.unlink()
+                            except:
+                                pass
+                else:
+                    print(f"     ⚠️ Nu am găsit suficiente sub-clustere ({len(sub_clusters)} < 2). Folosesc metoda simplă de split.")
+                    
+                    # Fallback la metoda simplă dacă nu găsim clustere
+                    h, w = crop_img.shape[:2]
+                    
+                    # Împărțim cluster-ul în 2 părți (vertical sau orizontal)
+                    if w > h:
+                        # Cluster lat - verificăm stânga și dreapta
+                        left_crop = crop_img[:, :w//2]
+                        right_crop = crop_img[:, w//2:]
+                    else:
+                        # Cluster înalt - verificăm sus și jos
+                        left_crop = crop_img[:h//2, :]
+                        right_crop = crop_img[h//2:, :]
+                    
+                    # Salvăm temporar ambele părți
+                    with tempfile.NamedTemporaryFile(suffix='_left.jpg', delete=False) as tmp_left:
+                        tmp_left_path = Path(tmp_left.name)
+                        cv2.imwrite(str(tmp_left_path), left_crop)
+                    
+                    with tempfile.NamedTemporaryFile(suffix='_right.jpg', delete=False) as tmp_right:
+                        tmp_right_path = Path(tmp_right.name)
+                        cv2.imwrite(str(tmp_right_path), right_crop)
+                    
+                    try:
+                        # Clasificăm ambele părți folosind sistemul robust
+                        result_left = classify_image_robust(tmp_left_path, gpt_client, gemini_client)
+                        result_right = classify_image_robust(tmp_right_path, gpt_client, gemini_client)
+                        
+                        label_left = result_left.label if result_left else None
+                        label_right = result_right.label if result_right else None
+                        
+                        print(f"     📋 Partea stânga/sus: {label_left}")
+                        print(f"     📋 Partea dreapta/jos: {label_right}")
+                        
+                        # Verificăm dacă una este blueprint și cealaltă este sideview
+                        left_is_blueprint = label_left in ("house_blueprint", "site_blueprint")
+                        left_is_sideview = label_left == "side_view"
+                        right_is_blueprint = label_right in ("house_blueprint", "site_blueprint")
+                        right_is_sideview = label_right == "side_view"
+                        
+                        has_both = (left_is_blueprint and right_is_sideview) or (left_is_sideview and right_is_blueprint)
+                        
+                        if has_both:
+                            print(f"     ✅ Detectat blueprint + sideview în același cluster (metodă simplă split)!")
+                            return True
+                        else:
+                            print(f"     ℹ️ Cluster nu conține blueprint + sideview împreună.")
+                            return False
+                            
+                    finally:
+                        # Ștergem fișierele temporare
+                        try:
+                            tmp_left_path.unlink()
+                            tmp_right_path.unlink()
+                        except:
+                            pass
+            
+            return False
+                    
+        finally:
+            # Ștergem fișierul temporar
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+                
+    except Exception as e:
+        import traceback
+        print(f"     ⚠️ Eroare la verificare blueprint + sideview: {e}")
+        print(f"     ⚠️ Traceback: {traceback.format_exc()}")
+        return False
+
+
 def _ask_ai_how_many_buildings_in_cluster(crop_img: np.ndarray) -> int:
     """
     ✅ FUNCȚIE NOUĂ: Întreabă AI-ul câte clădiri separate există într-un cluster.
@@ -1072,12 +1855,154 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
                 print(f"   ⚠️  Nu pot împărți geometric. Păstrez original.")
                 final_validated_boxes.append([x1, y1, x2, y2])
         else:
-            print(f"   ✅ AI confirmă: 1 clădire. OK.")
-            final_validated_boxes.append([x1, y1, x2, y2])
+            print(f"   ✅ AI confirmă: 1 clădire. Verific dacă conține blueprint + sideview...")
+            
+            # Verificăm dacă cluster-ul conține atât blueprint cât și sideview
+            has_blueprint_and_sideview = _check_blueprint_and_sideview_in_cluster(crop)
+            
+            if has_blueprint_and_sideview:
+                print(f"   ⚠️  Detectat blueprint + sideview în același cluster!")
+                print(f"   📐 Cluster original: [{x1}, {y1}, {x2}, {y2}] (dimensiuni: {x2-x1}x{y2-y1})")
+                print(f"   🗑️  Elimin cluster-ul mare original și generează sub-clustere...")
+                print(f"   🔧 Încerc să detectez sub-clustere în imagine...")
+                
+                # Folosim algoritmul inteligent de detectare a sub-clusterelor
+                sub_clusters = _detect_sub_clusters_in_image(crop)
+                
+                if len(sub_clusters) >= 2:
+                    print(f"   ✅ Detectat {len(sub_clusters)} sub-clustere în imagine")
+                    # Adăugăm offset-ul cluster-ului original și eliminăm cluster-ul mare
+                    for idx, (sub_x1, sub_y1, sub_x2, sub_y2) in enumerate(sub_clusters, 1):
+                        adjusted_box = [
+                            x1 + sub_x1,
+                            y1 + sub_y1,
+                            x1 + sub_x2,
+                            y1 + sub_y2
+                        ]
+                        print(f"      📦 Sub-cluster {idx}: local=[{sub_x1}, {sub_y1}, {sub_x2}, {sub_y2}] → global={adjusted_box} (dimensiuni: {adjusted_box[2]-adjusted_box[0]}x{adjusted_box[3]-adjusted_box[1]})")
+                        final_validated_boxes.append(adjusted_box)
+                    print(f"   ✅ Cluster mare eliminat. Înlocuit cu {len(sub_clusters)} sub-clustere folosind detectare geometrică.")
+                else:
+                    print(f"   ⚠️ Nu am găsit suficiente sub-clustere ({len(sub_clusters)} < 2). Folosesc split geometric cu _split_cluster_by_buildings...")
+                    # Fallback: folosim _split_cluster_by_buildings cu expected_count=2
+                    split_boxes = _split_cluster_by_buildings(crop, x1, y1, expected_count=2)
+                    
+                    if len(split_boxes) >= 2:
+                        print(f"   ✅ _split_cluster_by_buildings a găsit {len(split_boxes)} clustere")
+                        for idx, split_box in enumerate(split_boxes, 1):
+                            print(f"      📦 Sub-cluster {idx}: {split_box} (dimensiuni: {split_box[2]-split_box[0]}x{split_box[3]-split_box[1]})")
+                        print(f"   ✅ Cluster mare eliminat. Înlocuit cu {len(split_boxes)} sub-clustere.")
+                        final_validated_boxes.extend(split_boxes)
+                    else:
+                        print(f"   ⚠️ _split_cluster_by_buildings nu a găsit clustere. Folosesc split simplu pe jumătate ca ultim fallback...")
+                        # Ultim fallback: split simplu pe jumătate
+                        h_crop, w_crop = crop.shape[:2]
+                        if w_crop > h_crop:
+                            # Cluster lat - împărțim vertical (pe jumătate)
+                            mid_x = x1 + w_crop // 2
+                            box1 = [x1, y1, mid_x, y2]
+                            box2 = [mid_x, y1, x2, y2]
+                            print(f"      📦 Sub-cluster 1: {box1} (dimensiuni: {box1[2]-box1[0]}x{box1[3]-box1[1]})")
+                            print(f"      📦 Sub-cluster 2: {box2} (dimensiuni: {box2[2]-box2[0]}x{box2[3]-box2[1]})")
+                            final_validated_boxes.append(box1)
+                            final_validated_boxes.append(box2)
+                            print(f"   ✅ Cluster mare eliminat. Împărțit vertical în 2 clustere (fallback simplu).")
+                        else:
+                            # Cluster înalt - împărțim orizontal (pe jumătate)
+                            mid_y = y1 + h_crop // 2
+                            box1 = [x1, y1, x2, mid_y]
+                            box2 = [x1, mid_y, x2, y2]
+                            print(f"      📦 Sub-cluster 1: {box1} (dimensiuni: {box1[2]-box1[0]}x{box1[3]-box1[1]})")
+                            print(f"      📦 Sub-cluster 2: {box2} (dimensiuni: {box2[2]-box2[0]}x{box2[3]-box2[1]})")
+                            final_validated_boxes.append(box1)
+                            final_validated_boxes.append(box2)
+                            print(f"   ✅ Cluster mare eliminat. Împărțit orizontal în 2 clustere (fallback simplu).")
+                # NU adăugăm cluster-ul original - l-am eliminat și l-am înlocuit cu sub-clustere
+            else:
+                print(f"   ✅ Cluster OK (nu conține blueprint + sideview).")
+                final_validated_boxes.append([x1, y1, x2, y2])
     
     final_validated_boxes.sort(key=lambda b: (b[1], b[0]))
     
     print(f"\n📊 Rezultat: {len(filtered)} → {len(final_validated_boxes)} clustere finale")
+
+    # 7.5. Fill background pentru imagini mici incluse în imagini mari
+    def _fill_small_clusters_in_large(orig_img: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, list[list[int]]]:
+        """
+        Dacă există o imagine mare și una/mai multe mici incluse în ea,
+        face fill cu background color în imaginea mare la coordonatele imaginilor mici.
+        """
+        if len(boxes) < 2:
+            return orig_img, boxes
+        
+        h, w = orig_img.shape[:2]
+        img_area = w * h
+        
+        # Calculăm ariile și ratio-urile
+        boxes_with_info = []
+        for box in boxes:
+            bx1, by1, bx2, by2 = box
+            area = (bx2 - bx1) * (by2 - by1)
+            ratio = area / float(img_area)
+            boxes_with_info.append((box, area, ratio))
+        
+        # Sortăm după arie (descrescător)
+        boxes_with_info.sort(key=lambda x: x[1], reverse=True)
+        
+        # Detectăm dacă primul box este mare (>80% din imagine)
+        if boxes_with_info[0][2] < 0.80:
+            return orig_img, boxes
+        
+        big_box, big_area, big_ratio = boxes_with_info[0]
+        big_x1, big_y1, big_x2, big_y2 = big_box
+        
+        # Detectăm box-uri mici incluse în box-ul mare
+        small_boxes = []
+        for box, area, ratio in boxes_with_info[1:]:
+            sx1, sy1, sx2, sy2 = box
+            
+            # Verificăm dacă box-ul mic este inclus în box-ul mare (cu margin mic)
+            if (sx1 >= big_x1 and sy1 >= big_y1 and sx2 <= big_x2 and sy2 <= big_y2):
+                # Verificăm că nu este un peer (să fie semnificativ mai mic)
+                peer_ratio = area / float(big_area)
+                if peer_ratio < 0.55:  # Nu este peer
+                    small_boxes.append(box)
+        
+        if not small_boxes:
+            return orig_img, boxes
+        
+        print(f"\n🎨 Detectat {len(small_boxes)} imagini mici incluse în imaginea mare")
+        print(f"   📦 Imagine mare: {big_box} (ratio={big_ratio:.2f})")
+        for idx, small_box in enumerate(small_boxes, 1):
+            small_area = (small_box[2] - small_box[0]) * (small_box[3] - small_box[1])
+            print(f"   📦 Imagine mică {idx}: {small_box} (aria={small_area}px)")
+        
+        # Calculăm culoarea background-ului (media colțurilor imaginii mari)
+        big_crop = orig_img[big_y1:big_y2, big_x1:big_x2]
+        h_crop, w_crop = big_crop.shape[:2]
+        
+        # Media colțurilor pentru background
+        corners = [
+            big_crop[0, 0],  # top-left
+            big_crop[0, w_crop-1],  # top-right
+            big_crop[h_crop-1, 0],  # bottom-left
+            big_crop[h_crop-1, w_crop-1]  # bottom-right
+        ]
+        background_color = np.mean(corners, axis=0).astype(np.uint8)
+        print(f"   🎨 Culoare background detectată: {background_color}")
+        
+        # Facem fill în imaginea mare la coordonatele imaginilor mici
+        modified_img = orig_img.copy()
+        for small_box in small_boxes:
+            sx1, sy1, sx2, sy2 = small_box
+            # Facem fill complet cu background color
+            modified_img[sy1:sy2, sx1:sx2] = background_color
+            print(f"   ✅ Fill aplicat la {small_box}")
+        
+        return modified_img, boxes
+    
+    # Aplicăm fill-ul dacă este necesar
+    orig, final_validated_boxes = _fill_small_clusters_in_large(orig, final_validated_boxes)
 
     # 8. Output
     result = orig.copy()

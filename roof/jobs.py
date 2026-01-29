@@ -112,17 +112,37 @@ def _run_for_single_plan(
     # STEP 2: Încarcă date pentru CALCUL
     # ==========================================
     
-    # INPUT FILES
+    # INPUT FILES - Verificăm datele din raster_processing (prioritate)
+    scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
+    raster_room_scales = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+    
     area_dir = work_dir.parent.parent / "area" / plan.plan_id
     area_json = area_dir / "areas_calculated.json"
     
-    if not area_json.exists():
-        return RoofJobResult(
-            plan_id=plan.plan_id,
-            work_dir=work_dir,
-            success=False,
-            message=f"Nu găsesc {area_json.name}"
-        )
+    # ✅ PRIORITATE: Verificăm dacă există date din raster_processing
+    use_raster_data = False
+    total_area_m2 = 0.0
+    
+    if raster_room_scales.exists():
+        try:
+            with open(raster_room_scales, "r", encoding="utf-8") as f:
+                room_scales_data = json.load(f)
+            total_area_m2 = room_scales_data.get('total_area_m2', 0.0)
+            if total_area_m2 > 0:
+                use_raster_data = True
+                print(f"       ✅ Folosesc suprafața din raster_processing: {total_area_m2:.2f} m²")
+        except Exception as e:
+            print(f"       ⚠️ Eroare la citirea room_scales.json: {e}")
+    
+    # Fallback la areas_calculated.json dacă nu avem date din raster
+    if not use_raster_data:
+        if not area_json.exists():
+            return RoofJobResult(
+                plan_id=plan.plan_id,
+                work_dir=work_dir,
+                success=False,
+                message=f"Nu găsesc {area_json.name} și nici room_scales.json din raster"
+            )
     
     perimeter_dir = work_dir.parent.parent / "perimeter" / plan.plan_id
     perimeter_json = perimeter_dir / "walls_measurements_gemini.json"
@@ -133,28 +153,38 @@ def _run_for_single_plan(
             flush=True
         )
         
-        with open(area_json, "r", encoding="utf-8") as f:
-            area_data = json.load(f)
+        # Folosim datele din raster sau areas_calculated.json
+        roof_area_m2 = None
+        ceiling_area_m2 = None
         
-        surfaces = area_data.get("surfaces", {})
-        
-        # Aria acoperișului
-        roof_area_m2 = surfaces.get("roof_m2") 
-        ceiling_area_m2 = surfaces.get("ceiling_m2")
-        
-        # Fallback logică agresivă pentru Single Plan / Unknown
-        if (roof_area_m2 is None or roof_area_m2 <= 0):
-            # Încercăm ceiling
-            if ceiling_area_m2 and ceiling_area_m2 > 0:
-                 roof_area_m2 = ceiling_area_m2 * 1.35 # Adăugăm pantă + streașină estimată
-                 print(f"       ⚠️  roof_m2 lipsă. Estimat din ceiling ({ceiling_area_m2}) * 1.35 = {roof_area_m2:.2f}")
-            else:
-                # Încercăm gross area
-                gross = surfaces.get("floor_gross_m2") or area_data.get("house_area_m2")
-                if gross and gross > 0:
-                    roof_area_m2 = gross * 1.35
-                    ceiling_area_m2 = gross # Aproximare pentru tavan
-                    print(f"       ⚠️  roof_m2 & ceiling lipsă. Estimat din gross ({gross}) = {roof_area_m2:.2f}")
+        if use_raster_data:
+            # Folosim total_area_m2 din raster ca bază pentru acoperiș
+            roof_area_m2 = total_area_m2 * 1.35  # Adăugăm pantă + streașină estimată
+            ceiling_area_m2 = total_area_m2
+            print(f"       ✅ Folosesc suprafața din raster pentru acoperiș: {roof_area_m2:.2f} m²")
+        else:
+            with open(area_json, "r", encoding="utf-8") as f:
+                area_data = json.load(f)
+            
+            surfaces = area_data.get("surfaces", {})
+            
+            # Aria acoperișului
+            roof_area_m2 = surfaces.get("roof_m2") 
+            ceiling_area_m2 = surfaces.get("ceiling_m2")
+            
+            # Fallback logică agresivă pentru Single Plan / Unknown
+            if (roof_area_m2 is None or roof_area_m2 <= 0):
+                # Încercăm ceiling
+                if ceiling_area_m2 and ceiling_area_m2 > 0:
+                     roof_area_m2 = ceiling_area_m2 * 1.35 # Adăugăm pantă + streașină estimată
+                     print(f"       ⚠️  roof_m2 lipsă. Estimat din ceiling ({ceiling_area_m2}) * 1.35 = {roof_area_m2:.2f}")
+                else:
+                    # Încercăm gross area
+                    gross = surfaces.get("floor_gross_m2") or area_data.get("house_area_m2")
+                    if gross and gross > 0:
+                        roof_area_m2 = gross * 1.35
+                        ceiling_area_m2 = gross # Aproximare pentru tavan
+                        print(f"       ⚠️  roof_m2 & ceiling lipsă. Estimat din gross ({gross}) = {roof_area_m2:.2f}")
 
         if roof_area_m2 is None or roof_area_m2 <= 0:
              return RoofJobResult(
@@ -168,12 +198,26 @@ def _run_for_single_plan(
         if ceiling_area_m2 is None:
             ceiling_area_m2 = roof_area_m2 / 1.35
 
-        # Perimetrul
+        # ✅ Perimetrul - citim din walls_measurements.json (RasterScan) - FĂRĂ dependență de CubiCasa
         perimeter_m = None
-        if perimeter_json.exists():
-            with open(perimeter_json, "r", encoding="utf-8") as f:
-                perim_data = json.load(f)
-            perimeter_m = perim_data.get("estimations", {}).get("average_result", {}).get("total_perimeter_meters")
+        scale_dir = work_dir.parent.parent / "scale" / plan.plan_id
+        raster_walls_measurements = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
+        
+        if raster_walls_measurements.exists():
+            try:
+                with open(raster_walls_measurements, "r", encoding="utf-8") as f:
+                    walls_measurements = json.load(f)
+                exterior_meters = walls_measurements.get("estimations", {}).get("average_result", {}).get("exterior_meters", 0.0)
+                if exterior_meters > 0:
+                    perimeter_m = exterior_meters
+                    print(f"       ✅ Folosesc perimetrul din RasterScan (walls_measurements.json): {perimeter_m:.2f} m")
+            except Exception as e:
+                print(f"       ⚠️ Eroare la citirea walls_measurements.json: {e}")
+        
+        # Dacă nu avem perimetru din RasterScan, folosim 0 (nu mai există fallback)
+        if perimeter_m is None:
+            perimeter_m = 0.0
+            print(f"       ⚠️ Nu am perimetru din RasterScan, folosesc 0.0")
         
         # ==========================================
         # STEP 3: Extrage input de la frontend
