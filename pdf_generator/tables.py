@@ -481,6 +481,65 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
     ]))
     return tbl
 
+
+def create_wall_measurements_table_english(plan_data: dict) -> Table:
+    """
+    Same as create_wall_measurements_table but with English headers only (for Calculation Method PDF).
+    """
+    from .utils import format_length, format_area, safe_get
+
+    walls_data = safe_get(plan_data, "walls", default={})
+    interior_data = safe_get(walls_data, "interior", default={})
+    exterior_data = safe_get(walls_data, "exterior", default={})
+
+    int_length_finish = safe_get(interior_data, "length_m", default=0.0)
+    int_length_structure = safe_get(interior_data, "length_m_structure", default=int_length_finish)
+    ext_length = safe_get(exterior_data, "length_m", default=0.0)
+
+    int_gross_finish = safe_get(interior_data, "gross_area_m2", default=0.0)
+    int_gross_structure = safe_get(interior_data, "gross_area_m2_structure", default=int_gross_finish)
+    int_openings = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_area_finish = safe_get(interior_data, "net_area_m2", default=0.0)
+    int_area_structure = safe_get(interior_data, "net_area_m2_structure", default=int_area_finish)
+
+    ext_gross = safe_get(exterior_data, "gross_area_m2", default=0.0)
+    ext_openings = safe_get(exterior_data, "openings_area_m2", default=0.0)
+    ext_area = safe_get(exterior_data, "net_area_m2", default=0.0)
+
+    head = [
+        P("Wall Type", "CellBold"),
+        P("Use", "CellBold"),
+        P("Length (m)", "CellBold"),
+        P("Gross Area (m²)", "CellBold"),
+        P("Openings (m²)", "CellBold"),
+        P("Net Area (m²)", "CellBold"),
+    ]
+    data = []
+    data.append([P("Exterior Walls", "Cell"), P("Structure", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings), "Cell"), P(format_area(ext_area), "CellBold")])
+    data.append([P("Exterior Walls", "Cell"), P("Finishes", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings), "Cell"), P(format_area(ext_area), "CellBold")])
+    data.append([P("Interior Walls", "Cell"), P("Structure (skeleton)", "Cell"), P(format_length(int_length_structure), "Cell"), P(format_area(int_gross_structure), "Cell"), P(format_area(int_openings), "Cell"), P(format_area(int_area_structure), "CellBold")])
+    data.append([P("Interior Walls", "Cell"), P("Finishes (outline)", "Cell"), P(format_length(int_length_finish), "Cell"), P(format_area(int_gross_finish), "Cell"), P(format_area(int_openings), "Cell"), P(format_area(int_area_finish), "CellBold")])
+
+    tbl = Table([head] + data, colWidths=[40*mm, 38*mm, 32*mm, 32*mm, 32*mm, 32*mm])
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+        ("BACKGROUND", (0,0), (-1,0), COLORS["bg_header"]),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+    ]))
+    return tbl
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+        ("BACKGROUND", (0,0), (-1,0), COLORS["bg_header"]),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+    ]))
+    return tbl
+
 # ----------------------------
 # Floors & Ceilings
 # ----------------------------

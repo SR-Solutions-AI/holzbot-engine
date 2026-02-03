@@ -85,5 +85,6 @@ def calculate_openings_details(coeffs: dict, openings_list: list, material: str,
 
     return {
         "total_cost": round(total, 2),
-        "items": items
+        "items": items,
+        "detailed_items": items,  # alias for PDF and consumers expecting detailed_items
     }

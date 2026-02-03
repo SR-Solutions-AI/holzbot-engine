@@ -2940,54 +2940,109 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     ))
     story.append(Spacer(1, 4*mm))
     
-    # Extract user selections from frontend_data
+    # ---------- Form value to English (all options chosen in the form) ----------
+    FORM_VALUE_TO_ENGLISH = {
+        "Placă": "Slab", "Piloți": "Piles", "Soclu": "Plinth",
+        "Blockbau": "Blockbau", "Holzrahmen": "Timber frame", "Massivholz": "Solid wood",
+        "PANOURI": "Panels", "BALLOON": "Balloon", "PLACA": "Slab",
+        "Structură": "Structure only", "Structură + ferestre": "Structure + windows", "Casă completă": "Turnkey house",
+        "Ușor (camion 40t)": "Easy (40t truck)", "Mediu": "Medium", "Dificil": "Difficult",
+        "Plan": "Flat", "Pantă ușoară": "Gentle slope", "Pantă mare": "Steep slope",
+        "Kein Keller (nur Bodenplatte)": "No basement (only floor slab)",
+        "Keller (unbeheizt / Nutzkeller)": "Basement (unheated / utility)",
+        "Keller (mit einfachem Ausbau)": "Basement (with simple finish)",
+        "Standard (2,50 m)": "Standard (2.50 m)", "Komfort (2,70 m)": "Comfort (2.70 m)", "Hoch (2,85+ m)": "High (2.85+ m)",
+        "Flachdach": "Flat roof", "Pultdach": "Shed roof", "Gründach": "Green roof", "Satteldach": "Gable roof",
+        "Krüppelwalmdach": "Hip and valley roof", "Mansardendach": "Mansard roof",
+        "Mansardendach mit Fußwalm": "Mansard roof with foot hip", "Mansardendach mit Schlepp": "Mansard roof with extension",
+        "Mansardenwalmdach": "Mansard hip roof", "Walmdach": "Hip roof", "Paralleldach": "Parallel roof",
+        "Nein": "No", "Ja – einzelne": "Yes – individual", "Ja – mehrere / große Glasflächen": "Yes – multiple / large glass surfaces",
+        "3-fach verglast": "Triple glazed", "3-fach verglast, Passiv": "Triple glazed, Passive",
+        "Standard (2m)": "Standard (2 m)", "Erhöht / Sondermaß (2,2+ m)": "Raised / custom size (2.2+ m)",
+        "Tencuială": "Plaster", "Lemn": "Wood", "Fibrociment": "Fiber cement", "Mix": "Mix",
+        "Țiglă": "Roof tile", "Tablă": "Sheet metal", "Membrană": "Roof membrane",
+        "Standard": "Standard", "KfW 55": "KfW 55", "KfW 40": "KfW 40", "KfW 40+": "KfW 40+",
+        "Gaz": "Gas", "Pompa de căldură": "Heat pump", "Electric": "Electric",
+        "Kein Kamin": "No fireplace", "Klassischer Holzofen": "Classic wood stove",
+        "Moderner Design-Kaminofen": "Modern design fireplace", "Pelletofen (automatisch)": "Pellet stove (automatic)",
+        "Einbaukamin": "Built-in fireplace", "Kachel-/wassergeführter Kamin": "Tiled/water-bearing fireplace",
+        "Pereți Interiori": "Interior Walls", "Pereți Exteriori": "Exterior Walls",
+        "Structură Planșeu/Podea": "Floor structure", "Structură Tavan": "Ceiling structure",
+        "Lemn-Aluminiu": "Wood-Aluminum",
+        "Scară interioară completă (Structură + Finisaj)": "Complete interior stair (structure + finish)",
+        "Balustradă scară": "Stair railing",
+    }
+    def _en(v):
+        if v is None or v == "" or v == "—": return "—"
+        return FORM_VALUE_TO_ENGLISH.get(str(v).strip(), str(v))
+    
+    # Extract user selections from frontend_data – structured per form steps, all in English
     sistem_constructiv = frontend_data.get("sistemConstructiv", {})
+    structura_cladirii = frontend_data.get("structuraCladirii", {})
     materiale_finisaj = frontend_data.get("materialeFinisaj", {})
     performanta = frontend_data.get("performanta", {})
+    performanta_energetica = frontend_data.get("performantaEnergetica", {})
     ferestre_usi = frontend_data.get("ferestreUsi", {})
     incalzire = frontend_data.get("incalzire", {})
     
-    # User selections summary
-    story.append(Paragraph("User Selections for This Project", styles["H2"]))
+    tip_sistem = sistem_constructiv.get("tipSistem")
+    grad_prefabricare = sistem_constructiv.get("gradPrefabricare")
+    tip_fundatie = sistem_constructiv.get("tipFundatie")
+    tip_acoperis = sistem_constructiv.get("tipAcoperis")
+    nivel_oferta = materiale_finisaj.get("nivelOferta")
+    acces_santier = sistem_constructiv.get("accesSantier")
+    teren = sistem_constructiv.get("teren")
+    utilitati = sistem_constructiv.get("utilitati")
+    tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci")
+    pilons = structura_cladirii.get("pilons")
+    inaltime_etaje = structura_cladirii.get("inaltimeEtaje")
+    bodentiefe_fenster = ferestre_usi.get("bodentiefeFenster")
+    window_quality = ferestre_usi.get("windowQuality")
+    turhohe = ferestre_usi.get("turhohe")
+    nivel_energetic = performanta.get("nivelEnergetic") or performanta_energetica.get("nivelEnergetic")
+    tip_incalzire = performanta.get("tipIncalzire") or performanta_energetica.get("tipIncalzire")
+    ventilatie = performanta.get("ventilatie", False) or performanta_energetica.get("ventilatie", False)
+    tip_semineu = performanta_energetica.get("tipSemineu") or performanta.get("tipSemineu") or incalzire.get("tipSemineu")
+    semineu = tip_semineu and str(tip_semineu) != "Kein Kamin"
+    material_acoperis = materiale_finisaj.get("materialAcoperis")
     
-    # Construction system
-    tip_sistem = sistem_constructiv.get("tipSistem", "—")
-    grad_prefabricare = sistem_constructiv.get("gradPrefabricare", "—")
-    tip_fundatie = sistem_constructiv.get("tipFundatie", "—")
-    tip_acoperis = sistem_constructiv.get("tipAcoperis", "—")
+    story.append(Paragraph("User Selections for This Project (by form step)", styles["H2"]))
     
-    story.append(Paragraph(f"<b>Construction System:</b> {tip_sistem}", styles["Body"]))
-    if grad_prefabricare and grad_prefabricare != "—":
-        story.append(Paragraph(f"<b>Prefabrication Level:</b> {grad_prefabricare}", styles["Body"]))
-    if tip_fundatie and tip_fundatie != "—":
-        story.append(Paragraph(f"<b>Foundation Type:</b> {tip_fundatie}", styles["Body"]))
-    if tip_acoperis and tip_acoperis != "—":
-        story.append(Paragraph(f"<b>Roof Type:</b> {tip_acoperis}", styles["Body"]))
+    story.append(Paragraph("<b>Step – General project information / Building structure</b>", styles["H3"]))
+    story.append(Paragraph(f"Construction system: {_en(tip_sistem)}", styles["Body"]))
+    if grad_prefabricare: story.append(Paragraph(f"Prefabrication level: {_en(grad_prefabricare)}", styles["Body"]))
+    story.append(Paragraph(f"Offer level: {_en(nivel_oferta)}", styles["Body"]))
+    story.append(Paragraph(f"Site access: {_en(acces_santier)}", styles["Body"]))
+    story.append(Paragraph(f"Terrain: {_en(teren)}", styles["Body"]))
+    story.append(Paragraph(f"Electricity/water connection available: {'Yes' if utilitati else 'No'}", styles["Body"]))
     
-    # Window and door settings
-    bodentiefe_fenster = ferestre_usi.get("bodentiefeFenster", "—")
-    window_quality = ferestre_usi.get("windowQuality", "—")
-    turhohe = ferestre_usi.get("turhohe", "—")
+    story.append(Paragraph("<b>Step – Basement / Foundation</b>", styles["H3"]))
+    story.append(Paragraph(f"Basement / foundation: {_en(tip_fundatie_beci)}", styles["Body"]))
+    story.append(Paragraph(f"Foundation type (slab/piles/plinth): {_en(tip_fundatie)}", styles["Body"]))
+    story.append(Paragraph(f"Pile foundation required: {'Yes' if pilons else 'No'}", styles["Body"]))
+    story.append(Paragraph(f"Floor height: {_en(inaltime_etaje)}", styles["Body"]))
     
-    if bodentiefe_fenster and bodentiefe_fenster != "—":
-        story.append(Paragraph(f"<b>Window Height Setting:</b> {bodentiefe_fenster}", styles["Body"]))
-    if window_quality and window_quality != "—":
-        story.append(Paragraph(f"<b>Window Quality:</b> {window_quality}", styles["Body"]))
-    if turhohe and turhohe != "—":
-        story.append(Paragraph(f"<b>Door Height:</b> {turhohe}", styles["Body"]))
+    story.append(Paragraph("<b>Step – Roof type</b>", styles["H3"]))
+    story.append(Paragraph(f"Roof type: {_en(tip_acoperis)}", styles["Body"]))
     
-    # Energy and heating
-    nivel_energetic = performanta.get("nivelEnergetic", "—")
-    tip_incalzire = performanta.get("tipIncalzire", "—")
-    ventilatie = performanta.get("ventilatie", False)
-    semineu = incalzire.get("semineu", False)
+    story.append(Paragraph("<b>Step – Windows &amp; Doors</b>", styles["H3"]))
+    story.append(Paragraph(f"Floor-to-ceiling windows / large glass: {_en(bodentiefe_fenster)}", styles["Body"]))
+    story.append(Paragraph(f"Window quality: {_en(window_quality)}", styles["Body"]))
+    story.append(Paragraph(f"Door height: {_en(turhohe)}", styles["Body"]))
     
-    if nivel_energetic and nivel_energetic != "—":
-        story.append(Paragraph(f"<b>Energy Level:</b> {nivel_energetic}", styles["Body"]))
-    if tip_incalzire and tip_incalzire != "—":
-        story.append(Paragraph(f"<b>Heating Type:</b> {tip_incalzire}", styles["Body"]))
-    story.append(Paragraph(f"<b>Ventilation:</b> {'Yes' if ventilatie else 'No'}", styles["Body"]))
-    story.append(Paragraph(f"<b>Fireplace:</b> {'Yes' if semineu else 'No'}", styles["Body"]))
+    story.append(Paragraph("<b>Step – Materials &amp; finish level</b>", styles["H3"]))
+    story.append(Paragraph(f"Interior finish (basement): {_en(materiale_finisaj.get('finisajInteriorBeci'))}", styles["Body"]))
+    story.append(Paragraph(f"Interior finish (ground floor): {_en(materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
+    story.append(Paragraph(f"Facade (ground floor): {_en(materiale_finisaj.get('fatada_ground'))}", styles["Body"]))
+    story.append(Paragraph(f"Interior finish (attic): {_en(materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
+    story.append(Paragraph(f"Facade (attic): {_en(materiale_finisaj.get('fatadaMansarda'))}", styles["Body"]))
+    story.append(Paragraph(f"Roof material: {_en(material_acoperis)}", styles["Body"]))
+    
+    story.append(Paragraph("<b>Step – Energy efficiency &amp; Heating</b>", styles["H3"]))
+    story.append(Paragraph(f"Energy level: {_en(nivel_energetic)}", styles["Body"]))
+    story.append(Paragraph(f"Heating type: {_en(tip_incalzire)}", styles["Body"]))
+    story.append(Paragraph(f"Ventilation / heat recovery: {'Yes' if ventilatie else 'No'}", styles["Body"]))
+    story.append(Paragraph(f"Fireplace: {_en(tip_semineu) if tip_semineu else 'No'}", styles["Body"]))
     
     story.append(Spacer(1, 6*mm))
     
@@ -3011,15 +3066,55 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             
+            # Load room_scales for per-room area breakdown (foundation = sum of room areas)
+            scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
+            room_scales_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+            room_areas_list = []
+            total_from_rooms = 0.0
+            if room_scales_path.exists():
+                try:
+                    with open(room_scales_path, "r", encoding="utf-8") as f:
+                        room_data = json.load(f)
+                    rooms_dict = room_data.get("room_scales") or room_data.get("rooms") or {}
+                    if isinstance(rooms_dict, dict):
+                        for room_id, room_info in rooms_dict.items():
+                            if isinstance(room_info, dict):
+                                a = float(room_info.get("area_m2", 0))
+                            else:
+                                a = float(room_info) if room_info else 0
+                            if a > 0:
+                                room_areas_list.append((room_id, a))
+                                total_from_rooms += a
+                except Exception:
+                    pass
+            foundation_area = 0.0
             items = foundation.get("detailed_items", [])
             for item in items:
-                area = item.get("area_m2", 0)
+                foundation_area = item.get("area_m2", 0) or foundation_area
+                break
+            if not foundation_area and total_from_rooms > 0:
+                foundation_area = total_from_rooms
+            
+            story.append(Paragraph("<b>House surface (foundation area):</b>", styles["Body"]))
+            if room_areas_list:
+                story.append(Paragraph("Per-room areas (sum = foundation area):", styles["Body"]))
+                for room_id, area_m2 in room_areas_list:
+                    story.append(Paragraph(f"  • Room «{room_id}»: {area_m2:.2f} m²", styles["Small"]))
+                story.append(Paragraph(f"  <b>Sum of rooms: {total_from_rooms:.2f} m²</b>", styles["Body"]))
+                story.append(Paragraph(f"<b>Total house/foundation area used: {foundation_area:.2f} m²</b>", styles["Body"]))
+            else:
+                story.append(Paragraph(f"Total foundation area: <b>{foundation_area:.2f} m²</b>", styles["Body"]))
+            
+            for item in items:
+                area = item.get("area_m2", 0) or foundation_area
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
-                foundation_type = item.get("name", "").split("(")[1].split(")")[0] if "(" in item.get("name", "") else "—"
-                
+                name = item.get("name", "")
+                foundation_type_display = "Slab"
+                if "(" in name and ")" in name:
+                    foundation_type_display = _en(name.split("(")[1].split(")")[0].strip())
                 story.append(Paragraph(
-                    f"<b>Foundation Type Selected:</b> {foundation_type}",
+                    f"<b>Foundation type selected:</b> {foundation_type_display}",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
@@ -3215,11 +3310,11 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                         ))
                         story.append(Spacer(1, 2*mm))
                     
-                    # Adaugă tabelul cu măsurătorile pereților
+                    # Wall measurements table (English only for this PDF)
                     if area_data:
-                        from .tables import create_wall_measurements_table
-                        measurements_table = create_wall_measurements_table(area_data, enforcer)
-                        story.append(Paragraph("<b>Summary Table - Wall Measurements:</b>", styles["Body"]))
+                        from .tables import create_wall_measurements_table_english
+                        measurements_table = create_wall_measurements_table_english(area_data)
+                        story.append(Paragraph("<b>Summary Table – Wall Measurements:</b>", styles["Body"]))
                         story.append(measurements_table)
                         story.append(Spacer(1, 2*mm))
                         
@@ -3234,11 +3329,11 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
                 name = item.get("name", "")
-                material = item.get("material", "—")
-                construction_mode = item.get("construction_mode", "—")
+                material = _en(item.get("material", "—"))
+                construction_mode = _en(item.get("construction_mode", "—"))
                 
                 story.append(Paragraph(
-                    f"<b>Material Selected:</b> {material} | <b>Construction Mode:</b> {construction_mode}",
+                    f"<b>Material selected:</b> {material} | <b>Construction mode:</b> {construction_mode}",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
@@ -3257,55 +3352,43 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             
-            # Show user selections
-            if bodentiefe_fenster and bodentiefe_fenster != "—":
-                window_height_map = {
-                    "Nein": "1.0m",
-                    "Ja – einzelne": "1.5m",
-                    "Ja – mehrere / große Glasflächen": "2.0m"
-                }
-                height = window_height_map.get(bodentiefe_fenster, "1.25m")
-                story.append(Paragraph(
-                    f"<b>Window Height Setting:</b> {bodentiefe_fenster} → All windows use height: {height}",
-                    styles["Body"]
-                ))
-            
-            if turhohe and turhohe != "—":
-                door_height = "2.2m" if "Erhöht" in turhohe else "2.0m"
-                story.append(Paragraph(
-                    f"<b>Door Height Setting:</b> {turhohe} → All doors use height: {door_height}",
-                    styles["Body"]
-                ))
-            
-            if window_quality and window_quality != "—":
-                quality_mult_map = {
-                    "3-fach verglast": "1.25x",
-                    "3-fach verglast, Passiv": "1.6x"
-                }
-                mult = quality_mult_map.get(window_quality, "1.0x")
-                story.append(Paragraph(
-                    f"<b>Window Quality:</b> {window_quality} → Multiplier: {mult}",
-                    styles["Body"]
-                ))
-            
             story.append(Paragraph(
-                f"<b>Window/Door Material:</b> Lemn-Aluminiu (standard, fixed)",
+                f"<b>Window height setting:</b> {_en(bodentiefe_fenster)} → All windows use height: "
+                + ("1.0 m" if bodentiefe_fenster == "Nein" else "1.5 m" if "einzelne" in str(bodentiefe_fenster) else "2.0 m"),
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"<b>Door height setting:</b> {_en(turhohe)} → All doors use height: "
+                + ("2.2 m" if turhohe and "Erhöht" in str(turhohe) else "2.0 m"),
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"<b>Window quality:</b> {_en(window_quality)} → Multiplier: "
+                + ("1.25x" if window_quality == "3-fach verglast" else "1.6x" if window_quality == "3-fach verglast, Passiv" else "1.0x"),
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"<b>Window/door material:</b> {_en('Lemn-Aluminiu')} (standard, fixed)",
                 styles["Body"]
             ))
             
-            items = openings.get("detailed_items", [])
+            opening_items = openings.get("detailed_items", openings.get("items", []))
+            num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
+            num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
             story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("<b>All Openings for This Plan:</b>", styles["Body"]))
-            for item in items:
+            story.append(Paragraph(
+                f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
+            ))
+            for item in opening_items:
                 name = item.get("name", "")
                 area = item.get("area_m2", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("total_cost", 0)
                 dimensions = item.get("dimensions_m", "")
-                material = item.get("material", "—")
-                
+                material = _en(item.get("material", "—"))
+                # dimensions_m is e.g. "1.20 x 2.00" (width x height in m)
                 story.append(Paragraph(
-                    f"{name} ({dimensions}, {material}): {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                    f"  • {name}: dimensions {dimensions} m → area {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
             
@@ -3316,27 +3399,64 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         if finishes and finishes.get("total_cost", 0) > 0:
             story.append(Paragraph("4. Finishes Calculation", styles["H2"]))
             story.append(Paragraph(
-                "<b>Formula:</b> Cost = Wall Area (m²) × Finish Unit Price per m²",
+                "<b>Formula:</b> Cost = Net Wall Area (m²) × Finish Unit Price per m². "
+                "Net area = (Length × Height) − Openings area.",
                 styles["Body"]
             ))
-            
+            # Detailed lengths, heights, surface calc, deduction of openings (from area_data)
+            try:
+                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+                if area_json_path.exists():
+                    with open(area_json_path, "r", encoding="utf-8") as f:
+                        area_data_fin = json.load(f)
+                    walls_fin = area_data_fin.get("walls", {})
+                    int_fin = walls_fin.get("interior", {})
+                    ext_fin = walls_fin.get("exterior", {})
+                    wall_height = area_data_fin.get("wall_height_m", 2.7)
+                    len_int = int_fin.get("length_m", 0.0)
+                    len_ext = ext_fin.get("length_m", 0.0)
+                    gross_int = int_fin.get("gross_area_m2", 0.0)
+                    gross_ext = ext_fin.get("gross_area_m2", 0.0)
+                    open_int = int_fin.get("openings_area_m2", 0.0)
+                    open_ext = ext_fin.get("openings_area_m2", 0.0)
+                    net_int = int_fin.get("net_area_m2", 0.0)
+                    net_ext = ext_fin.get("net_area_m2", 0.0)
+                    story.append(Paragraph("<b>Interior finishes:</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  Length: {len_int:.2f} m × Height: {wall_height:.2f} m = Gross area: {gross_int:.2f} m²",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  Gross area {gross_int:.2f} m² − Openings (doors/windows) {open_int:.2f} m² = <b>Net area: {net_int:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph("<b>Exterior finishes (facade):</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  Length: {len_ext:.2f} m × Height: {wall_height:.2f} m = Gross area: {gross_ext:.2f} m²",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  Gross area {gross_ext:.2f} m² − Openings {open_ext:.2f} m² = <b>Net area: {net_ext:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
+            except Exception:
+                pass
             items = finishes.get("detailed_items", [])
             for item in items:
                 name = item.get("name", "")
                 area = item.get("area_m2", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
-                material = item.get("material", "—")
-                
+                material = _en(item.get("material", "—"))
                 story.append(Paragraph(
-                    f"<b>Finish Selected:</b> {material}",
+                    f"<b>Finish selected:</b> {material}",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
                     f"<b>Calculation:</b> {name}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
-            
             story.append(Spacer(1, 4*mm))
     
         # 5. FLOORS & CEILINGS CALCULATION FOR THIS PLAN
@@ -3357,16 +3477,14 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             items = floors.get("detailed_items", [])
             for item in items:
-                name = item.get("name", "")
+                name = _en(item.get("name", "")) or item.get("name", "")
                 area = item.get("area_m2", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
-                
                 story.append(Paragraph(
                     f"<b>Calculation:</b> {name}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
-            
             story.append(Spacer(1, 4*mm))
     
         # 6. UTILITIES CALCULATION FOR THIS PLAN (only for ground floor)
@@ -3460,16 +3578,16 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             stair_unit_price = stairs_coeffs.get("price_per_stair_unit", 0)
             railing_price = stairs_coeffs.get("railing_price_per_stair", 0)
             
-            story.append(Paragraph(f"<b>Stair Unit Price Used:</b> {stair_unit_price:.2f} EUR/unit", styles["Body"]))
-            story.append(Paragraph(f"<b>Railing Price Used:</b> {railing_price:.2f} EUR/stair", styles["Body"]))
-            
+            story.append(Paragraph(f"<b>Stair unit price used:</b> {stair_unit_price:.2f} EUR/unit", styles["Body"]))
+            story.append(Paragraph(f"<b>Railing price used:</b> {railing_price:.2f} EUR/stair", styles["Body"]))
             items = stairs.get("detailed_items", [])
             for item in items:
-                name = item.get("name", "")
+                name = _en(item.get("name", "")) or item.get("name", "")
+                if not name or name == "—":
+                    name = "Complete interior stair (structure + finish)" if "Scară" in str(item.get("name", "")) else "Stair railing"
                 quantity = item.get("quantity", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
-                
                 story.append(Paragraph(
                     f"<b>Calculation:</b> {name}: {quantity} × {unit_price:.2f} EUR = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
@@ -3486,31 +3604,38 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             
-            if tip_acoperis and tip_acoperis != "—":
-                story.append(Paragraph(
-                    f"<b>Roof Type Selected:</b> {tip_acoperis}",
-                    styles["Body"]
-                ))
+            story.append(Paragraph(
+                f"<b>Roof type selected:</b> {_en(tip_acoperis)}",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"<b>Roof material selected:</b> {_en(material_acoperis)}",
+                styles["Body"]
+            ))
             
-            material_acoperis = materiale_finisaj.get("materialAcoperis", "—")
-            if material_acoperis and material_acoperis != "—":
-                story.append(Paragraph(
-                    f"<b>Roof Material Selected:</b> {material_acoperis}",
-                    styles["Body"]
-                ))
-            
-            items = roof.get("detailed_items", [])
-            for item in items:
+            roof_items = roof.get("detailed_items", [])
+            for item in roof_items:
                 name = item.get("name", "")
-                area = item.get("area_m2", 0)
-                unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
-                
-                story.append(Paragraph(
-                    f"<b>Calculation:</b> {name}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                    styles["Body"]
-                ))
-            
+                area_m2 = item.get("area_m2", 0)
+                unit_price = item.get("unit_price", 0)
+                quantity = item.get("quantity", 0)
+                unit = item.get("unit", "m²")
+                # Roof module now provides area_m2 and unit_price; for ml items use quantity (length) × unit_price
+                if unit == "ml" and quantity and quantity > 0:
+                    story.append(Paragraph(
+                        f"<b>Calculation:</b> {name}: {quantity:.2f} m × {unit_price:.2f} EUR/m = <b>{cost:.2f} EUR</b>",
+                        styles["Body"]
+                    ))
+                else:
+                    if not area_m2 and quantity and quantity > 0:
+                        area_m2 = quantity
+                    if not unit_price and quantity and quantity > 0:
+                        unit_price = cost / quantity
+                    story.append(Paragraph(
+                        f"<b>Calculation:</b> {name}: {area_m2:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                        styles["Body"]
+                    ))
             story.append(Spacer(1, 4*mm))
         
         # 9.5. BASEMENT CALCULATION FOR THIS PLAN (if exists)
