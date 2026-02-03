@@ -275,48 +275,48 @@ def run_segmentation_and_classification_for_document(
     for label, count in label_counts.items():
         print(f"   {label}: {count}")
 
+    # Blueprint-uri finale (doar house_blueprint) – verificare număr etaje imediat după clasificare
+    house_plans = [p for p in plans if p.label == "house_blueprint"]
+    print(f"\n🏠 HOUSE PLANS ONLY: {len(house_plans)}/{len(plans)}")
+    if len(house_plans) < len(plans):
+        print(f"⚠️  {len(plans) - len(house_plans)} plans EXCLUDED (not house_blueprint)\n")
+
+    # ---------- Verificare număr etaje vs formular (chiar după ce știm ce e blueprint) ----------
+    frontend_data = load_frontend_data_for_run(job_root.name, job_root)
+    our_floors = len(house_plans)
+    floors_number = frontend_data.get("floorsNumber")
+    basement = frontend_data.get("basement", False)
+    structura = frontend_data.get("structuraCladirii", {})
+    tip_fundatie_beci = (structura.get("tipFundatieBeci") or "")
+    has_basement_form = basement or (
+        tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
+    )
+    if floors_number is not None:
+        user_expected = int(floors_number) + (1 if has_basement_form else 0)
+    else:
+        lista_etaje = structura.get("listaEtaje")
+        if isinstance(lista_etaje, list):
+            user_expected = 1 + len(lista_etaje) + (1 if has_basement_form else 0)
+        elif isinstance(lista_etaje, dict):
+            user_expected = 1 + (1 if has_basement_form else 0)
+        else:
+            user_expected = 1 + (1 if has_basement_form else 0)
+    print(f"   📋 Formular: etaje așteptate (cu beci) = {user_expected}  |  Planuri blueprint = {our_floors}")
+    if our_floors != user_expected:
+        print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
+        print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
+        sys.exit(1)
+
     # =========================================================
     # REST OF PIPELINE
     # =========================================================
-    
+
     with Timer("STEP 4: Floor Classification") as t:
         floor_results = run_floor_classification(job_root, plans)
         notify_ui("floor_classification")
     pipeline_timer.add_step("Floor Classification", t.end_time - t.start_time)
 
-    house_plans = [p for p in plans if p.label == "house_blueprint"]
-    
-    print(f"\n🏠 HOUSE PLANS ONLY: {len(house_plans)}/{len(plans)}")
-    if len(house_plans) < len(plans):
-        print(f"⚠️  {len(plans) - len(house_plans)} plans EXCLUDED (not house_blueprint)\n")
-    
     if house_plans:
-        # ---------- Verificare număr etaje vs formular ----------
-        frontend_data = load_frontend_data_for_run(job_root.name, job_root)
-        our_floors = len(house_plans)
-        floors_number = frontend_data.get("floorsNumber")
-        basement = frontend_data.get("basement", False)
-        structura = frontend_data.get("structuraCladirii", {})
-        tip_fundatie_beci = (structura.get("tipFundatieBeci") or "")
-        has_basement_form = basement or (
-            tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
-        )
-        if floors_number is not None:
-            user_expected = int(floors_number) + (1 if has_basement_form else 0)
-        else:
-            lista_etaje = structura.get("listaEtaje")
-            if isinstance(lista_etaje, list):
-                user_expected = 1 + len(lista_etaje) + (1 if has_basement_form else 0)
-            elif isinstance(lista_etaje, dict):
-                # Form poate trimite obiect în loc de array
-                user_expected = 1 + (1 if has_basement_form else 0)
-            else:
-                # Fără floorsNumber și fără listaEtaje validă (lipsă sau nu e listă): presupunem parter (1 etaj) ca să nu sărim verificarea
-                user_expected = 1 + (1 if has_basement_form else 0)
-        if user_expected is not None and our_floors != user_expected:
-            print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
-            print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
-            sys.exit(1)
         # ---------- Dacă utilizatorul a ales beci: scor Gemini pentru a alege care plan e beciul ----------
         basement_plan_index = None
         if has_basement_form and our_floors > 0:
