@@ -3134,189 +3134,153 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             
-            # Încarcă area_data și cubicasa_result pentru a afișa măsurătorile detaliate
+            # Load ALL calculation sources: areas_calculated.json, walls_measurements.json, cubicasa_result.json
+            area_data = None
+            walls_measurements_raw = None
             try:
+                scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
                 area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+                raster_walls_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
                 cubicasa_json_path = plan.stage_work_dir / "cubicasa_result.json"
-                
-                area_data = None
-                cubicasa_data = None
                 
                 if area_json_path.exists():
                     with open(area_json_path, "r", encoding="utf-8") as f:
                         area_data = json.load(f)
+                if raster_walls_path.exists():
+                    try:
+                        with open(raster_walls_path, "r", encoding="utf-8") as f:
+                            walls_measurements_raw = json.load(f)
+                    except Exception:
+                        pass
                 
-                if cubicasa_json_path.exists():
-                    with open(cubicasa_json_path, "r", encoding="utf-8") as f:
-                        cubicasa_data = json.load(f)
-                    
-                    # Adaugă secțiunea detaliată de calcul
+                # ----- Structural walls: always show full lengths, heights, gross, openings, net from areas_calculated.json -----
+                if area_data:
                     story.append(Spacer(1, 2*mm))
-                    story.append(Paragraph("<b>Detailed Calculation Process:</b>", styles["H3"]))
+                    story.append(Paragraph("<b>Detailed wall data (from area calculation):</b>", styles["H3"]))
+                    walls_data = area_data.get("walls", {})
+                    interior_data = walls_data.get("interior", {})
+                    exterior_data = walls_data.get("exterior", {})
+                    wall_height = area_data.get("wall_height_m")
+                    if wall_height is None and interior_data.get("length_m"):
+                        wall_height = interior_data.get("gross_area_m2", 0) / max(interior_data.get("length_m", 1), 0.001) if interior_data.get("length_m") else 2.7
+                    if wall_height is None:
+                        wall_height = 2.7
+                    wall_height = float(wall_height)
                     
-                    # Scala
-                    if cubicasa_data and "measurements" in cubicasa_data:
-                        measurements = cubicasa_data["measurements"]
-                        scale_m_px = measurements.get("metrics", {}).get("scale_m_per_px", 0.0)
-                        pixels_data = measurements.get("pixels", {})
-                        metrics_data = measurements.get("metrics", {})
-                        
-                        story.append(Paragraph(f"<b>Step 1: Scale Detection</b>", styles["Body"]))
-                        story.append(Paragraph(
-                            f"Scale determined from room labels: <b>{scale_m_px:.9f} m/pixel</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Spacer(1, 2*mm))
-                        
-                        # Pixeli din fiecare tip de imagine
-                        story.append(Paragraph("<b>Step 2: Pixel Measurements from Images</b>", styles["Body"]))
-                        story.append(Paragraph(
-                            "The following pixel counts are extracted from different image types:",
-                            styles["Body"]
-                        ))
-                        
-                        px_ext = pixels_data.get("walls_len_ext", 0)
-                        px_int = pixels_data.get("walls_len_int", 0)
-                        px_skeleton_complete = pixels_data.get("walls_skeleton_complete", 0)
-                        px_skeleton_ext = pixels_data.get("walls_skeleton_ext", 0)
-                        px_skeleton_int = pixels_data.get("walls_skeleton_int", 0)
-                        
-                        story.append(Paragraph(
-                            f"• <b>Exterior walls (blue outline):</b> {px_ext:,} pixels",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• <b>Interior walls (green outline):</b> {px_int:,} pixels",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• <b>Skeleton complete (all walls):</b> {px_skeleton_complete:,} pixels",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• <b>Skeleton exterior (from skeleton):</b> {px_skeleton_ext:,} pixels",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• <b>Skeleton interior (skeleton - exterior):</b> {px_skeleton_int:,} pixels",
-                            styles["Body"]
-                        ))
-                        story.append(Spacer(1, 2*mm))
-                        
-                        # Conversia pixeli → metri
-                        story.append(Paragraph("<b>Step 3: Conversion from Pixels to Meters</b>", styles["Body"]))
-                        story.append(Paragraph(
-                            "Each pixel count is multiplied by the scale to get length in meters:",
-                            styles["Body"]
-                        ))
-                        
-                        walls_ext_m = metrics_data.get("walls_ext_m", 0.0)
-                        walls_int_m = metrics_data.get("walls_int_m", 0.0)
-                        walls_skeleton_complete_m = metrics_data.get("walls_skeleton_complete_m", 0.0)
-                        walls_skeleton_ext_m = metrics_data.get("walls_skeleton_ext_m", 0.0)
-                        walls_skeleton_int_m = metrics_data.get("walls_skeleton_int_m", 0.0)
-                        
-                        story.append(Paragraph(
-                            f"• Exterior (outline): {px_ext:,} px × {scale_m_px:.9f} m/px = <b>{walls_ext_m:.2f} m</b> (for finishes)",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• Interior (outline): {px_int:,} px × {scale_m_px:.9f} m/px = <b>{walls_int_m:.2f} m</b> (for finishes)",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• Skeleton complete: {px_skeleton_complete:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_complete_m:.2f} m</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• Skeleton exterior: {px_skeleton_ext:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_ext_m:.2f} m</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"• Skeleton interior: {px_skeleton_int:,} px × {scale_m_px:.9f} m/px = <b>{walls_skeleton_int_m:.2f} m</b> (for structure)",
-                            styles["Body"]
-                        ))
-                        story.append(Spacer(1, 2*mm))
+                    ext_length = float(exterior_data.get("length_m", 0.0))
+                    ext_gross = float(exterior_data.get("gross_area_m2", 0.0))
+                    ext_openings = float(exterior_data.get("openings_area_m2", 0.0))
+                    ext_net = float(exterior_data.get("net_area_m2", 0.0))
+                    int_length_finish = float(interior_data.get("length_m", 0.0))
+                    int_gross_finish = float(interior_data.get("gross_area_m2", 0.0))
+                    int_openings = float(interior_data.get("openings_area_m2", 0.0))
+                    int_net_finish = float(interior_data.get("net_area_m2", 0.0))
+                    int_length_structure = float(interior_data.get("length_m_structure", 0.0))
+                    int_gross_structure = float(interior_data.get("gross_area_m2_structure", 0.0))
+                    int_net_structure = float(interior_data.get("net_area_m2_structure", 0.0))
                     
-                    # Calculele ariilor
-                    if area_data:
-                        story.append(Paragraph("<b>Step 4: Area Calculations</b>", styles["Body"]))
+                    story.append(Paragraph(f"<b>Wall height used:</b> {wall_height:.2f} m (from floor height setting).", styles["Body"]))
+                    story.append(Spacer(1, 2*mm))
+                    
+                    story.append(Paragraph("<b>Exterior walls (structure and finishes use same length):</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  • Length (exterior): <b>{ext_length:.2f} m</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Surface: Length × Height = {ext_length:.2f} m × {wall_height:.2f} m = <b>Gross area: {ext_gross:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Openings deducted (windows + exterior doors): <b>{ext_openings:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Net area (exterior): Gross − Openings = {ext_gross:.2f} − {ext_openings:.2f} = <b>{ext_net:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
+                    
+                    story.append(Paragraph("<b>Interior walls – finishes (green outline):</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  • Length (interior, for finishes): <b>{int_length_finish:.2f} m</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Surface: Length × Height = {int_length_finish:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_finish:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Openings deducted (interior doors): <b>{int_openings:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Net area (interior finishes): Gross − Openings = {int_gross_finish:.2f} − {int_openings:.2f} = <b>{int_net_finish:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
+                    
+                    story.append(Paragraph("<b>Interior walls – structure (skeleton):</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  • Length (interior, for structure): <b>{int_length_structure:.2f} m</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Surface: Length × Height = {int_length_structure:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_structure:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Openings deducted: <b>{int_openings:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Paragraph(
+                        f"  • Net area (interior structure): Gross − Openings = {int_gross_structure:.2f} − {int_openings:.2f} = <b>{int_net_structure:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
+                    
+                    if walls_measurements_raw:
+                        avg = walls_measurements_raw.get("estimations", {}).get("average_result", {})
+                        story.append(Paragraph("<b>Raw lengths from walls_measurements.json (raster):</b>", styles["Body"]))
                         story.append(Paragraph(
-                            "Wall areas are calculated by multiplying length by wall height, then subtracting openings:",
-                            styles["Body"]
-                        ))
-                        
-                        walls_data = area_data.get("walls", {})
-                        interior_data = walls_data.get("interior", {})
-                        exterior_data = walls_data.get("exterior", {})
-                        
-                        # Exterior
-                        ext_length = exterior_data.get("length_m", 0.0)
-                        ext_gross = exterior_data.get("gross_area_m2", 0.0)
-                        ext_openings = exterior_data.get("openings_area_m2", 0.0)
-                        ext_net = exterior_data.get("net_area_m2", 0.0)
-                        wall_height = area_data.get("wall_height_m", 2.7)
-                        
-                        story.append(Paragraph(
-                            f"<b>Exterior Walls:</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Length: {ext_length:.2f} m × Height: {wall_height:.2f} m = Gross Area: {ext_gross:.2f} m²",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Gross Area: {ext_gross:.2f} m² - Openings: {ext_openings:.2f} m² = <b>Net Area: {ext_net:.2f} m²</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Spacer(1, 1*mm))
-                        
-                        # Interior finisaje
-                        int_length_finish = interior_data.get("length_m", 0.0)
-                        int_gross_finish = interior_data.get("gross_area_m2", 0.0)
-                        int_openings = interior_data.get("openings_area_m2", 0.0)
-                        int_net_finish = interior_data.get("net_area_m2", 0.0)
-                        
-                        story.append(Paragraph(
-                            f"<b>Interior Walls (Finishes - from green outline):</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Length: {int_length_finish:.2f} m × Height: {wall_height:.2f} m = Gross Area: {int_gross_finish:.2f} m²",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Gross Area: {int_gross_finish:.2f} m² - Openings: {int_openings:.2f} m² = <b>Net Area: {int_net_finish:.2f} m²</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Spacer(1, 1*mm))
-                        
-                        # Interior structură
-                        int_length_structure = interior_data.get("length_m_structure", 0.0)
-                        int_gross_structure = interior_data.get("gross_area_m2_structure", 0.0)
-                        int_net_structure = interior_data.get("net_area_m2_structure", 0.0)
-                        
-                        story.append(Paragraph(
-                            f"<b>Interior Walls (Structure - from skeleton):</b>",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Length: {int_length_structure:.2f} m × Height: {wall_height:.2f} m = Gross Area: {int_gross_structure:.2f} m²",
-                            styles["Body"]
-                        ))
-                        story.append(Paragraph(
-                            f"  • Gross Area: {int_gross_structure:.2f} m² - Openings: {int_openings:.2f} m² = <b>Net Area: {int_net_structure:.2f} m²</b>",
-                            styles["Body"]
+                            f"  Interior (finishes): {avg.get('interior_meters', 0):.2f} m  |  "
+                            f"Exterior: {avg.get('exterior_meters', 0):.2f} m  |  "
+                            f"Interior (structure): {avg.get('interior_meters_structure', 0):.2f} m",
+                            styles["Small"]
                         ))
                         story.append(Spacer(1, 2*mm))
                     
-                    # Wall measurements table (English only for this PDF)
-                    if area_data:
-                        from .tables import create_wall_measurements_table_english
-                        measurements_table = create_wall_measurements_table_english(area_data)
-                        story.append(Paragraph("<b>Summary Table – Wall Measurements:</b>", styles["Body"]))
-                        story.append(measurements_table)
-                        story.append(Spacer(1, 2*mm))
+                    from .tables import create_wall_measurements_table_english
+                    measurements_table = create_wall_measurements_table_english(area_data)
+                    story.append(Paragraph("<b>Summary table – wall measurements:</b>", styles["Body"]))
+                    story.append(measurements_table)
+                    story.append(Spacer(1, 2*mm))
+                
+                # Optional: CubiCasa pixel/scale detail if file exists
+                cubicasa_data = None
+                if cubicasa_json_path.exists():
+                    try:
+                        with open(cubicasa_json_path, "r", encoding="utf-8") as f:
+                            cubicasa_data = json.load(f)
+                    except Exception:
+                        pass
+                if cubicasa_data and cubicasa_data.get("measurements"):
+                    story.append(Paragraph("<b>Scale and pixel lengths (CubiCasa source):</b>", styles["H3"]))
+                    measurements = cubicasa_data["measurements"]
+                    scale_m_px = measurements.get("metrics", {}).get("scale_m_per_px", 0.0)
+                    pixels_data = measurements.get("pixels", {})
+                    metrics_data = measurements.get("metrics", {})
+                    story.append(Paragraph(f"Scale: <b>{scale_m_px:.9f} m/pixel</b>", styles["Body"]))
+                    px_ext = pixels_data.get("walls_len_ext", 0)
+                    px_int = pixels_data.get("walls_len_int", 0)
+                    walls_ext_m = metrics_data.get("walls_ext_m", 0.0)
+                    walls_int_m = metrics_data.get("walls_int_m", 0.0)
+                    story.append(Paragraph(
+                        f"Exterior: {px_ext:,} px × scale = <b>{walls_ext_m:.2f} m</b>  |  "
+                        f"Interior (outline): {px_int:,} px × scale = <b>{walls_int_m:.2f} m</b>",
+                        styles["Small"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
                         
             except Exception as e:
                 print(f"⚠️ [PDF] Could not load detailed measurements for {plan.plan_id}: {e}")
@@ -3394,54 +3358,88 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             story.append(Spacer(1, 4*mm))
     
-        # 4. FINISHES CALCULATION FOR THIS PLAN
+        # 4. FINISHES CALCULATION FOR THIS PLAN (wall finishes: interior + exterior)
         finishes = breakdown.get("finishes", {})
         if finishes and finishes.get("total_cost", 0) > 0:
-            story.append(Paragraph("4. Finishes Calculation", styles["H2"]))
+            story.append(Paragraph("4. Finishes Calculation (Wall Finishes)", styles["H2"]))
             story.append(Paragraph(
-                "<b>Formula:</b> Cost = Net Wall Area (m²) × Finish Unit Price per m². "
-                "Net area = (Length × Height) − Openings area.",
+                "<b>Formula:</b> Cost = Net wall area (m²) × Finish unit price per m². "
+                "Net area = (Length × Height) − Openings (doors/windows) area.",
                 styles["Body"]
             ))
-            # Detailed lengths, heights, surface calc, deduction of openings (from area_data)
+            # Load areas_calculated.json and dump ALL lengths, height, surface calc, openings deducted, net
+            area_data_fin = None
             try:
                 area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
                 if area_json_path.exists():
                     with open(area_json_path, "r", encoding="utf-8") as f:
                         area_data_fin = json.load(f)
-                    walls_fin = area_data_fin.get("walls", {})
-                    int_fin = walls_fin.get("interior", {})
-                    ext_fin = walls_fin.get("exterior", {})
-                    wall_height = area_data_fin.get("wall_height_m", 2.7)
-                    len_int = int_fin.get("length_m", 0.0)
-                    len_ext = ext_fin.get("length_m", 0.0)
-                    gross_int = int_fin.get("gross_area_m2", 0.0)
-                    gross_ext = ext_fin.get("gross_area_m2", 0.0)
-                    open_int = int_fin.get("openings_area_m2", 0.0)
-                    open_ext = ext_fin.get("openings_area_m2", 0.0)
-                    net_int = int_fin.get("net_area_m2", 0.0)
-                    net_ext = ext_fin.get("net_area_m2", 0.0)
-                    story.append(Paragraph("<b>Interior finishes:</b>", styles["Body"]))
-                    story.append(Paragraph(
-                        f"  Length: {len_int:.2f} m × Height: {wall_height:.2f} m = Gross area: {gross_int:.2f} m²",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  Gross area {gross_int:.2f} m² − Openings (doors/windows) {open_int:.2f} m² = <b>Net area: {net_int:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph("<b>Exterior finishes (facade):</b>", styles["Body"]))
-                    story.append(Paragraph(
-                        f"  Length: {len_ext:.2f} m × Height: {wall_height:.2f} m = Gross area: {gross_ext:.2f} m²",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  Gross area {gross_ext:.2f} m² − Openings {open_ext:.2f} m² = <b>Net area: {net_ext:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Spacer(1, 2*mm))
             except Exception:
                 pass
+            if area_data_fin:
+                walls_fin = area_data_fin.get("walls", {})
+                int_fin = walls_fin.get("interior", {})
+                ext_fin = walls_fin.get("exterior", {})
+                wall_height_f = area_data_fin.get("wall_height_m")
+                if wall_height_f is None and int_fin.get("length_m"):
+                    g = float(int_fin.get("gross_area_m2", 0))
+                    L = float(int_fin.get("length_m", 1))
+                    wall_height_f = (g / L) if L > 0 else 2.7
+                if wall_height_f is None:
+                    wall_height_f = 2.7
+                wall_height_f = float(wall_height_f)
+                len_int = float(int_fin.get("length_m", 0.0))
+                len_ext = float(ext_fin.get("length_m", 0.0))
+                gross_int = float(int_fin.get("gross_area_m2", 0.0))
+                gross_ext = float(ext_fin.get("gross_area_m2", 0.0))
+                open_int = float(int_fin.get("openings_area_m2", 0.0))
+                open_ext = float(ext_fin.get("openings_area_m2", 0.0))
+                net_int = float(int_fin.get("net_area_m2", 0.0))
+                net_ext = float(ext_fin.get("net_area_m2", 0.0))
+                
+                story.append(Paragraph("<b>Wall height used for finishes:</b>", styles["Body"]))
+                story.append(Paragraph(f"  {wall_height_f:.2f} m (from floor height setting).", styles["Body"]))
+                story.append(Spacer(1, 2*mm))
+                
+                story.append(Paragraph("<b>Interior wall finishes:</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Length (interior walls, outline): <b>{len_int:.2f} m</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {len_int:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (interior doors only): <b>{open_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Spacer(1, 2*mm))
+                
+                story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Length (exterior walls): <b>{len_ext:.2f} m</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {len_ext:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (windows + exterior doors): <b>{open_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Spacer(1, 4*mm))
+            
+            story.append(Paragraph("<b>Cost calculation (net area × unit price):</b>", styles["Body"]))
             items = finishes.get("detailed_items", [])
             for item in items:
                 name = item.get("name", "")
@@ -3450,11 +3448,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 cost = item.get("cost", 0)
                 material = _en(item.get("material", "—"))
                 story.append(Paragraph(
-                    f"<b>Finish selected:</b> {material}",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"<b>Calculation:</b> {name}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                    f"  • {material}: Net area <b>{area:.2f} m²</b> × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
             story.append(Spacer(1, 4*mm))

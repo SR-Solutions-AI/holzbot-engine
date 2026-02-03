@@ -163,6 +163,9 @@ def calculate_areas_for_plan(
         "floor_type": floor_type,
         "is_single_plan": is_single_plan,
         
+        # Înălțime pereți (folosită la calcul, pentru PDF / rapoarte)
+        "wall_height_m": round(wall_height_m, 2),
+        
         # Informativ
         "input_net_area_m2": round(area_net_m2, 2),
         "input_gross_area_m2": round(area_gross_m2, 2),
