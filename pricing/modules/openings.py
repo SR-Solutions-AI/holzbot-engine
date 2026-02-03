@@ -77,6 +77,8 @@ def calculate_openings_details(coeffs: dict, openings_list: list, material: str,
             "location": "Exterior" if is_exterior else "Interior",
             "status": door_status if door_status else ("exterior" if is_exterior else "interior"),  # Păstrăm status-ul pentru uși
             "material": material,
+            "width_m": round(width, 2),
+            "height_m": round(height, 2),
             "dimensions_m": f"{width:.2f} x {height:.2f}",
             "area_m2": round(area, 2),
             "unit_price": price_per_m2,

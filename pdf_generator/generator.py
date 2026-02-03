@@ -3057,54 +3057,62 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         story.append(Paragraph(f"PLAN {plan_idx}: {plan.plan_id}", styles["H1"]))
         story.append(Spacer(1, 3*mm))
         
-        # 1. FOUNDATION CALCULATION FOR THIS PLAN
+        # 1. FOUNDATION CALCULATION FOR THIS PLAN – always show (area + rooms + cost when applicable)
         foundation = breakdown.get("foundation", {})
-        if foundation and foundation.get("total_cost", 0) > 0:
-            story.append(Paragraph("1. Foundation Calculation", styles["H2"]))
-            story.append(Paragraph(
-                "<b>Formula:</b> Cost = Foundation Area (m²) × Unit Price per m²",
-                styles["Body"]
-            ))
-            
-            # Load room_scales for per-room area breakdown (foundation = sum of room areas)
-            scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
-            room_scales_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
-            room_areas_list = []
-            total_from_rooms = 0.0
-            if room_scales_path.exists():
-                try:
-                    with open(room_scales_path, "r", encoding="utf-8") as f:
-                        room_data = json.load(f)
-                    rooms_dict = room_data.get("room_scales") or room_data.get("rooms") or {}
-                    if isinstance(rooms_dict, dict):
-                        for room_id, room_info in rooms_dict.items():
-                            if isinstance(room_info, dict):
-                                a = float(room_info.get("area_m2", 0))
-                            else:
-                                a = float(room_info) if room_info else 0
-                            if a > 0:
-                                room_areas_list.append((room_id, a))
-                                total_from_rooms += a
-                except Exception:
-                    pass
-            foundation_area = 0.0
-            items = foundation.get("detailed_items", [])
-            for item in items:
-                foundation_area = item.get("area_m2", 0) or foundation_area
-                break
-            if not foundation_area and total_from_rooms > 0:
-                foundation_area = total_from_rooms
-            
-            story.append(Paragraph("<b>House surface (foundation area):</b>", styles["Body"]))
-            if room_areas_list:
-                story.append(Paragraph("Per-room areas (sum = foundation area):", styles["Body"]))
-                for room_id, area_m2 in room_areas_list:
-                    story.append(Paragraph(f"  • Room «{room_id}»: {area_m2:.2f} m²", styles["Small"]))
-                story.append(Paragraph(f"  <b>Sum of rooms: {total_from_rooms:.2f} m²</b>", styles["Body"]))
-                story.append(Paragraph(f"<b>Total house/foundation area used: {foundation_area:.2f} m²</b>", styles["Body"]))
-            else:
-                story.append(Paragraph(f"Total foundation area: <b>{foundation_area:.2f} m²</b>", styles["Body"]))
-            
+        story.append(Paragraph("1. Foundation Calculation", styles["H2"]))
+        story.append(Paragraph(
+            "<b>Formula:</b> Cost = Foundation Area (m²) × Unit Price per m². "
+            "Foundation area = total house surface (sum of room areas or gross area for this plan).",
+            styles["Body"]
+        ))
+        scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
+        room_scales_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+        area_json_path_foundation = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+        room_areas_list = []
+        total_from_rooms = 0.0
+        if room_scales_path.exists():
+            try:
+                with open(room_scales_path, "r", encoding="utf-8") as f:
+                    room_data = json.load(f)
+                rooms_dict = room_data.get("room_scales") or room_data.get("rooms") or {}
+                if isinstance(rooms_dict, dict):
+                    for room_id, room_info in rooms_dict.items():
+                        if isinstance(room_info, dict):
+                            a = float(room_info.get("area_m2", 0))
+                        else:
+                            a = float(room_info) if room_info else 0
+                        if a > 0:
+                            room_areas_list.append((room_id, a))
+                            total_from_rooms += a
+            except Exception:
+                pass
+        foundation_area = 0.0
+        items = foundation.get("detailed_items", [])
+        for item in items:
+            foundation_area = item.get("area_m2", 0) or foundation_area
+            break
+        if not foundation_area and total_from_rooms > 0:
+            foundation_area = total_from_rooms
+        if foundation_area <= 0 and area_json_path_foundation.exists():
+            try:
+                with open(area_json_path_foundation, "r", encoding="utf-8") as f:
+                    area_f = json.load(f)
+                surfaces = area_f.get("surfaces", {})
+                foundation_area = float(surfaces.get("foundation_m2") or 0.0)
+                if foundation_area <= 0:
+                    foundation_area = float(area_f.get("input_gross_area_m2", 0.0))
+            except Exception:
+                pass
+        story.append(Paragraph("<b>House surface (foundation area for this plan):</b>", styles["Body"]))
+        if room_areas_list:
+            story.append(Paragraph("Per-room areas (sum = foundation area):", styles["Body"]))
+            for room_id, area_m2 in room_areas_list:
+                story.append(Paragraph(f"  • Room «{room_id}»: {area_m2:.2f} m²", styles["Small"]))
+            story.append(Paragraph(f"  <b>Sum of rooms: {total_from_rooms:.2f} m²</b>", styles["Body"]))
+            story.append(Paragraph(f"<b>Total house/foundation area used: {foundation_area:.2f} m²</b>", styles["Body"]))
+        else:
+            story.append(Paragraph(f"Total foundation area: <b>{foundation_area:.2f} m²</b>", styles["Body"]))
+        if foundation and foundation.get("total_cost", 0) > 0 and items:
             for item in items:
                 area = item.get("area_m2", 0) or foundation_area
                 unit_price = item.get("unit_price", 0)
@@ -3121,8 +3129,12 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     f"<b>Calculation:</b> {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
-            
-            story.append(Spacer(1, 4*mm))
+        else:
+            story.append(Paragraph(
+                "<i>No foundation cost applied for this plan (e.g. upper floor; foundation only on ground floor).</i>",
+                styles["Body"]
+            ))
+        story.append(Spacer(1, 4*mm))
     
         # 2. STRUCTURAL WALLS – always show full calculation data from areas_calculated.json
         walls = breakdown.get("structure_walls", {})
@@ -3135,11 +3147,13 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         
         area_data = None
         walls_measurements_raw = None
+        cubicasa_data = None
         try:
             scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
             area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
             raster_walls_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
-            cubicasa_json_path = plan.stage_work_dir / "cubicasa_result.json"
+            cubicasa_json_path_scale = scale_dir / "cubicasa_result.json"
+            cubicasa_json_path = cubicasa_json_path_scale
             
             if area_json_path.exists():
                 with open(area_json_path, "r", encoding="utf-8") as f:
@@ -3150,6 +3164,49 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                         walls_measurements_raw = json.load(f)
                 except Exception:
                     pass
+            if cubicasa_json_path_scale.exists():
+                try:
+                    with open(cubicasa_json_path_scale, "r", encoding="utf-8") as f:
+                        cubicasa_data = json.load(f)
+                except Exception:
+                    pass
+            
+            ext_length = 0.0
+            int_length_finish = 0.0
+            int_length_structure = 0.0
+            wall_height = 2.7
+            if area_data:
+                walls_data = area_data.get("walls", {})
+                interior_data = area_data.get("walls", {}).get("interior", {})
+                exterior_data = area_data.get("walls", {}).get("exterior", {})
+                ext_length = float(exterior_data.get("length_m", 0.0))
+                int_length_finish = float(interior_data.get("length_m", 0.0))
+                int_length_structure = float(interior_data.get("length_m_structure", 0.0))
+                if area_data.get("wall_height_m") is not None:
+                    wall_height = float(area_data["wall_height_m"])
+                elif interior_data.get("length_m") and interior_data.get("gross_area_m2"):
+                    L = float(interior_data.get("length_m", 1))
+                    wall_height = float(interior_data.get("gross_area_m2", 0)) / max(L, 0.001) if L else 2.7
+            if (ext_length <= 0 and int_length_finish <= 0) and walls_measurements_raw:
+                avg = walls_measurements_raw.get("estimations", {}).get("average_result", {})
+                ext_length = float(avg.get("exterior_meters", 0.0))
+                int_length_finish = float(avg.get("interior_meters", 0.0))
+                int_length_structure = float(avg.get("interior_meters_structure", 0.0))
+            if (ext_length <= 0 and int_length_finish <= 0) and cubicasa_data:
+                metrics = (cubicasa_data.get("measurements") or {}).get("metrics", {})
+                ext_length = float(metrics.get("walls_ext_m", 0.0))
+                int_length_finish = float(metrics.get("walls_int_m", 0.0))
+                int_length_structure = float(metrics.get("walls_skeleton_structure_int_m", metrics.get("walls_int_m", 0.0)))
+            
+            story.append(Spacer(1, 2*mm))
+            story.append(Paragraph("<b>Wall lengths (interior and exterior):</b>", styles["H3"]))
+            story.append(Paragraph(
+                f"  • Exterior walls: <b>{ext_length:.2f} m</b>  |  "
+                f"Interior (finishes / outline): <b>{int_length_finish:.2f} m</b>  |  "
+                f"Interior (structure / skeleton): <b>{int_length_structure:.2f} m</b>",
+                styles["Body"]
+            ))
+            story.append(Spacer(1, 2*mm))
             
             if area_data:
                 story.append(Spacer(1, 2*mm))
@@ -3233,14 +3290,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 story.append(Paragraph("<b>Summary table – wall measurements:</b>", styles["Body"]))
                 story.append(measurements_table)
                 story.append(Spacer(1, 2*mm))
-            # Optional: CubiCasa pixel/scale detail if file exists
-            cubicasa_data = None
-            if cubicasa_json_path.exists():
-                try:
-                    with open(cubicasa_json_path, "r", encoding="utf-8") as f:
-                        cubicasa_data = json.load(f)
-                except Exception:
-                    pass
+            # Optional: CubiCasa pixel/scale detail (cubicasa_data already loaded from scale_dir above)
             if cubicasa_data and cubicasa_data.get("measurements"):
                 story.append(Paragraph("<b>Scale and pixel lengths (CubiCasa source):</b>", styles["H3"]))
                 measurements = cubicasa_data["measurements"]
@@ -3281,56 +3331,71 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 ))
         story.append(Spacer(1, 4*mm))
     
-        # 3. OPENINGS (WINDOWS & DOORS) CALCULATION FOR THIS PLAN
+        # 3. OPENINGS (WINDOWS & DOORS) CALCULATION FOR THIS PLAN – always show (formula, settings, list; cost when > 0)
         openings = breakdown.get("openings", {})
-        if openings and openings.get("total_cost", 0) > 0:
-            story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
-            story.append(Paragraph(
-                "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m² × Quality Multiplier (for windows)",
-                styles["Body"]
-            ))
-            
-            story.append(Paragraph(
-                f"<b>Window height setting:</b> {_en(bodentiefe_fenster)} → All windows use height: "
-                + ("1.0 m" if bodentiefe_fenster == "Nein" else "1.5 m" if "einzelne" in str(bodentiefe_fenster) else "2.0 m"),
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"<b>Door height setting:</b> {_en(turhohe)} → All doors use height: "
-                + ("2.2 m" if turhohe and "Erhöht" in str(turhohe) else "2.0 m"),
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"<b>Window quality:</b> {_en(window_quality)} → Multiplier: "
-                + ("1.25x" if window_quality == "3-fach verglast" else "1.6x" if window_quality == "3-fach verglast, Passiv" else "1.0x"),
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"<b>Window/door material:</b> {_en('Lemn-Aluminiu')} (standard, fixed)",
-                styles["Body"]
-            ))
-            
-            opening_items = openings.get("detailed_items", openings.get("items", []))
-            num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
-            num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph(
-                f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
-            ))
+        story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
+        story.append(Paragraph(
+            "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m² × Quality Multiplier (for windows). "
+            "Each opening: area = width (m) × height (m).",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"<b>Window height setting:</b> {_en(bodentiefe_fenster)} → All windows use height: "
+            + ("1.0 m" if bodentiefe_fenster == "Nein" else "1.5 m" if "einzelne" in str(bodentiefe_fenster) else "2.0 m"),
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"<b>Door height setting:</b> {_en(turhohe)} → All doors use height: "
+            + ("2.2 m" if turhohe and "Erhöht" in str(turhohe) else "2.0 m"),
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"<b>Window quality:</b> {_en(window_quality)} → Multiplier: "
+            + ("1.25x" if window_quality == "3-fach verglast" else "1.6x" if window_quality == "3-fach verglast, Passiv" else "1.0x"),
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"<b>Window/door material:</b> {_en('Lemn-Aluminiu')} (standard, fixed)",
+            styles["Body"]
+        ))
+        opening_items = openings.get("detailed_items", openings.get("items", [])) if openings else []
+        num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
+        num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph(
+            f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
+        ))
+        if opening_items:
             for item in opening_items:
                 name = item.get("name", "")
                 area = item.get("area_m2", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("total_cost", 0)
-                dimensions = item.get("dimensions_m", "")
+                w_m = item.get("width_m")
+                h_m = item.get("height_m")
+                if w_m is not None and h_m is not None:
+                    dim_str = f"{float(w_m):.2f} × {float(h_m):.2f}"
+                else:
+                    dim_str = item.get("dimensions_m", "—")
                 material = _en(item.get("material", "—"))
-                # dimensions_m is e.g. "1.20 x 2.00" (width x height in m)
-                story.append(Paragraph(
-                    f"  • {name}: dimensions {dimensions} m → area {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                    styles["Body"]
-                ))
-            
-            story.append(Spacer(1, 4*mm))
+                if openings.get("total_cost", 0) > 0 and (unit_price or cost):
+                    story.append(Paragraph(
+                        f"  • {name}: dimensions {dim_str} m → area {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                        styles["Body"]
+                    ))
+                else:
+                    story.append(Paragraph(
+                        f"  • {name}: dimensions {dim_str} m → area <b>{area:.2f} m²</b>",
+                        styles["Body"]
+                    ))
+        else:
+            story.append(Paragraph("<i>No openings detected for this plan.</i>", styles["Body"]))
+        if openings and openings.get("total_cost", 0) > 0:
+            story.append(Paragraph(
+                f"<b>Openings total for this plan: {openings.get('total_cost', 0):.2f} EUR</b>",
+                styles["Body"]
+            ))
+        story.append(Spacer(1, 4*mm))
     
         # 4. FINISHES CALCULATION (wall finishes) – always show section with full data from areas_calculated.json
         finishes = breakdown.get("finishes", {})
