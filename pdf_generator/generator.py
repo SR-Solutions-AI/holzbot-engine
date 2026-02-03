@@ -3164,6 +3164,14 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                         walls_measurements_raw = json.load(f)
                 except Exception:
                     pass
+            wall_lengths_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "wall_lengths.json"
+            wall_lengths_raw = None
+            if wall_lengths_path.exists():
+                try:
+                    with open(wall_lengths_path, "r", encoding="utf-8") as f:
+                        wall_lengths_raw = json.load(f)
+                except Exception:
+                    pass
             if cubicasa_json_path_scale.exists():
                 try:
                     with open(cubicasa_json_path_scale, "r", encoding="utf-8") as f:
@@ -3240,12 +3248,16 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    f"  • Openings deducted (windows + exterior doors): <b>{ext_openings:.2f} m²</b>",
+                    f"  • Openings deducted (windows + exterior doors, from section 3): <b>{ext_openings:.2f} m²</b>",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
                     f"  • Net area (exterior): Gross − Openings = {ext_gross:.2f} − {ext_openings:.2f} = <b>{ext_net:.2f} m²</b>",
                     styles["Body"]
+                ))
+                story.append(Paragraph(
+                    "<i>Exterior openings = sum of all window areas + exterior door areas (see section 3).</i>",
+                    styles["Small"]
                 ))
                 story.append(Spacer(1, 2*mm))
                 story.append(Paragraph("<b>Interior walls – finishes (green outline):</b>", styles["Body"]))
@@ -3255,12 +3267,16 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    f"  • Openings deducted (interior doors): <b>{int_openings:.2f} m²</b>",
+                    f"  • Openings deducted (interior doors, from section 3): <b>{int_openings:.2f} m²</b>",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
                     f"  • Net area (interior finishes): Gross − Openings = {int_gross_finish:.2f} − {int_openings:.2f} = <b>{int_net_finish:.2f} m²</b>",
                     styles["Body"]
+                ))
+                story.append(Paragraph(
+                    "<i>Interior openings = sum of all interior door areas (see section 3).</i>",
+                    styles["Small"]
                 ))
                 story.append(Spacer(1, 2*mm))
                 story.append(Paragraph("<b>Interior walls – structure (skeleton):</b>", styles["Body"]))
@@ -3269,7 +3285,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     f"  • Surface: Length × Height = {int_length_structure:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_structure:.2f} m²</b>",
                     styles["Body"]
                 ))
-                story.append(Paragraph(f"  • Openings deducted: <b>{int_openings:.2f} m²</b>", styles["Body"]))
+                story.append(Paragraph(f"  • Openings deducted (interior doors, from section 3): <b>{int_openings:.2f} m²</b>", styles["Body"]))
                 story.append(Paragraph(
                     f"  • Net area (interior structure): Gross − Openings = {int_gross_structure:.2f} − {int_openings:.2f} = <b>{int_net_structure:.2f} m²</b>",
                     styles["Body"]
@@ -3282,6 +3298,18 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                         f"  Interior (finishes): {avg.get('interior_meters', 0):.2f} m  |  "
                         f"Exterior: {avg.get('exterior_meters', 0):.2f} m  |  "
                         f"Interior (structure): {avg.get('interior_meters_structure', 0):.2f} m",
+                        styles["Small"]
+                    ))
+                    story.append(Spacer(1, 2*mm))
+                if wall_lengths_raw:
+                    scale_m_px = wall_lengths_raw.get("scale_m_per_px", 0)
+                    story.append(Paragraph("<b>Lengths from wall_lengths.json (pixel × scale):</b>", styles["Body"]))
+                    story.append(Paragraph(
+                        f"  Scale: {scale_m_px:.9f} m/px  |  "
+                        f"Interior finish: {wall_lengths_raw.get('interior_finish_length_m', 0):.2f} m  |  "
+                        f"Exterior: {wall_lengths_raw.get('exterior_length_m', 0):.2f} m  |  "
+                        f"Interior structure: {wall_lengths_raw.get('interior_structure_length_m', 0):.2f} m  |  "
+                        f"Exterior structure: {wall_lengths_raw.get('exterior_structure_length_m', 0):.2f} m",
                         styles["Small"]
                     ))
                     story.append(Spacer(1, 2*mm))
@@ -3361,6 +3389,11 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         opening_items = openings.get("detailed_items", openings.get("items", [])) if openings else []
         num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
         num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
+        # Total areas by category (for explicit deduction in wall sections)
+        total_windows_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "window" in str(it.get("type", "")).lower())
+        total_exterior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() == "exterior")
+        total_interior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() != "exterior")
+        total_openings_area = total_windows_area + total_exterior_doors_area + total_interior_doors_area
         story.append(Spacer(1, 2*mm))
         story.append(Paragraph(
             f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
@@ -3390,6 +3423,28 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     ))
         else:
             story.append(Paragraph("<i>No openings detected for this plan.</i>", styles["Body"]))
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph("<b>Total area of openings (used for wall surface deductions):</b>", styles["Body"]))
+        story.append(Paragraph(
+            f"  • Windows: <b>{total_windows_area:.2f} m²</b>",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"  • Exterior doors: <b>{total_exterior_doors_area:.2f} m²</b> (deducted from exterior wall finishes and exterior wall structure)",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"  • Interior doors: <b>{total_interior_doors_area:.2f} m²</b> (deducted from interior wall finishes and interior wall structure)",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            f"  • Total openings area: <b>{total_openings_area:.2f} m²</b>",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            "In sections 2 and 4, gross wall surfaces are reduced by these opening areas to obtain net wall area for pricing.",
+            styles["Small"]
+        ))
         if openings and openings.get("total_cost", 0) > 0:
             story.append(Paragraph(
                 f"<b>Openings total for this plan: {openings.get('total_cost', 0):.2f} EUR</b>",
@@ -3446,12 +3501,16 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             story.append(Paragraph(
-                f"  • Openings deducted (interior doors only): <b>{open_int:.2f} m²</b>",
+                f"  • Openings deducted (interior doors only, from section 3): <b>{open_int:.2f} m²</b>",
                 styles["Body"]
             ))
             story.append(Paragraph(
                 f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
                 styles["Body"]
+            ))
+            story.append(Paragraph(
+                "<i>Interior openings = sum of all interior door areas (section 3).</i>",
+                styles["Small"]
             ))
             story.append(Spacer(1, 2*mm))
             story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
@@ -3464,12 +3523,16 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 styles["Body"]
             ))
             story.append(Paragraph(
-                f"  • Openings deducted (windows + exterior doors): <b>{open_ext:.2f} m²</b>",
+                f"  • Openings deducted (windows + exterior doors, from section 3): <b>{open_ext:.2f} m²</b>",
                 styles["Body"]
             ))
             story.append(Paragraph(
                 f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
                 styles["Body"]
+            ))
+            story.append(Paragraph(
+                "<i>Exterior openings = sum of all window areas + exterior door areas (section 3).</i>",
+                styles["Small"]
             ))
             story.append(Spacer(1, 4*mm))
         else:

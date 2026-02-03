@@ -3406,6 +3406,22 @@ def run_cubicasa_detection(
         with open(walls_measurements_file, "w", encoding="utf-8") as f:
             json.dump(walls_measurements_data, f, indent=2, ensure_ascii=False)
         print(f"   💾 Salvat: walls_measurements.json (pentru pricing)")
+        # wall_lengths.json: lungimi explicite din pixeli (07, 08, 11) × m_px pentru documentație și PDF
+        wall_lengths_file = raster_processing_dir / "wall_lengths.json"
+        wall_lengths_data = {
+            "scale_m_per_px": float(m_px),
+            "interior_finish_length_px": int(px_len_int),
+            "interior_finish_length_m": float(round(walls_int_m, 4)),
+            "exterior_length_px": int(px_len_ext),
+            "exterior_length_m": float(round(walls_ext_m, 4)),
+            "interior_structure_length_px": int(px_len_skeleton_structure_int),
+            "interior_structure_length_m": float(round(walls_skeleton_structure_int_m, 4)),
+            "exterior_structure_length_px": int(px_len_skeleton_ext),
+            "exterior_structure_length_m": float(round(walls_skeleton_ext_m, 4)),
+        }
+        with open(wall_lengths_file, "w", encoding="utf-8") as f:
+            json.dump(wall_lengths_data, f, indent=2, ensure_ascii=False)
+        print(f"   💾 Salvat: wall_lengths.json (lungimi pereți pentru PDF)")
     
     # 10. FILTRARE ZGOMOT CU MASCĂ ZONĂ INTERIOARĂ (înainte de generarea 3D)
     print("   🎨 Filtrez zgomotul de fundal cu masca zonei interioare...")
