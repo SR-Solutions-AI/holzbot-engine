@@ -294,9 +294,11 @@ def run_segmentation_and_classification_for_document(
     if floors_number is not None:
         user_expected = int(floors_number) + (1 if has_basement_form else 0)
     else:
+        # listaEtaje poate conține "intermediar", "mansarda", "pod" – doar "intermediar" = etaj cu plan separat; mansardă/acoperiș nu e etaj suplimentar
         lista_etaje = structura.get("listaEtaje")
         if isinstance(lista_etaje, list):
-            user_expected = 1 + len(lista_etaje) + (1 if has_basement_form else 0)
+            etaje_intermediare = sum(1 for e in lista_etaje if e == "intermediar")
+            user_expected = 1 + etaje_intermediare + (1 if has_basement_form else 0)
         elif isinstance(lista_etaje, dict):
             user_expected = 1 + (1 if has_basement_form else 0)
         else:
