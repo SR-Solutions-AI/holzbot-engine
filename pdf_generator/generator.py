@@ -3234,54 +3234,52 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 story.append(measurements_table)
                 story.append(Spacer(1, 2*mm))
             # Optional: CubiCasa pixel/scale detail if file exists
-                cubicasa_data = None
-                if cubicasa_json_path.exists():
-                    try:
-                        with open(cubicasa_json_path, "r", encoding="utf-8") as f:
-                            cubicasa_data = json.load(f)
-                    except Exception:
-                        pass
-                if cubicasa_data and cubicasa_data.get("measurements"):
-                    story.append(Paragraph("<b>Scale and pixel lengths (CubiCasa source):</b>", styles["H3"]))
-                    measurements = cubicasa_data["measurements"]
-                    scale_m_px = measurements.get("metrics", {}).get("scale_m_per_px", 0.0)
-                    pixels_data = measurements.get("pixels", {})
-                    metrics_data = measurements.get("metrics", {})
-                    story.append(Paragraph(f"Scale: <b>{scale_m_px:.9f} m/pixel</b>", styles["Body"]))
-                    px_ext = pixels_data.get("walls_len_ext", 0)
-                    px_int = pixels_data.get("walls_len_int", 0)
-                    walls_ext_m = metrics_data.get("walls_ext_m", 0.0)
-                    walls_int_m = metrics_data.get("walls_int_m", 0.0)
-                    story.append(Paragraph(
-                        f"Exterior: {px_ext:,} px × scale = <b>{walls_ext_m:.2f} m</b>  |  "
-                        f"Interior (outline): {px_int:,} px × scale = <b>{walls_int_m:.2f} m</b>",
-                        styles["Small"]
-                    ))
-                    story.append(Spacer(1, 2*mm))
-                        
-            except Exception as e:
-                print(f"⚠️ [PDF] Could not load detailed measurements for {plan.plan_id}: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            if not area_data:
-                story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
-            
-            if walls and walls.get("total_cost", 0) > 0:
-                story.append(Paragraph("<b>Cost calculation:</b>", styles["Body"]))
-                for item in walls.get("detailed_items", []):
-                    area = item.get("area_m2", 0)
-                    unit_price = item.get("unit_price", 0)
-                    cost = item.get("cost", 0)
-                    name = item.get("name", "")
-                    material = _en(item.get("material", "—"))
-                    construction_mode = _en(item.get("construction_mode", "—"))
-                    story.append(Paragraph(
-                        f"  {material} | {construction_mode}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                        styles["Body"]
-                    ))
-            
-            story.append(Spacer(1, 4*mm))
+            cubicasa_data = None
+            if cubicasa_json_path.exists():
+                try:
+                    with open(cubicasa_json_path, "r", encoding="utf-8") as f:
+                        cubicasa_data = json.load(f)
+                except Exception:
+                    pass
+            if cubicasa_data and cubicasa_data.get("measurements"):
+                story.append(Paragraph("<b>Scale and pixel lengths (CubiCasa source):</b>", styles["H3"]))
+                measurements = cubicasa_data["measurements"]
+                scale_m_px = measurements.get("metrics", {}).get("scale_m_per_px", 0.0)
+                pixels_data = measurements.get("pixels", {})
+                metrics_data = measurements.get("metrics", {})
+                story.append(Paragraph(f"Scale: <b>{scale_m_px:.9f} m/pixel</b>", styles["Body"]))
+                px_ext = pixels_data.get("walls_len_ext", 0)
+                px_int = pixels_data.get("walls_len_int", 0)
+                walls_ext_m = metrics_data.get("walls_ext_m", 0.0)
+                walls_int_m = metrics_data.get("walls_int_m", 0.0)
+                story.append(Paragraph(
+                    f"Exterior: {px_ext:,} px × scale = <b>{walls_ext_m:.2f} m</b>  |  "
+                    f"Interior (outline): {px_int:,} px × scale = <b>{walls_int_m:.2f} m</b>",
+                    styles["Small"]
+                ))
+                story.append(Spacer(1, 2*mm))
+        except Exception as e:
+            print(f"⚠️ [PDF] Could not load detailed measurements for {plan.plan_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        if not area_data:
+            story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
+        
+        if walls and walls.get("total_cost", 0) > 0:
+            story.append(Paragraph("<b>Cost calculation:</b>", styles["Body"]))
+            for item in walls.get("detailed_items", []):
+                area = item.get("area_m2", 0)
+                unit_price = item.get("unit_price", 0)
+                cost = item.get("cost", 0)
+                name = item.get("name", "")
+                material = _en(item.get("material", "—"))
+                construction_mode = _en(item.get("construction_mode", "—"))
+                story.append(Paragraph(
+                    f"  {material} | {construction_mode}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                    styles["Body"]
+                ))
+        story.append(Spacer(1, 4*mm))
     
         # 3. OPENINGS (WINDOWS & DOORS) CALCULATION FOR THIS PLAN
         openings = breakdown.get("openings", {})
