@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from config.settings import load_plan_infos, PlansListError, PlanInfo
+from config.settings import load_plan_infos, PlansListError, PlanInfo, get_run_dir
 from .calculator import calculate_pricing_for_plan
 from .db_loader import fetch_pricing_parameters
 from .modes import get_pricing_mode
@@ -75,7 +75,8 @@ def _run_for_single_plan(
     frontend_data: dict, 
     total_plans: int,
     pricing_coeffs: dict,
-    all_plans: List[PlanInfo] = None  # Lista tuturor planurilor pentru a calcula floor_idx
+    all_plans: List[PlanInfo] = None,  # Lista tuturor planurilor pentru a calcula floor_idx
+    basement_plan_index: int | None = None,  # Index (0-based) al planului ales ca beci; None = fără beci dedicat
 ) -> PricingJobResult:
     work_dir = plan.stage_work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +264,8 @@ def _run_for_single_plan(
                             except Exception:
                                 pass
         
+        is_basement_plan = basement_plan_index is not None and plan_index == basement_plan_index
+        has_dedicated_basement_plan = basement_plan_index is not None
         result = calculate_pricing_for_plan(
             area_data=area_data, 
             openings_data=openings_data, 
@@ -272,7 +275,9 @@ def _run_for_single_plan(
             total_floors=total_plans,
             is_ground_floor=is_ground_floor,
             plan_index=plan_index,
-            intermediate_floor_index=intermediate_floor_index  # Indexul etajului intermediar (1, 2, 3, etc.)
+            intermediate_floor_index=intermediate_floor_index,  # Indexul etajului intermediar (1, 2, 3, etc.)
+            is_basement_plan=is_basement_plan,
+            has_dedicated_basement_plan=has_dedicated_basement_plan,
         )
 
         allowed = frontend_data.get("allowed_pricing_categories")
@@ -319,12 +324,24 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
         return []
 
     total_plans = len(plans)
+    basement_plan_index = None
+    try:
+        run_dir = get_run_dir(run_id)
+        bp_file = run_dir / "basement_plan_id.json"
+        if bp_file.exists():
+            bp_data = json.loads(bp_file.read_text(encoding="utf-8"))
+            basement_plan_index = bp_data.get("basement_plan_index")
+            if basement_plan_index is not None:
+                print(f"   📋 [PRICING] Beci dedicat: plan index {basement_plan_index}")
+    except Exception as e:
+        print(f"   ⚠️ [PRICING] Nu am putut încărca basement_plan_id.json: {e}")
+
     max_parallel = max_parallel or min(os.cpu_count() or 4, total_plans)
     results = []
     
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {
-            executor.submit(_run_for_single_plan, run_id, plan, idx, frontend_data, total_plans, pricing_coeffs, plans): plan 
+            executor.submit(_run_for_single_plan, run_id, plan, idx, frontend_data, total_plans, pricing_coeffs, plans, basement_plan_index): plan 
             for idx, plan in enumerate(plans)
         }
         for fut in as_completed(futures):

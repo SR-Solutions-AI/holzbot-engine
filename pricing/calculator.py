@@ -20,7 +20,9 @@ def calculate_pricing_for_plan(
     total_floors: int = 1,
     is_ground_floor: bool = False,
     plan_index: int = 0,
-    intermediate_floor_index: int = 0  # Indexul etajului intermediar (1, 2, 3, etc.)
+    intermediate_floor_index: int = 0,  # Indexul etajului intermediar (1, 2, 3, etc.)
+    is_basement_plan: bool = False,  # Acest plan este beciul ales (plan dedicat beci)
+    has_dedicated_basement_plan: bool = False,  # Există un plan dedicat beci → nu mai adăugăm cost_basement la parter
 ) -> dict:
     """
     Calculează toate costurile pentru un plan folosind coeficienții din DB.
@@ -135,10 +137,80 @@ def calculate_pricing_for_plan(
     floor_type = area_data.get("floor_type", "").lower()
     is_top_floor_plan = ("top" in floor_type or "mansard" in floor_type) or (total_floors == 1)
     
-    # Verificăm dacă avem beci locuibil din frontend_data
+    # Verificăm dacă avem beci locuibil din frontend_data (și din câmpul basementUse)
     structura_cladirii = frontend_input.get("structuraCladirii", {})
     tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci", "")
-    has_basement_livable = "mit einfachem Ausbau" in str(tip_fundatie_beci)
+    has_basement_livable = frontend_input.get("basementUse", False) or ("mit einfachem Ausbau" in str(tip_fundatie_beci))
+    
+    # ---------- Plan dedicat beci: doar pereți interiori, finisaje interior, podele, utilități (fără exterior/fundație/acoperiș) ----------
+    if is_basement_plan:
+        finish_int_beci = _norm_finish(
+            mat_finisaj.get("finisajInteriorBeci") or mat_finisaj.get("finisajInterior", "Tencuială"),
+            "Tencuială"
+        )
+        cost_walls_b = calculate_walls_details(
+            system_coeffs, w_int_net_structure, 0.0,
+            system=system_constructie, prefab_type=prefab_type
+        )
+        cost_finishes_b = calculate_finishes_details(
+            finish_coeffs, w_int_net_finish, 0.0,
+            type_int=finish_int_beci, type_ext="Tencuială",
+            floor_label="Beci"
+        )
+        cost_floors_b = calculate_floors_details(area_coeffs, floor_area, ceiling_area)
+        electricity_coeffs = pricing_coeffs["utilities"]["electricity"]
+        heating_coeffs = pricing_coeffs["utilities"]["heating"]
+        ventilation_coeffs = pricing_coeffs["utilities"]["ventilation"]
+        sewage_coeffs = pricing_coeffs["utilities"]["sewage"]
+        energy_level = performanta.get("nivelEnergetic", "Standard")
+        heating_type = performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or "Gaz"
+        has_ventilation = performanta.get("ventilatie", False)
+        if has_basement_livable:
+            cost_utilities_b = calculate_utilities_details(
+                electricity_coeffs, heating_coeffs, ventilation_coeffs, sewage_coeffs,
+                total_floor_area_m2=floor_area, energy_level=energy_level,
+                heating_type=heating_type, has_ventilation=has_ventilation, has_sewage=True
+            )
+        else:
+            elec_base = float(electricity_coeffs.get("coefficient_electricity_per_m2", 60.0))
+            elec_modifiers = electricity_coeffs.get("energy_performance_modifiers", {})
+            elec_modifier = float(elec_modifiers.get(energy_level, 1.0))
+            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0))
+            cost_utilities_b = {
+                "total_cost": round(floor_area * (elec_base * elec_modifier + sewage_base), 2),
+                "detailed_items": [
+                    {"category": "electricity", "name": f"Instalație electrică beci ({energy_level})", "area_m2": round(floor_area, 2), "total_cost": round(floor_area * elec_base * elec_modifier, 2)},
+                    {"category": "sewage", "name": "Canalizare beci", "area_m2": round(floor_area, 2), "total_cost": round(floor_area * sewage_base, 2)}
+                ]
+            }
+        total_b = cost_walls_b["total_cost"] + cost_finishes_b["total_cost"] + cost_floors_b["total_cost"] + cost_utilities_b["total_cost"]
+        cost_basement_only = {
+            "total_cost": round(total_b, 2),
+            "detailed_items": (
+                cost_walls_b.get("detailed_items", []) +
+                cost_finishes_b.get("detailed_items", []) +
+                cost_floors_b.get("detailed_items", []) +
+                cost_utilities_b.get("detailed_items", [])
+            )
+        }
+        print(f"✅ [PRICING] Plan beci (dedicat): {cost_basement_only['total_cost']:,.0f} EUR (fără finisaje exterioare)")
+        return {
+            "total_cost_eur": round(total_b, 2),
+            "total_area_m2": floor_area,
+            "currency": "EUR",
+            "breakdown": {
+                "foundation": {"total_cost": 0.0, "detailed_items": []},
+                "structure_walls": cost_walls_b,
+                "floors_ceilings": cost_floors_b,
+                "roof": {"total_cost": 0.0, "detailed_items": []},
+                "openings": {"total_cost": 0.0, "detailed_items": []},
+                "finishes": cost_finishes_b,
+                "utilities": cost_utilities_b,
+                "stairs": {"total_cost": 0.0, "detailed_items": []},
+                "fireplace": {"total_cost": 0.0, "detailed_items": []},
+                "basement": cost_basement_only
+            }
+        }
     
     # Verificăm dacă top floor este mansardă sau pod
     # În frontend, listaEtaje conține tipurile de etaje: 'intermediar', 'pod', 'mansarda_ohne', 'mansarda_mit'
@@ -325,15 +397,12 @@ def calculate_pricing_for_plan(
         cost_fireplace["total_cost"]
     )
 
-    # 6. CALCUL BASEMENT (dacă există)
-    # Calculăm beciul folosind coeficienți multiplicați cu suprafața parterului
+    # 6. CALCUL BASEMENT (dacă există și NU e deja un plan dedicat beci)
+    # Când has_dedicated_basement_plan = True, beciul e calculat pe planul dedicat; nu mai adăugăm bloc aici.
     cost_basement = {"total_cost": 0.0, "detailed_items": []}
-    structura_cladirii = frontend_input.get("structuraCladirii", {})
-    tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci", "")
     has_basement = tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
-    has_basement_livable = has_basement and "mit einfachem Ausbau" in str(tip_fundatie_beci)
     
-    if has_basement and is_ground_floor:
+    if has_basement and is_ground_floor and not has_dedicated_basement_plan:
         # Coeficienți pentru beci
         if has_basement_livable:
             # Beci locuibil: coeficienți mai mari (include finisaje elaborate)

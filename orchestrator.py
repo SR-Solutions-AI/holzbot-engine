@@ -16,8 +16,9 @@ import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo
+from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo, get_run_dir
 from config.frontend_loader import load_frontend_data_for_run
+from floor_classifier.basement_scorer import run_basement_scoring
 from typing import List, Tuple
 
 # ✅ IMPORT SEGMENTER JOBS
@@ -290,7 +291,43 @@ def run_segmentation_and_classification_for_document(
         print(f"⚠️  {len(plans) - len(house_plans)} plans EXCLUDED (not house_blueprint)\n")
     
     if house_plans:
+        # ---------- Verificare număr etaje vs formular ----------
+        frontend_data = load_frontend_data_for_run(job_root.name, job_root)
+        our_floors = len(house_plans)
+        floors_number = frontend_data.get("floorsNumber")
+        basement = frontend_data.get("basement", False)
+        structura = frontend_data.get("structuraCladirii", {})
+        tip_fundatie_beci = (structura.get("tipFundatieBeci") or "")
+        has_basement_form = basement or (
+            tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
+        )
+        if floors_number is not None:
+            user_expected = int(floors_number) + (1 if has_basement_form else 0)
+        else:
+            lista_etaje = structura.get("listaEtaje") or []
+            if isinstance(lista_etaje, list):
+                user_expected = 1 + len(lista_etaje) + (1 if has_basement_form else 0)
+            else:
+                user_expected = None
+        if user_expected is not None and our_floors != user_expected:
+            print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
+            print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
+            sys.exit(1)
+        # ---------- Dacă utilizatorul a ales beci: scor Gemini pentru a alege care plan e beciul ----------
+        basement_plan_index = None
+        if has_basement_form and our_floors > 0:
+            with Timer("STEP 4b: Basement scoring (Gemini)") as _t:
+                basement_plan_index = run_basement_scoring(house_plans)
+            pipeline_timer.add_step("Basement scoring", _t.end_time - _t.start_time)
+        # ---------- Creare run și salvare basement_plan_index ----------
         run_id = _create_run_for_detections(job_root, house_plans)
+        if basement_plan_index is not None:
+            run_dir = get_run_dir(run_id)
+            (run_dir / "basement_plan_id.json").write_text(
+                json.dumps({"basement_plan_index": basement_plan_index}, indent=2),
+                encoding="utf-8",
+            )
+            print(f"   💾 Salvat: {run_dir / 'basement_plan_id.json'} (beci = plan index {basement_plan_index})")
         
         with Timer("STEP 5: Detections") as t:
             run_detections_for_run(run_id)
@@ -438,10 +475,6 @@ def run_segmentation_and_classification_for_document(
             notify_ui("computation_complete", pdf_path if pdf_path and Path(pdf_path).exists() else None)
 
         pipeline_timer.finish()
-    else:
-        # 0 house blueprints → no PDF generated; signal API to mark offer as failed
-        pipeline_timer.finish()
-        sys.exit(2)
     return job_root, plans, floor_results
 
 if __name__ == "__main__":
