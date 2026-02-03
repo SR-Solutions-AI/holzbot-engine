@@ -304,11 +304,15 @@ def run_segmentation_and_classification_for_document(
         if floors_number is not None:
             user_expected = int(floors_number) + (1 if has_basement_form else 0)
         else:
-            lista_etaje = structura.get("listaEtaje") or []
+            lista_etaje = structura.get("listaEtaje")
             if isinstance(lista_etaje, list):
                 user_expected = 1 + len(lista_etaje) + (1 if has_basement_form else 0)
+            elif isinstance(lista_etaje, dict):
+                # Form poate trimite obiect în loc de array
+                user_expected = 1 + (1 if has_basement_form else 0)
             else:
-                user_expected = None
+                # Fără floorsNumber și fără listaEtaje validă (lipsă sau nu e listă): presupunem parter (1 etaj) ca să nu sărim verificarea
+                user_expected = 1 + (1 if has_basement_form else 0)
         if user_expected is not None and our_floors != user_expected:
             print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
             print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
