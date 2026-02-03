@@ -3124,139 +3124,116 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             story.append(Spacer(1, 4*mm))
     
-        # 2. WALLS CALCULATION FOR THIS PLAN
+        # 2. STRUCTURAL WALLS – always show full calculation data from areas_calculated.json
         walls = breakdown.get("structure_walls", {})
-        if walls and walls.get("total_cost", 0) > 0:
-            story.append(Paragraph("2. Structural Walls Calculation", styles["H2"]))
-            story.append(Paragraph(
-                "<b>Formula:</b> Cost = Interior Wall Area (m²) × Interior Unit Price × Prefabrication Modifier + "
-                "Exterior Wall Area (m²) × Exterior Unit Price × Prefabrication Modifier",
-                styles["Body"]
-            ))
+        story.append(Paragraph("2. Structural Walls Calculation", styles["H2"]))
+        story.append(Paragraph(
+            "<b>Formula:</b> Cost = Interior Wall Area (m²) × Interior Unit Price × Prefabrication Modifier + "
+            "Exterior Wall Area (m²) × Exterior Unit Price × Prefabrication Modifier",
+            styles["Body"]
+        ))
+        
+        area_data = None
+        walls_measurements_raw = None
+        try:
+            scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
+            area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+            raster_walls_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
+            cubicasa_json_path = plan.stage_work_dir / "cubicasa_result.json"
             
-            # Load ALL calculation sources: areas_calculated.json, walls_measurements.json, cubicasa_result.json
-            area_data = None
-            walls_measurements_raw = None
-            try:
-                scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
-                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
-                raster_walls_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
-                cubicasa_json_path = plan.stage_work_dir / "cubicasa_result.json"
-                
-                if area_json_path.exists():
-                    with open(area_json_path, "r", encoding="utf-8") as f:
-                        area_data = json.load(f)
-                if raster_walls_path.exists():
-                    try:
-                        with open(raster_walls_path, "r", encoding="utf-8") as f:
-                            walls_measurements_raw = json.load(f)
-                    except Exception:
-                        pass
-                
-                # ----- Structural walls: always show full lengths, heights, gross, openings, net from areas_calculated.json -----
-                if area_data:
-                    story.append(Spacer(1, 2*mm))
-                    story.append(Paragraph("<b>Detailed wall data (from area calculation):</b>", styles["H3"]))
-                    walls_data = area_data.get("walls", {})
-                    interior_data = walls_data.get("interior", {})
-                    exterior_data = walls_data.get("exterior", {})
-                    wall_height = area_data.get("wall_height_m")
-                    if wall_height is None and interior_data.get("length_m"):
-                        wall_height = interior_data.get("gross_area_m2", 0) / max(interior_data.get("length_m", 1), 0.001) if interior_data.get("length_m") else 2.7
-                    if wall_height is None:
-                        wall_height = 2.7
-                    wall_height = float(wall_height)
-                    
-                    ext_length = float(exterior_data.get("length_m", 0.0))
-                    ext_gross = float(exterior_data.get("gross_area_m2", 0.0))
-                    ext_openings = float(exterior_data.get("openings_area_m2", 0.0))
-                    ext_net = float(exterior_data.get("net_area_m2", 0.0))
-                    int_length_finish = float(interior_data.get("length_m", 0.0))
-                    int_gross_finish = float(interior_data.get("gross_area_m2", 0.0))
-                    int_openings = float(interior_data.get("openings_area_m2", 0.0))
-                    int_net_finish = float(interior_data.get("net_area_m2", 0.0))
-                    int_length_structure = float(interior_data.get("length_m_structure", 0.0))
-                    int_gross_structure = float(interior_data.get("gross_area_m2_structure", 0.0))
-                    int_net_structure = float(interior_data.get("net_area_m2_structure", 0.0))
-                    
-                    story.append(Paragraph(f"<b>Wall height used:</b> {wall_height:.2f} m (from floor height setting).", styles["Body"]))
-                    story.append(Spacer(1, 2*mm))
-                    
-                    story.append(Paragraph("<b>Exterior walls (structure and finishes use same length):</b>", styles["Body"]))
+            if area_json_path.exists():
+                with open(area_json_path, "r", encoding="utf-8") as f:
+                    area_data = json.load(f)
+            if raster_walls_path.exists():
+                try:
+                    with open(raster_walls_path, "r", encoding="utf-8") as f:
+                        walls_measurements_raw = json.load(f)
+                except Exception:
+                    pass
+            
+            if area_data:
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Detailed wall data (from area calculation):</b>", styles["H3"]))
+                walls_data = area_data.get("walls", {})
+                interior_data = walls_data.get("interior", {})
+                exterior_data = walls_data.get("exterior", {})
+                wall_height = area_data.get("wall_height_m")
+                if wall_height is None and interior_data.get("length_m"):
+                    wall_height = interior_data.get("gross_area_m2", 0) / max(interior_data.get("length_m", 1), 0.001) if interior_data.get("length_m") else 2.7
+                if wall_height is None:
+                    wall_height = 2.7
+                wall_height = float(wall_height)
+                ext_length = float(exterior_data.get("length_m", 0.0))
+                ext_gross = float(exterior_data.get("gross_area_m2", 0.0))
+                ext_openings = float(exterior_data.get("openings_area_m2", 0.0))
+                ext_net = float(exterior_data.get("net_area_m2", 0.0))
+                int_length_finish = float(interior_data.get("length_m", 0.0))
+                int_gross_finish = float(interior_data.get("gross_area_m2", 0.0))
+                int_openings = float(interior_data.get("openings_area_m2", 0.0))
+                int_net_finish = float(interior_data.get("net_area_m2", 0.0))
+                int_length_structure = float(interior_data.get("length_m_structure", 0.0))
+                int_gross_structure = float(interior_data.get("gross_area_m2_structure", 0.0))
+                int_net_structure = float(interior_data.get("net_area_m2_structure", 0.0))
+                story.append(Paragraph(f"<b>Wall height used:</b> {wall_height:.2f} m (from floor height setting).", styles["Body"]))
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Exterior walls (structure and finishes use same length):</b>", styles["Body"]))
+                story.append(Paragraph(f"  • Length (exterior): <b>{ext_length:.2f} m</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {ext_length:.2f} m × {wall_height:.2f} m = <b>Gross area: {ext_gross:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (windows + exterior doors): <b>{ext_openings:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area (exterior): Gross − Openings = {ext_gross:.2f} − {ext_openings:.2f} = <b>{ext_net:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Interior walls – finishes (green outline):</b>", styles["Body"]))
+                story.append(Paragraph(f"  • Length (interior, for finishes): <b>{int_length_finish:.2f} m</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {int_length_finish:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_finish:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (interior doors): <b>{int_openings:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area (interior finishes): Gross − Openings = {int_gross_finish:.2f} − {int_openings:.2f} = <b>{int_net_finish:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Interior walls – structure (skeleton):</b>", styles["Body"]))
+                story.append(Paragraph(f"  • Length (interior, for structure): <b>{int_length_structure:.2f} m</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {int_length_structure:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_structure:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(f"  • Openings deducted: <b>{int_openings:.2f} m²</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Net area (interior structure): Gross − Openings = {int_gross_structure:.2f} − {int_openings:.2f} = <b>{int_net_structure:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Spacer(1, 2*mm))
+                if walls_measurements_raw:
+                    avg = walls_measurements_raw.get("estimations", {}).get("average_result", {})
+                    story.append(Paragraph("<b>Raw lengths from walls_measurements.json (raster):</b>", styles["Body"]))
                     story.append(Paragraph(
-                        f"  • Length (exterior): <b>{ext_length:.2f} m</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Surface: Length × Height = {ext_length:.2f} m × {wall_height:.2f} m = <b>Gross area: {ext_gross:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Openings deducted (windows + exterior doors): <b>{ext_openings:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Net area (exterior): Gross − Openings = {ext_gross:.2f} − {ext_openings:.2f} = <b>{ext_net:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Spacer(1, 2*mm))
-                    
-                    story.append(Paragraph("<b>Interior walls – finishes (green outline):</b>", styles["Body"]))
-                    story.append(Paragraph(
-                        f"  • Length (interior, for finishes): <b>{int_length_finish:.2f} m</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Surface: Length × Height = {int_length_finish:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_finish:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Openings deducted (interior doors): <b>{int_openings:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Net area (interior finishes): Gross − Openings = {int_gross_finish:.2f} − {int_openings:.2f} = <b>{int_net_finish:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Spacer(1, 2*mm))
-                    
-                    story.append(Paragraph("<b>Interior walls – structure (skeleton):</b>", styles["Body"]))
-                    story.append(Paragraph(
-                        f"  • Length (interior, for structure): <b>{int_length_structure:.2f} m</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Surface: Length × Height = {int_length_structure:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_structure:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Openings deducted: <b>{int_openings:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-                    story.append(Paragraph(
-                        f"  • Net area (interior structure): Gross − Openings = {int_gross_structure:.2f} − {int_openings:.2f} = <b>{int_net_structure:.2f} m²</b>",
-                        styles["Body"]
+                        f"  Interior (finishes): {avg.get('interior_meters', 0):.2f} m  |  "
+                        f"Exterior: {avg.get('exterior_meters', 0):.2f} m  |  "
+                        f"Interior (structure): {avg.get('interior_meters_structure', 0):.2f} m",
+                        styles["Small"]
                     ))
                     story.append(Spacer(1, 2*mm))
-                    
-                    if walls_measurements_raw:
-                        avg = walls_measurements_raw.get("estimations", {}).get("average_result", {})
-                        story.append(Paragraph("<b>Raw lengths from walls_measurements.json (raster):</b>", styles["Body"]))
-                        story.append(Paragraph(
-                            f"  Interior (finishes): {avg.get('interior_meters', 0):.2f} m  |  "
-                            f"Exterior: {avg.get('exterior_meters', 0):.2f} m  |  "
-                            f"Interior (structure): {avg.get('interior_meters_structure', 0):.2f} m",
-                            styles["Small"]
-                        ))
-                        story.append(Spacer(1, 2*mm))
-                    
-                    from .tables import create_wall_measurements_table_english
-                    measurements_table = create_wall_measurements_table_english(area_data)
-                    story.append(Paragraph("<b>Summary table – wall measurements:</b>", styles["Body"]))
-                    story.append(measurements_table)
-                    story.append(Spacer(1, 2*mm))
-                
-                # Optional: CubiCasa pixel/scale detail if file exists
+                from .tables import create_wall_measurements_table_english
+                measurements_table = create_wall_measurements_table_english(area_data)
+                story.append(Paragraph("<b>Summary table – wall measurements:</b>", styles["Body"]))
+                story.append(measurements_table)
+                story.append(Spacer(1, 2*mm))
+            # Optional: CubiCasa pixel/scale detail if file exists
                 cubicasa_data = None
                 if cubicasa_json_path.exists():
                     try:
@@ -3287,23 +3264,22 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 import traceback
                 traceback.print_exc()
             
-            items = walls.get("detailed_items", [])
-            for item in items:
-                area = item.get("area_m2", 0)
-                unit_price = item.get("unit_price", 0)
-                cost = item.get("cost", 0)
-                name = item.get("name", "")
-                material = _en(item.get("material", "—"))
-                construction_mode = _en(item.get("construction_mode", "—"))
-                
-                story.append(Paragraph(
-                    f"<b>Material selected:</b> {material} | <b>Construction mode:</b> {construction_mode}",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"<b>Calculation:</b> {name}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                    styles["Body"]
-                ))
+            if not area_data:
+                story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
+            
+            if walls and walls.get("total_cost", 0) > 0:
+                story.append(Paragraph("<b>Cost calculation:</b>", styles["Body"]))
+                for item in walls.get("detailed_items", []):
+                    area = item.get("area_m2", 0)
+                    unit_price = item.get("unit_price", 0)
+                    cost = item.get("cost", 0)
+                    name = item.get("name", "")
+                    material = _en(item.get("material", "—"))
+                    construction_mode = _en(item.get("construction_mode", "—"))
+                    story.append(Paragraph(
+                        f"  {material} | {construction_mode}: {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                        styles["Body"]
+                    ))
             
             story.append(Spacer(1, 4*mm))
     
@@ -3358,91 +3334,88 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             story.append(Spacer(1, 4*mm))
     
-        # 4. FINISHES CALCULATION FOR THIS PLAN (wall finishes: interior + exterior)
+        # 4. FINISHES CALCULATION (wall finishes) – always show section with full data from areas_calculated.json
         finishes = breakdown.get("finishes", {})
-        if finishes and finishes.get("total_cost", 0) > 0:
-            story.append(Paragraph("4. Finishes Calculation (Wall Finishes)", styles["H2"]))
+        story.append(Paragraph("4. Finishes Calculation (Wall Finishes)", styles["H2"]))
+        story.append(Paragraph(
+            "<b>Formula:</b> Cost = Net wall area (m²) × Finish unit price per m². "
+            "Net area = (Length × Height) − Openings (doors/windows) area.",
+            styles["Body"]
+        ))
+        area_data_fin = None
+        try:
+            area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+            if area_json_path.exists():
+                with open(area_json_path, "r", encoding="utf-8") as f:
+                    area_data_fin = json.load(f)
+        except Exception:
+            pass
+        if area_data_fin:
+            walls_fin = area_data_fin.get("walls", {})
+            int_fin = walls_fin.get("interior", {})
+            ext_fin = walls_fin.get("exterior", {})
+            wall_height_f = area_data_fin.get("wall_height_m")
+            if wall_height_f is None and int_fin.get("length_m"):
+                g = float(int_fin.get("gross_area_m2", 0))
+                L = float(int_fin.get("length_m", 1))
+                wall_height_f = (g / L) if L > 0 else 2.7
+            if wall_height_f is None:
+                wall_height_f = 2.7
+            wall_height_f = float(wall_height_f)
+            len_int = float(int_fin.get("length_m", 0.0))
+            len_ext = float(ext_fin.get("length_m", 0.0))
+            gross_int = float(int_fin.get("gross_area_m2", 0.0))
+            gross_ext = float(ext_fin.get("gross_area_m2", 0.0))
+            open_int = float(int_fin.get("openings_area_m2", 0.0))
+            open_ext = float(ext_fin.get("openings_area_m2", 0.0))
+            net_int = float(int_fin.get("net_area_m2", 0.0))
+            net_ext = float(ext_fin.get("net_area_m2", 0.0))
+            story.append(Paragraph("<b>Wall height used for finishes:</b>", styles["Body"]))
+            story.append(Paragraph(f"  {wall_height_f:.2f} m (from floor height setting).", styles["Body"]))
+            story.append(Spacer(1, 2*mm))
+            story.append(Paragraph("<b>Interior wall finishes:</b>", styles["Body"]))
             story.append(Paragraph(
-                "<b>Formula:</b> Cost = Net wall area (m²) × Finish unit price per m². "
-                "Net area = (Length × Height) − Openings (doors/windows) area.",
+                f"  • Length (interior walls, outline): <b>{len_int:.2f} m</b>",
                 styles["Body"]
             ))
-            # Load areas_calculated.json and dump ALL lengths, height, surface calc, openings deducted, net
-            area_data_fin = None
-            try:
-                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
-                if area_json_path.exists():
-                    with open(area_json_path, "r", encoding="utf-8") as f:
-                        area_data_fin = json.load(f)
-            except Exception:
-                pass
-            if area_data_fin:
-                walls_fin = area_data_fin.get("walls", {})
-                int_fin = walls_fin.get("interior", {})
-                ext_fin = walls_fin.get("exterior", {})
-                wall_height_f = area_data_fin.get("wall_height_m")
-                if wall_height_f is None and int_fin.get("length_m"):
-                    g = float(int_fin.get("gross_area_m2", 0))
-                    L = float(int_fin.get("length_m", 1))
-                    wall_height_f = (g / L) if L > 0 else 2.7
-                if wall_height_f is None:
-                    wall_height_f = 2.7
-                wall_height_f = float(wall_height_f)
-                len_int = float(int_fin.get("length_m", 0.0))
-                len_ext = float(ext_fin.get("length_m", 0.0))
-                gross_int = float(int_fin.get("gross_area_m2", 0.0))
-                gross_ext = float(ext_fin.get("gross_area_m2", 0.0))
-                open_int = float(int_fin.get("openings_area_m2", 0.0))
-                open_ext = float(ext_fin.get("openings_area_m2", 0.0))
-                net_int = float(int_fin.get("net_area_m2", 0.0))
-                net_ext = float(ext_fin.get("net_area_m2", 0.0))
-                
-                story.append(Paragraph("<b>Wall height used for finishes:</b>", styles["Body"]))
-                story.append(Paragraph(f"  {wall_height_f:.2f} m (from floor height setting).", styles["Body"]))
-                story.append(Spacer(1, 2*mm))
-                
-                story.append(Paragraph("<b>Interior wall finishes:</b>", styles["Body"]))
-                story.append(Paragraph(
-                    f"  • Length (interior walls, outline): <b>{len_int:.2f} m</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Surface: Length × Height = {len_int:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_int:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Openings deducted (interior doors only): <b>{open_int:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Spacer(1, 2*mm))
-                
-                story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
-                story.append(Paragraph(
-                    f"  • Length (exterior walls): <b>{len_ext:.2f} m</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Surface: Length × Height = {len_ext:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_ext:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Openings deducted (windows + exterior doors): <b>{open_ext:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Paragraph(
-                    f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
-                    styles["Body"]
-                ))
-                story.append(Spacer(1, 4*mm))
-            
+            story.append(Paragraph(
+                f"  • Surface: Length × Height = {len_int:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_int:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"  • Openings deducted (interior doors only): <b>{open_int:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Spacer(1, 2*mm))
+            story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
+            story.append(Paragraph(
+                f"  • Length (exterior walls): <b>{len_ext:.2f} m</b>",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"  • Surface: Length × Height = {len_ext:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_ext:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"  • Openings deducted (windows + exterior doors): <b>{open_ext:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
+                styles["Body"]
+            ))
+            story.append(Spacer(1, 4*mm))
+        else:
+            story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
+            story.append(Spacer(1, 2*mm))
+        
+        if finishes and finishes.get("total_cost", 0) > 0:
             story.append(Paragraph("<b>Cost calculation (net area × unit price):</b>", styles["Body"]))
-            items = finishes.get("detailed_items", [])
-            for item in items:
-                name = item.get("name", "")
+            for item in finishes.get("detailed_items", []):
                 area = item.get("area_m2", 0)
                 unit_price = item.get("unit_price", 0)
                 cost = item.get("cost", 0)
@@ -3451,7 +3424,9 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     f"  • {material}: Net area <b>{area:.2f} m²</b> × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
-            story.append(Spacer(1, 4*mm))
+        else:
+            story.append(Paragraph("<i>Finishes not included in this offer level or cost is zero.</i>", styles["Body"]))
+        story.append(Spacer(1, 4*mm))
     
         # 5. FLOORS & CEILINGS CALCULATION FOR THIS PLAN
         floors = breakdown.get("floors_ceilings", {})
