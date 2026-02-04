@@ -826,7 +826,8 @@ def generate_walls_from_room_coordinates(
             dx = x2u - x1u
             dy = y2u - y1u
             line_length = np.sqrt(dx * dx + dy * dy)
-            half_count = max(2, min(6, line_thickness))
+            # Număr de linii galbene paralele = grosimea segmentului în pixeli (2.5% din plan): exact line_thickness linii
+            half_count = max(0, (line_thickness - 1) // 2)
             parallel_offsets = list(range(-half_count, half_count + 1))
             off_axis = 'y' if abs(dx) >= abs(dy) else 'x'
 
