@@ -567,6 +567,34 @@ def _clean_multiline_text(v: object, *, max_lines: int = 6, max_line_len: int = 
     return "\n".join(clipped)
 
 # ---------- LOGIC ----------
+def _normalize_nivel_oferta(frontend_data: dict) -> str:
+    """Mapează valorile din formular/calc_mode la cheia exactă pentru PDF: Structură | Structură + ferestre | Casă completă."""
+    materiale = frontend_data.get("materialeFinisaj") or {}
+    raw = (materiale.get("nivelOferta") or "").strip()
+    calc_mode = (frontend_data.get("calc_mode") or "").strip().lower()
+    if not raw and calc_mode:
+        if calc_mode in ("full_house", "full_house_premium", "casa_completa", "casacompleta"):
+            return "Casă completă"
+        if calc_mode in ("structure_windows", "structura_ferestre", "structura+ferestre"):
+            return "Structură + ferestre"
+        if calc_mode in ("structure", "structura"):
+            return "Structură"
+    if not raw:
+        return "Casă completă"
+    lower = raw.lower()
+    if lower in ("casă completă", "casa completa", "full_house", "full_house_premium", "casa_completa", "casacompleta",
+                 "schlüsselfertig", "schlüsselfertiges haus", "turnkey house"):
+        return "Casă completă"
+    if lower in ("structură + ferestre", "structure_windows", "structura+ferestre", "structura + ferestre",
+                 "structure + windows", "rohbau + fenster", "tragwerk + fenster"):
+        return "Structură + ferestre"
+    if lower in ("structură", "structura", "structure", "structure only", "rohbau", "rohbau / konstruktion"):
+        return "Structură"
+    if raw in ("Casă completă", "Structură + ferestre", "Structură"):
+        return raw
+    return "Casă completă"
+
+
 def _get_offer_inclusions(nivel_oferta: str) -> dict:
     INCLUSIONS = {
         "Structură": {
@@ -583,6 +611,34 @@ def _get_offer_inclusions(nivel_oferta: str) -> dict:
         }
     }
     return INCLUSIONS.get(nivel_oferta, INCLUSIONS["Casă completă"])
+
+
+def _finishes_per_floor_from_form(materiale_finisaj: dict) -> dict:
+    """Construiește dicționar finisaje per etaj din datele formularului (chei materialeFinisaj)."""
+    m = materiale_finisaj or {}
+    # Ordine etaje: Parter, Etaj 1, 2, 3, Mansardă, Beci
+    out = {}
+    # Parter / Erdgeschoss
+    fi_ground = m.get("finisajInterior_ground") or m.get("finisajInterior")
+    fa_ground = m.get("fatada_ground") or m.get("fatada")
+    if fi_ground or fa_ground:
+        out["Erdgeschoss"] = {"interior": fi_ground, "exterior": fa_ground}
+    for i in range(1, 4):
+        fi = m.get(f"finisajInterior_floor_{i}")
+        fa = m.get(f"fatada_floor_{i}")
+        if fi or fa:
+            out[f"Obergeschoss {i}"] = {"interior": fi, "exterior": fa}
+    # Mansardă
+    fi_mans = m.get("finisajInteriorMansarda")
+    fa_mans = m.get("fatadaMansarda")
+    if fi_mans or fa_mans:
+        out["Mansardă"] = {"interior": fi_mans, "exterior": fa_mans}
+    # Beci
+    fi_beci = m.get("finisajInteriorBeci")
+    if fi_beci:
+        out["Keller"] = {"interior": fi_beci, "exterior": None}
+    return out
+
 
 # ---------- STYLES ----------
 def _styles():
@@ -1633,11 +1689,12 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     print(f"🔍 [PDF] tip_semineu sources: performantaEnergetica={performanta_energetica.get('tipSemineu')}, performanta={performanta.get('tipSemineu')}, incalzire={incalzire_data.get('tipSemineu')}")
     print(f"🔍 [PDF] Final tip_semineu: '{tip_semineu}'")
     tamplarie = materiale_finisaj.get("tamplarie", "—")
-    nivel_finisare = materiale_finisaj.get("nivelOferta", "Schlüsselfertig")
+    nivel_finisare = _normalize_nivel_oferta(frontend_data)
     
-    # Colectăm finisajele per etaj din plans_data
-    finishes_per_floor = {}
+    # Finisaje per etaj: prioritate date din formular (alese de user), apoi fallback din plans_data (calcul)
+    finishes_per_floor = _finishes_per_floor_from_form(materiale_finisaj)
     if plans_data:
+        import re
         for entry in plans_data:
             pricing = entry.get("pricing", {})
             breakdown = pricing.get("breakdown", {})
@@ -1647,42 +1704,35 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                 for item in items:
                     floor_label = item.get("floor_label", "")
                     if not floor_label:
-                        # Încercăm să extragem din nume
                         name = item.get("name", "")
                         if "Erdgeschoss" in name or "ground" in name.lower():
                             floor_label = "Erdgeschoss"
                         elif "Mansardă" in name or "Mansarda" in name:
                             floor_label = "Mansardă"
                         elif "Obergeschoss" in name:
-                            # Extragem numărul
-                            import re
                             match = re.search(r'Obergeschoss\s*(\d+)', name)
-                            if match:
-                                floor_label = f"Obergeschoss {match.group(1)}"
-                            else:
-                                floor_label = "Obergeschoss"
+                            floor_label = f"Obergeschoss {match.group(1)}" if match else "Obergeschoss"
                         elif "Dachgeschoss" in name:
                             floor_label = "Dachgeschoss"
                         else:
-                            # Fallback: folosim tipul planului
                             plan = entry.get("info")
-                            if plan:
-                                entry_type = entry.get("type", "").strip().lower()
-                                if entry_type == "ground_floor":
-                                    floor_label = "Erdgeschoss"
-                                elif "top" in entry_type or "mansard" in entry_type:
-                                    floor_label = "Dachgeschoss"
-                                else:
-                                    floor_label = "Obergeschoss"
-                    
+                            entry_type = (entry.get("type") or "").strip().lower()
+                            if entry_type == "ground_floor":
+                                floor_label = "Erdgeschoss"
+                            elif "top" in entry_type or "mansard" in entry_type:
+                                floor_label = "Dachgeschoss"
+                            else:
+                                floor_label = "Obergeschoss"
+                    if not floor_label:
+                        continue
                     if floor_label not in finishes_per_floor:
                         finishes_per_floor[floor_label] = {"interior": None, "exterior": None}
-                    
                     category = item.get("category", "")
                     material = item.get("material", "")
-                    if "interior" in category:
+                    # Completați doar dacă formularul nu a furnizat deja valoarea
+                    if "interior" in category and finishes_per_floor[floor_label]["interior"] is None:
                         finishes_per_floor[floor_label]["interior"] = material
-                    elif "exterior" in category:
+                    elif "exterior" in category and finishes_per_floor[floor_label]["exterior"] is None:
                         finishes_per_floor[floor_label]["exterior"] = material
     
     # Traduce valorile
@@ -1715,8 +1765,8 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     
     # Finisaje interioare și exterioare (în loc de pereți)
     if finishes_per_floor:
-        # Sortăm etajele: Erdgeschoss primul, apoi Obergeschoss 1, 2, etc., apoi Mansardă/Dachgeschoss
-        floor_order = ["Erdgeschoss"]
+        # Sortăm etajele: Keller (Beci), Erdgeschoss, Obergeschoss 1, 2, etc., Mansardă, Dachgeschoss
+        floor_order = ["Keller", "Erdgeschoss"]
         for i in range(1, 10):
             floor_order.append(f"Obergeschoss {i}")
         floor_order.extend(["Mansardă", "Dachgeschoss"])
@@ -1974,7 +2024,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
                 else:
                     COMPANY[k] = v
     client_data_untranslated = frontend_data.get("client", frontend_data)
-    nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta", "Casă completă")
+    nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta)
     
     try: 
@@ -2447,7 +2497,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     global_utilities = []
 
     # ADMIN: Folosim aceeași filtrare ca în user PDF pentru același preț
-    nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta", "Casă completă")
+    nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta)
     
     for p_data in enriched_plans:
@@ -2578,60 +2628,51 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     
     # Materiale și finisaje
     if materiale_finisaj:
-        nivel_oferta = materiale_finisaj.get("nivelOferta", "—")
+        nivel_oferta = _normalize_nivel_oferta(frontend_data)
         tamplarie = materiale_finisaj.get("tamplarie", "—")
         material_acoperis = materiale_finisaj.get("materialAcoperis", "—")
         
         summary_items.append(f"<b>{enforcer.get('Nivel ofertă')}:</b> {enforcer.get(nivel_oferta) if nivel_oferta != '—' else '—'}")
         
-        # Colectăm finisajele per etaj din plans_data
-        finishes_per_floor = {}
-        for entry in plans_data:
+        # Finisaje per etaj: prioritate din formular, apoi din plans_data
+        finishes_per_floor = _finishes_per_floor_from_form(materiale_finisaj)
+        import re
+        for entry in (plans_data or []):
             pricing = entry.get("pricing", {})
             breakdown = pricing.get("breakdown", {})
             finishes_bd = breakdown.get("finishes", {})
-            if finishes_bd and finishes_bd.get("total_cost", 0) > 0:
-                items = finishes_bd.get("detailed_items", []) or finishes_bd.get("items", [])
-                for item in items:
-                    floor_label = item.get("floor_label", "")
-                    if not floor_label:
-                        # Încercăm să extragem din nume
-                        name = item.get("name", "")
-                        if "Erdgeschoss" in name or "ground" in name.lower():
-                            floor_label = "Erdgeschoss"
-                        elif "Mansardă" in name or "Mansarda" in name:
-                            floor_label = "Mansardă"
-                        elif "Obergeschoss" in name:
-                            import re
-                            match = re.search(r'Obergeschoss\s*(\d+)', name)
-                            if match:
-                                floor_label = f"Obergeschoss {match.group(1)}"
-                            else:
-                                floor_label = "Obergeschoss"
-                        elif "Dachgeschoss" in name:
-                            floor_label = "Dachgeschoss"
-                        else:
-                            entry_type = entry.get("type", "").strip().lower()
-                            if entry_type == "ground_floor":
-                                floor_label = "Erdgeschoss"
-                            elif "top" in entry_type or "mansard" in entry_type:
-                                floor_label = "Dachgeschoss"
-                            else:
-                                floor_label = "Obergeschoss"
-                    
-                    if floor_label not in finishes_per_floor:
-                        finishes_per_floor[floor_label] = {"interior": None, "exterior": None}
-                    
-                    category = item.get("category", "")
-                    material = item.get("material", "")
-                    if "interior" in category:
-                        finishes_per_floor[floor_label]["interior"] = material
-                    elif "exterior" in category:
-                        finishes_per_floor[floor_label]["exterior"] = material
+            if not (finishes_bd and finishes_bd.get("total_cost", 0) > 0):
+                continue
+            items = finishes_bd.get("detailed_items", []) or finishes_bd.get("items", [])
+            for item in items:
+                floor_label = item.get("floor_label", "")
+                if not floor_label:
+                    name = str(item.get("name", ""))
+                    entry_type = (entry.get("type") or "").strip().lower()
+                    if "Erdgeschoss" in name or "ground" in name.lower():
+                        floor_label = "Erdgeschoss"
+                    elif "Mansard" in name or "Mansarda" in name:
+                        floor_label = "Mansardă"
+                    elif "Dachgeschoss" in name:
+                        floor_label = "Dachgeschoss"
+                    else:
+                        mo = re.search(r'Obergeschoss\s*(\d+)', name)
+                        floor_label = f"Obergeschoss {mo.group(1)}" if mo else (
+                            "Erdgeschoss" if entry_type == "ground_floor"
+                            else "Dachgeschoss" if "mansard" in entry_type or "top" in entry_type
+                            else "Obergeschoss"
+                        )
+                if floor_label not in finishes_per_floor:
+                    finishes_per_floor[floor_label] = {"interior": None, "exterior": None}
+                cat, mat = item.get("category", ""), item.get("material", "")
+                if "interior" in cat and finishes_per_floor[floor_label]["interior"] is None:
+                    finishes_per_floor[floor_label]["interior"] = mat
+                elif "exterior" in cat and finishes_per_floor[floor_label]["exterior"] is None:
+                    finishes_per_floor[floor_label]["exterior"] = mat
         
         # Afișăm finisajele per etaj
         if finishes_per_floor:
-            floor_order = ["Erdgeschoss"]
+            floor_order = ["Keller", "Erdgeschoss"]
             for i in range(1, 10):
                 floor_order.append(f"Obergeschoss {i}")
             floor_order.extend(["Mansardă", "Dachgeschoss"])
@@ -2871,7 +2912,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         pricing_coeffs = {}
 
     # Load actual pricing data for each plan - folosim aceeași filtrare ca în user PDF
-    nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta", "Casă completă")
+    nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta)
     
     plans_data = []
@@ -3044,7 +3085,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     grad_prefabricare = sistem_constructiv.get("gradPrefabricare")
     tip_fundatie = sistem_constructiv.get("tipFundatie")
     tip_acoperis = sistem_constructiv.get("tipAcoperis")
-    nivel_oferta = materiale_finisaj.get("nivelOferta")
+    nivel_oferta = _normalize_nivel_oferta(frontend_data)
     acces_santier = sistem_constructiv.get("accesSantier")
     teren = sistem_constructiv.get("teren")
     utilitati = sistem_constructiv.get("utilitati")
