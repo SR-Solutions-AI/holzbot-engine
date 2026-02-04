@@ -2007,18 +2007,31 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             for i in range(len(rooms_polygons))
         ]
     
+    # Camere care acoperă (aproape) tot planul = flood fill eșuat → nu le folosim la total_area / scală
+    MAX_ROOM_COVERAGE_RATIO = 0.95
+    img_total_px = h_orig * w_orig
+
     if room_tasks:
         
         # ✅ Verificăm suprapunerea între camere și eliminăm duplicatele (>70% suprapunere)
-        print(f"      🔍 Verific suprapunerea între camere pentru a evita duplicatele către Gemini...")
+        # ✅ Excludem camerele prea mari (flood fill eșuat: o cameră = tot ecranul)
+        print(f"      🔍 Verific suprapunerea între camere și exclud camerele prea mari (flood fill eșuat)...")
         room_masks = {}
         rooms_to_process = []
         overlap_skipped_indices = set()
-        
+        flood_fill_skipped_indices = set()
+
         for i, room, room_poly in room_tasks:
             # Creăm masca pentru această cameră
             room_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
             cv2.fillPoly(room_mask, [room_poly], 255)
+
+            room_area_px = np.count_nonzero(room_mask)
+            if img_total_px > 0 and room_area_px / img_total_px > MAX_ROOM_COVERAGE_RATIO:
+                print(f"         ⚠️ Camera {i}: acoperă {100 * room_area_px / img_total_px:.1f}% din plan (flood fill eșuat) → exclud din calcul")
+                flood_fill_skipped_indices.add(i)
+                continue
+
             room_masks[i] = room_mask
             
             # Verificăm suprapunerea cu camerele deja procesate
@@ -2091,6 +2104,13 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                     'area_m2': 0.0,
                     'area_px': 0,
                     'room_name': f'Room_{i} (skipped - overlap >70%)'
+                }
+
+            for i in sorted(flood_fill_skipped_indices):
+                room_scales[i] = {
+                    'area_m2': 0.0,
+                    'area_px': 0,
+                    'room_name': f'Room_{i} (skipped - flood fill failed, room too large)'
                 }
 
             for i in sorted(gemini_failed_indices):

@@ -69,7 +69,7 @@ def score_plan_basement_likelihood(gemini_client: Any, image_path: Path) -> int:
     return 50
 
 
-def run_basement_scoring(house_plans: List[Any]) -> int:
+def run_basement_scoring(house_plans: List[Any]) -> int | None:
     """
     Pentru fiecare plan din house_plans (listă de obiecte cu .image_path),
     obține un scor Gemini 1-100 pentru probabilitatea că e beci.
@@ -78,7 +78,7 @@ def run_basement_scoring(house_plans: List[Any]) -> int:
     from segmenter.classifier import setup_gemini_client
 
     if not house_plans:
-        return 0
+        return None
     client = setup_gemini_client()
     if client is None:
         print("   ⚠️ [BasementScorer] Gemini indisponibil – aleg primul plan ca beci.")

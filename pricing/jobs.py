@@ -330,9 +330,17 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
         bp_file = run_dir / "basement_plan_id.json"
         if bp_file.exists():
             bp_data = json.loads(bp_file.read_text(encoding="utf-8"))
-            basement_plan_index = bp_data.get("basement_plan_index")
-            if basement_plan_index is not None:
-                print(f"   📋 [PRICING] Beci dedicat: plan index {basement_plan_index}")
+            raw = bp_data.get("basement_plan_index")
+            if raw is not None:
+                try:
+                    idx = int(raw)
+                    if 0 <= idx < total_plans:
+                        basement_plan_index = idx
+                        print(f"   📋 [PRICING] Beci dedicat: plan index {basement_plan_index}")
+                    else:
+                        print(f"   ⚠️ [PRICING] basement_plan_index {idx} în afara intervalului [0, {total_plans}) – ignorat")
+                except (TypeError, ValueError):
+                    print(f"   ⚠️ [PRICING] basement_plan_index invalid ({raw!r}) – ignorat")
     except Exception as e:
         print(f"   ⚠️ [PRICING] Nu am putut încărca basement_plan_id.json: {e}")
 
