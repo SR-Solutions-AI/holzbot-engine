@@ -814,8 +814,8 @@ def generate_walls_from_room_coordinates(
             else:
                 x1u, y1u, x2u, y2u = x1, y1, x2, y2
             
-            # ✅ Calculăm grosimea liniei: 1% din lățimea planului folosit pentru coverage (crop sau plan)
-            line_thickness = max(1, int(w_plan * 0.01))
+            # ✅ Calculăm grosimea liniei: 2.5% din lățimea planului folosit pentru coverage (crop sau plan)
+            line_thickness = max(1, int(w_plan * 0.025))
             
             # ✅ Coverage: câți pixeli din linia galbenă (paralele 1px) se află pe mască. overlap = linie ∩ mască, coverage = overlap/total. Valid dacă best >= 40%.
             should_draw = False
