@@ -51,6 +51,20 @@ def notify_ui(stage_tag: str, image_path: Path | str | None = None):
     sys.stdout.flush()
 
 
+def _notify_all_cubicasa_images_for_plan(plan: PlanInfo) -> None:
+    """
+    Trimite către UI (admin Details) toate imaginile generate de Cubicasa pentru acest plan:
+    pereți, camere, fill, walls_from_coords, openings, wall_repair, raster, etc.
+    """
+    base = plan.stage_work_dir / "cubicasa_steps"
+    if not base.is_dir():
+        return
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for p in sorted(base.rglob(ext)):
+            if p.is_file():
+                notify_ui("cubicasa_step", p)
+
+
 def _check_raster_complete(plans: List[PlanInfo]) -> Tuple[bool, List[str]]:
     """
     Verifică că toate planurile au camerele calculate:
@@ -388,6 +402,10 @@ def run_segmentation_and_classification_for_document(
                             import traceback
                             traceback.print_exc()
                             raster_scan_failed = True
+                # Trimite toate imaginile Cubicasa (pereți, camere, fill, openings, etc.) la admin Details
+                if not raster_scan_failed:
+                    for plan in plans:
+                        _notify_all_cubicasa_images_for_plan(plan)
             
             raster_ok, failed_plan_ids = _check_raster_complete(plans)
             if failed_plan_ids:
