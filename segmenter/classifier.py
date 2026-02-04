@@ -814,14 +814,21 @@ Your answer:"""
         return (False, f"ERROR: {str(e)}")
 
 
+# Numărul maxim de blueprint-uri luate în calcul pentru detectare duplicate.
+# Comparările se fac DOAR între clusterele finale (blueprint); dacă sunt prea multe,
+# luăm doar cele mai mari (după suprafață) ca să nu ajungem la sute de perechi.
+MAX_BLUEPRINTS_FOR_DUPLICATE_CHECK = 10
+
+
 def detect_and_remove_duplicates(
     crops_dir: Path,
     ai_client
 ) -> list[DuplicateGroup]:
     """
     Detectează și elimină blueprint-urile duplicate prin comparație AI directă.
-    Compară fiecare pereche de imagini și elimină cele mai mici.
-    Acum compară DOAR blueprint-urile finale sortate, nu toate clusterele.
+    Compară DOAR între clusterele finale din folderul blueprints (nu toate clusterele).
+    Dacă sunt mai multe de MAX_BLUEPRINTS_FOR_DUPLICATE_CHECK, se iau doar cele mai mari
+    după suprafață, ca să limităm numărul de perechi.
     """
     
     print("\n[STEP 7B] Detectare și eliminare duplicate blueprint-uri finale...")
@@ -835,9 +842,6 @@ def detect_and_remove_duplicates(
     if not ai_client:
         print("⚠️ Niciun client AI disponibil - skip detectare duplicate.")
         return []
-    
-    print(f"📊 Verificare {len(image_files)} blueprint-uri pentru duplicate...")
-    print(f"🔍 Total combinații de verificat: {len(image_files) * (len(image_files) - 1) // 2}\n")
     
     # Obținem dimensiunile fișierelor
     image_data = []
@@ -857,17 +861,26 @@ def detect_and_remove_duplicates(
         except Exception as e:
             debug_print(f"⚠️ Eroare procesare {img_file.name}: {e}")
     
-    # Verificăm toate combinațiile
+    # Sortăm descrescător după suprafață; pentru duplicate check folosim doar primele N
+    image_data.sort(key=lambda x: x['pixels'], reverse=True)
+    to_compare = image_data[:MAX_BLUEPRINTS_FOR_DUPLICATE_CHECK]
+    skipped = len(image_data) - len(to_compare)
+    if skipped > 0:
+        print(f"📊 Blueprint-uri în folder: {len(image_data)}. Pentru duplicate verific doar cele {len(to_compare)} cele mai mari (max {MAX_BLUEPRINTS_FOR_DUPLICATE_CHECK}).")
+    else:
+        print(f"📊 Verificare {len(to_compare)} blueprint-uri pentru duplicate...")
+    total_comparisons = len(to_compare) * (len(to_compare) - 1) // 2
+    print(f"🔍 Total perechi de verificat: {total_comparisons}\n")
+    
     confirmed_duplicates = []
-    total_comparisons = len(image_data) * (len(image_data) - 1) // 2
     current_comparison = 0
     
-    for i in range(len(image_data)):
-        for j in range(i + 1, len(image_data)):
+    for i in range(len(to_compare)):
+        for j in range(i + 1, len(to_compare)):
             current_comparison += 1
             
-            img1 = image_data[i]
-            img2 = image_data[j]
+            img1 = to_compare[i]
+            img2 = to_compare[j]
             
             path1 = img1['path']
             path2 = img2['path']
