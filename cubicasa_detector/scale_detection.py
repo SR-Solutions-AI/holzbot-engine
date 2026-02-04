@@ -14,6 +14,8 @@ import cv2
 import numpy as np
 from pathlib import Path
 
+from .config import GEMINI_MODEL
+
 
 GEMINI_PROMPT_CROP = """
 Analizează această imagine de plan de casă și identifică:
@@ -70,7 +72,7 @@ def call_gemini(image_path, prompt, api_key):
         mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
         mime_type = mime_map.get(ext, 'image/jpeg')
         
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
         
         payload = {
             "contents": [{

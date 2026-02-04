@@ -193,6 +193,7 @@ def setup_gemini_client():
         ]
         
         models_to_try = [
+            'gemini-3-flash-preview',
             'gemini-2.5-flash',
             'gemini-2.0-flash',
             'gemini-1.5-flash'

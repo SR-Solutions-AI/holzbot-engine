@@ -25,7 +25,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 
-from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT
+from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT, RUNS_ROOT
 from config.frontend_loader import load_frontend_data_for_run
 from branding.db_loader import fetch_tenant_branding
 
@@ -2908,6 +2908,22 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             
             plans_data.append({"info": plan, "pricing": p_json})
 
+    # Load basement (Keller) info: which plan index is treated as basement
+    basement_plan_index = None
+    for run_dir_candidate in (RUNS_ROOT / run_id, output_root):
+        bp_file = Path(run_dir_candidate) / "basement_plan_id.json"
+        if bp_file.exists():
+            try:
+                bp_data = json.loads(bp_file.read_text(encoding="utf-8"))
+                raw = bp_data.get("basement_plan_index")
+                if raw is not None:
+                    idx = int(raw) if isinstance(raw, (int, float)) else int(raw)
+                    if 0 <= idx < len(plan_infos):
+                        basement_plan_index = idx
+                        break
+            except Exception:
+                pass
+
     # Build PDF
     doc = SimpleDocTemplate(
         str(output_path), 
@@ -2939,7 +2955,46 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         styles["Body"]
     ))
     story.append(Spacer(1, 4*mm))
-    
+
+    # ---------- Basement (Keller): which floors are treated as basement, what is and isn't calculated ----------
+    story.append(Paragraph("Basement (Keller) – Floors and calculation scope", styles["H2"]))
+    structura_cladirii_calc = frontend_data.get("structuraCladirii", {}) if isinstance(frontend_data, dict) else {}
+    tip_fundatie_beci_calc = structura_cladirii_calc.get("tipFundatieBeci", "")
+    has_basement_form = bool(frontend_data.get("basement", False)) or (
+        tip_fundatie_beci_calc and "Keller" in str(tip_fundatie_beci_calc) and "Kein Keller" not in str(tip_fundatie_beci_calc)
+    )
+    basement_livable = bool(frontend_data.get("basementUse", False)) or ("mit einfachem Ausbau" in str(tip_fundatie_beci_calc))
+
+    if not has_basement_form:
+        story.append(Paragraph(
+            "No basement was selected for this project (form: no Keller / only floor slab). "
+            "All plans are priced as normal floors (foundation, structure, roof, openings, etc. as applicable).",
+            styles["Body"]
+        ))
+    elif basement_plan_index is None:
+        story.append(Paragraph(
+            "A basement was selected in the form, but no dedicated basement plan was identified for this run. "
+            "If the project has a basement, it may have been included as part of the ground floor cost (basement block added to ground floor).",
+            styles["Body"]
+        ))
+    else:
+        basement_plan_id = plan_infos[basement_plan_index].plan_id if basement_plan_index < len(plan_infos) else f"index {basement_plan_index}"
+        story.append(Paragraph(
+            f"<b>Floor treated as basement (Keller):</b> Plan {basement_plan_index + 1} ({basement_plan_id}) is the floor identified and priced as the basement.",
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            "<b>Calculated for the basement:</b> Interior walls (structure + finish), floors and ceiling, utilities. "
+            + ("Utilities include electricity, heating, ventilation, and sewage (livable basement)." if basement_livable else "Utilities include electricity and sewage only (unheated/utility basement)."),
+            styles["Body"]
+        ))
+        story.append(Paragraph(
+            "<b>Not calculated for the basement:</b> Foundation (0), exterior walls (0), roof (0), openings (windows/doors) (0), stairs (0), fireplace (0). "
+            "The basement is assumed to be below ground; its cost is limited to interior construction and utilities.",
+            styles["Body"]
+        ))
+    story.append(Spacer(1, 4*mm))
+
     # ---------- Form value to English (all options chosen in the form) ----------
     FORM_VALUE_TO_ENGLISH = {
         "Placă": "Slab", "Piloți": "Piles", "Soclu": "Plinth",
@@ -3055,8 +3110,14 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         # Plan header
         story.append(PageBreak() if plan_idx > 1 else Spacer(1, 0))
         story.append(Paragraph(f"PLAN {plan_idx}: {plan.plan_id}", styles["H1"]))
+        is_basement_plan = (basement_plan_index is not None and (plan_idx - 1) == basement_plan_index)
+        if is_basement_plan:
+            story.append(Paragraph(
+                "<i>This floor is treated as the basement (Keller). Only interior walls, finishes, floors, and utilities are calculated; no foundation, exterior walls, roof, or openings.</i>",
+                styles["Small"]
+            ))
         story.append(Spacer(1, 3*mm))
-        
+
         # 1. FOUNDATION CALCULATION FOR THIS PLAN – always show (area + rooms + cost when applicable)
         foundation = breakdown.get("foundation", {})
         story.append(Paragraph("1. Foundation Calculation", styles["H2"]))

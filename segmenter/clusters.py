@@ -420,8 +420,8 @@ Answer ONLY: YES or NO"""
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
             ]
             
-            # Creăm modelul direct cu safety settings
-            models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            # Creăm modelul direct cu safety settings (Gemini 3 Flash primary, fallback la 2.5/2.0/1.5)
+            models_to_try = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
             gemini_model = None
             
             for model_name in models_to_try:

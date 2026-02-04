@@ -15,7 +15,12 @@ def _init_gemini():
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY missing")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    for model_name in ("gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        try:
+            return genai.GenerativeModel(model_name)
+        except Exception:
+            continue
+    raise RuntimeError("No Gemini flash model available")
 
 
 def ask_gemini_comparison(gemini_model, reference_path: Path, candidate_path: Path, label: str, temp_dir: Path) -> bool:
