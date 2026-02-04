@@ -19,37 +19,63 @@ from .config import GEMINI_MODEL
 
 GEMINI_PROMPT_CROP = """
 Analizează această imagine de plan de casă și identifică:
-1. Numele camerei/camerelor (ex: "Living Room", "Bedroom", "Kitchen", etc.)
-2. Suprafața camerei/camerelor în metri pătrați (m²) - DOAR dacă este explicit indicată în imagine
+1. Numele camerei/camerelor (ex: "Living Room", "Bedroom", "Kitchen", "Terrasse", etc.)
+2. Suprafața camerei/camerelor în metri pătrați (m²) - DOAR dacă este explicit indicată PENTRU O CAMERĂ CONCRETĂ
 
 REGULI STRICTE PENTRU EXTRAGEREA SUPRAFEȚEI:
 
-⚠️ CRITICAL: Extrage DOAR valori care sunt EXPLICIT etichetate ca metri pătrați (m²).
-   - Caută texte precum: "15.5 m²", "20 m²", "12.3 m²", "25.7 m²", etc.
-   - Caută simbolul m² sau textul "m²" sau "m2" sau "sqm" sau "sq m" sau "m^2"
-   - Valorile trebuie să fie asociate explicit cu unitatea de măsură m²
+⚠️ CRITICAL: Extrage DOAR valori care sunt EXPLICIT etichetate ca metri pătrați (m²) ȘI sunt asociate cu O CAMERĂ CONCRETĂ (ex: "Terrasse 62,82 m²", "Küche 15 m²").
 
-❌ NU extrage:
-   - Numere care NU au unitatea m² explicită (ex: "15.5", "20", "12.3" fără m²)
-   - Numere din dimensiuni (ex: "3.5 x 4.2" - acestea sunt lungimi, nu suprafețe)
-   - Numere din scale (ex: "1:100", "1:50")
-   - Numere din coordonate sau adrese
-   - Orice alte numere care nu sunt explicit etichetate ca metri pătrați
+❌ IGNORĂ COMPLET – NU extrage și NU aduna:
+   - Texte informativ de tip TOTAL / SUPRAFAȚĂ UTILIZABILĂ pentru ÎNTREGUL NIVEL, nu pentru o cameră:
+     • "NNF = ca. X m²", "NNF=ca. 200 m²", "NNF ca. X m²"
+     • "Nutzfläche ca. X m²", "Gesamtnutzfläche", "Hausfläche ca. X m²"
+     • "net floor area", "suprafață utilizabilă", "total usable area", "ca. X m²" (fără nume de cameră lângă)
+   - Acestea sunt TOTALURI pentru etaj/nivel, NU suprafețe ale unei camere. Nu le include în room_name sau area_m2.
+   - Numere din scale (ex: "1:100", "1:50"), dimensiuni (ex: "3.5 x 4.2"), coordonate sau adrese.
 
-IMPORTANT: 
-- În această imagine pot exista una sau mai multe camere (de exemplu, în cazul unui open space pot exista 2 sau mai multe camere cu suprafețe separate).
-- Zonele negre din imagine NU fac parte din cameră - acoperă doar ce nu este relevant.
-- Dacă sunt mai multe camere cu suprafețe etichetate, adună DOAR cele care au explicit m² și returnează suma totală.
-- Dacă NICI O cameră nu are suprafață explicit etichetată cu m², returnează null pentru area_m2.
+✅ Extrage DOAR: nume de cameră + suprafața în m² când sunt ÎMPREUNĂ (ex: "Terrasse Feinsteinzeug 62,82 m²" → room_name: "Terrasse", area_m2: 62.82).
 
-Returnează JSON cu formatul:
+IMPORTANT:
+- Zonele negre din imagine NU fac parte din cameră.
+- Dacă singura suprafață în m² din imagine este un total (NNF / Nutzfläche / ca. X m² fără nume de cameră), returnează null pentru area_m2.
+- Dacă sunt mai multe camere cu suprafețe în crop, adună DOAR suprafețele care aparțin unor camere concrete (nu totalul de nivel).
+
+Returnează JSON:
 {
   "room_name": "numele camerei sau 'Multiple rooms' dacă sunt mai multe",
   "area_m2": 15.5
 }
-
-Dacă nu găsești NICI O valoare explicit etichetată cu m², returnează null pentru area_m2.
+Dacă nu găsești o suprafață asociată unei cameri concrete (doar total NNF/Nutzfläche etc.), returnează null pentru area_m2.
 """
+
+
+def is_informational_total_result(result: dict) -> bool:
+    """
+    Returnează True dacă rezultatul Gemini pare a fi un text informativ de tip total (NNF, Nutzfläche etc.),
+    nu o cameră concretă. Astfel de rezultate nu trebuie folosite la calculul scalei / sumă camere.
+    """
+    if not result or not isinstance(result, dict):
+        return True
+    room_name = (result.get("room_name") or "").strip().upper()
+    area_m2 = result.get("area_m2")
+    total_keywords = (
+        "NNF", "NUTZFLÄCHE", "NUTZFLAECHE", "GESAMT", "HAUSFLÄCHE", "HAUSFLAECHE",
+        "NET FLOOR", "TOTAL AREA", "SUPRAFAȚĂ UTILIZABILĂ", "SUPRAFATA UTILIZABILA",
+        "ERDGESCHOSS 1:100", "1:100"
+    )
+    if any(kw in room_name for kw in total_keywords):
+        return True
+    if area_m2 is not None:
+        try:
+            a = float(area_m2)
+            # Suprafață foarte rotundă (100, 150, 200) cu nume lipsă sau doar număr = probabil total etaj
+            if a >= 80 and a == round(a) and (not room_name or room_name.isdigit() or room_name in ("TOTAL", "SUM", "AREA")):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
 
 GEMINI_PROMPT_TOTAL_SUM = """
 Analizează această imagine de plan de casă și identifică suma totală a suprafețelor tuturor camerelor (în metri pătrați, m²).
@@ -229,7 +255,8 @@ def detect_scale_from_room_labels(image_path, indoor_mask, walls_mask, steps_dir
                 print(f"      ⏳ Segment {room_idx} ({area_px} px)...")
                 
                 res = call_gemini(crop_path, GEMINI_PROMPT_CROP, api_key)
-                
+                if res and is_informational_total_result(res):
+                    res = None
                 if res and 'area_m2' in res and res['area_m2'] is not None:
                     try:
                         area_m2 = float(res['area_m2'])

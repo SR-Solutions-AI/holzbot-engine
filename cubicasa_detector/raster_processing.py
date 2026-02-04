@@ -1966,9 +1966,11 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             try:
                 crop_path = output_dir / f"room_{i}_temp_for_gemini.png"
                 cv2.imwrite(str(crop_path), room_crop)
-                from .scale_detection import call_gemini, GEMINI_PROMPT_CROP
+                from .scale_detection import call_gemini, GEMINI_PROMPT_CROP, is_informational_total_result
                 result = call_gemini(str(crop_path), GEMINI_PROMPT_CROP, gemini_api_key)
-                
+                # Ignorăm rezultate care sunt texte informativ (NNF, Nutzfläche etc.), nu camere concrete
+                if result and is_informational_total_result(result):
+                    result = None
                 if result and 'area_m2' in result:
                     area_m2 = float(result['area_m2'])
                     if area_m2 > 0:
