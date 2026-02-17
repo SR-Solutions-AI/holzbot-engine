@@ -1,7 +1,7 @@
 # pricing/calculator.py
 from __future__ import annotations
 
-# Importăm modulele de calcul logic (care rămân neschimbate)
+from .form_tags import build_values_by_tag
 from .modules.finishes import calculate_finishes_details
 from .modules.foundation import calculate_foundation_details
 from .modules.openings import calculate_openings_details
@@ -58,11 +58,17 @@ def calculate_pricing_for_plan(
     floor_area = float(surfaces.get("floor_m2") or 0.0)
     ceiling_area = float(surfaces.get("ceiling_m2") or 0.0)
 
-    # 3. PREFERINȚE UTILIZATOR (NESCHIMBAT)
+    # 3. PREFERINȚE UTILIZATOR (citite după tag când e cazul, pentru formulare diferite per client)
+    values_by_tag = build_values_by_tag(frontend_input)
     sist_constr = frontend_input.get("sistemConstructiv", {})
     mat_finisaj = frontend_input.get("materialeFinisaj", {})
-    performanta = frontend_input.get("performanta", {})
-    
+    performanta = frontend_input.get("performantaEnergetica", {}) or frontend_input.get("performanta", {})
+
+    def _fv(tag: str, fallback: any = None):
+        """Valoare din formular după tag, cu fallback."""
+        v = values_by_tag.get(tag)
+        return v if v is not None and v != "" else fallback
+
     # Debug: afișăm toate cheile de finisaje disponibile
     print(f"🔍 [PRICING] Available finish keys in mat_finisaj: {list(mat_finisaj.keys())}")
     for key in ["finisajInterior_ground", "fatada_ground", "finisajInterior_floor_1", "fatada_floor_1", 
@@ -70,11 +76,10 @@ def calculate_pricing_for_plan(
         if key in mat_finisaj:
             print(f"   {key} = {mat_finisaj[key]}")
     
-    # Normalize user-provided strings from dynamic forms (DE/RO variants).
-    raw_system = str(sist_constr.get("tipSistem", "HOLZRAHMEN") or "HOLZRAHMEN").strip()
-    raw_prefab = str(sist_constr.get("gradPrefabricare", "PANOURI") or "PANOURI").strip()
+    # Normalize user-provided strings (sursă: tag system_type sau câmp tipSistem)
+    raw_system = str(_fv("system_type") or sist_constr.get("tipSistem", "HOLZRAHMEN") or "HOLZRAHMEN").strip()
 
-    # SYSTEM normalization to match coeff keys (case-insensitive, tolerate labels like "Holzrahmen Standard")
+    # SYSTEM normalization to match coeff keys
     sys_u = raw_system.upper()
     if "HOLZRAHMEN" in sys_u:
         system_constructie = "HOLZRAHMEN"
@@ -87,17 +92,11 @@ def calculate_pricing_for_plan(
     else:
         system_constructie = raw_system
 
-    # PREFAB normalization to match coeff keys (MODULE/PANOURI/SANTIER)
-    pf_u = raw_prefab.upper()
-    if "MODUL" in pf_u:
-        prefab_type = "MODULE"
-    elif "PANOU" in pf_u:
-        prefab_type = "PANOURI"
-    elif "SANTIER" in pf_u or "ȘANTIER" in pf_u:
-        prefab_type = "SANTIER"
-    else:
-        prefab_type = pf_u
-    foundation_type = sist_constr.get("tipFundatie", "Placă")
+    # Fundament (tag: foundation_type)
+    structura_cladirii = frontend_input.get("structuraCladirii", {})
+    foundation_type = _fv("foundation_type") or structura_cladirii.get("tipFundatieBeci") or sist_constr.get("tipFundatie", "Placă")
+    if foundation_type == "Placă":
+        foundation_type = "Kein Keller (nur Bodenplatte)"
     
     # Finishes/materials normalization (tolerate tenant-specific labels)
     def _norm_finish(v: str, default: str) -> str:
@@ -117,29 +116,13 @@ def calculate_pricing_for_plan(
             return "Lemn"
         return s
 
-    def _norm_tamplarie(v: str, default: str = "PVC") -> str:
-        s = str(v or "").strip()
-        if not s:
-            return default
-        u = s.upper()
-        if "PVC" in u:
-            return "PVC"
-        if ("LEMN" in u or "HOLZ" in u) and ("ALU" in u or "ALUM" in u):
-            # use the key we have in coeffs
-            return "Lemn-Aluminiu" if "PREMIUM" not in u else "Premium Holz-Alu"
-        if "ALU" in u or "ALUM" in u:
-            return "Aluminiu"
-        if "LEMN" in u or "HOLZ" in u:
-            return "Lemn"
-        return s
-
     # Determinăm finisajele bazat pe etaj
     floor_type = area_data.get("floor_type", "").lower()
     is_top_floor_plan = ("top" in floor_type or "mansard" in floor_type) or (total_floors == 1)
     
     # Verificăm dacă avem beci locuibil din frontend_data (și din câmpul basementUse)
     structura_cladirii = frontend_input.get("structuraCladirii", {})
-    tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci", "")
+    tip_fundatie_beci = _fv("foundation_type") or structura_cladirii.get("tipFundatieBeci", "")
     has_basement_livable = frontend_input.get("basementUse", False) or ("mit einfachem Ausbau" in str(tip_fundatie_beci))
     
     # ---------- Plan dedicat beci: doar pereți interiori, finisaje interior, podele, utilități (fără exterior/fundație/acoperiș) ----------
@@ -150,7 +133,7 @@ def calculate_pricing_for_plan(
         )
         cost_walls_b = calculate_walls_details(
             system_coeffs, w_int_net_structure, 0.0,
-            system=system_constructie, prefab_type=prefab_type
+            system=system_constructie
         )
         cost_finishes_b = calculate_finishes_details(
             finish_coeffs, w_int_net_finish, 0.0,
@@ -162,9 +145,9 @@ def calculate_pricing_for_plan(
         heating_coeffs = pricing_coeffs["utilities"]["heating"]
         ventilation_coeffs = pricing_coeffs["utilities"]["ventilation"]
         sewage_coeffs = pricing_coeffs["utilities"]["sewage"]
-        energy_level = performanta.get("nivelEnergetic", "Standard")
-        heating_type = performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or "Gaz"
-        has_ventilation = performanta.get("ventilatie", False)
+        energy_level = _fv("energy_level") or performanta.get("nivelEnergetic", "Standard")
+        heating_type = _fv("heating_type") or performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or "Gaz"
+        has_ventilation = _fv("ventilation") if _fv("ventilation") is not None and _fv("ventilation") != "" else performanta.get("ventilatie", False)
         if has_basement_livable:
             cost_utilities_b = calculate_utilities_details(
                 electricity_coeffs, heating_coeffs, ventilation_coeffs, sewage_coeffs,
@@ -304,17 +287,14 @@ def calculate_pricing_for_plan(
         # Pentru beci, folosim finisajul interior beci pentru pereții interiori
         # (dar pentru moment, folosim finish_int normal pentru calculul general)
     
-    # Folosim preț standard "Lemn-Aluminiu" pentru ferestre/uși (nu mai citim din formular)
-    material_tamplarie = "Lemn-Aluminiu"
-    
-    energy_level = performanta.get("nivelEnergetic", "Standard")
-    has_ventilation = performanta.get("ventilatie", False)
+    energy_level = _fv("energy_level") or performanta.get("nivelEnergetic", "Standard")
+    has_ventilation = _fv("ventilation") if _fv("ventilation") is not None and _fv("ventilation") != "" else performanta.get("ventilatie", False)
     
     # Citim tipul de încălzire din pasul "performanta" (mutat acolo) sau din pasul "incalzire" (fallback)
-    heating_type = performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or performanta.get("incalzire", "Gaz")
+    heating_type = _fv("heating_type") or performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or performanta.get("incalzire", "Gaz")
     
     # Citim tipul de semineu din pasul "performantaEnergetica" (nou) sau "incalzire" (fallback)
-    tip_semineu = performanta.get("tipSemineu") or frontend_input.get("incalzire", {}).get("tipSemineu") or frontend_input.get("performantaEnergetica", {}).get("tipSemineu")
+    tip_semineu = _fv("fireplace_type") or performanta.get("tipSemineu") or frontend_input.get("incalzire", {}).get("tipSemineu") or frontend_input.get("performantaEnergetica", {}).get("tipSemineu")
     # Fallback pentru vechiul câmp boolean "semineu"
     if not tip_semineu:
         incalzire_data = frontend_input.get("incalzire", {})
@@ -326,7 +306,7 @@ def calculate_pricing_for_plan(
     
     cost_walls = calculate_walls_details(
         system_coeffs, w_int_net_structure, w_ext_net,
-        system=system_constructie, prefab_type=prefab_type
+        system=system_constructie
     )
     
     cost_finishes = calculate_finishes_details(
@@ -342,7 +322,6 @@ def calculate_pricing_for_plan(
     
     cost_openings = calculate_openings_details(
         openings_coeffs, openings_data,
-        material=material_tamplarie,
         frontend_data=frontend_input
     )
     
@@ -378,24 +357,67 @@ def calculate_pricing_for_plan(
     else:
         cost_stairs = {"total_cost": 0.0, "detailed_items": []}
     
-    # Calculăm costurile pentru semineu și horn (doar o dată, la ground floor)
+    # Calculăm costurile pentru semineu și horn (doar o dată, la ground floor); prețuri din DB
+    fireplace_coeffs = pricing_coeffs.get("fireplace", {})
     if is_ground_floor:
-        cost_fireplace = calculate_fireplace_details(tip_semineu, total_floors)
+        cost_fireplace = calculate_fireplace_details(tip_semineu, total_floors, fireplace_coeffs)
     else:
         cost_fireplace = {"total_cost": 0.0, "detailed_items": []}
 
-    # 5. TOTAL
-    total_plan_cost = (
-        cost_walls["total_cost"] +
-        cost_finishes["total_cost"] +
+    # 5. TOTAL – Nivel ofertă (tag: offer_scope) decide CE includem, nu coeficient
+    nivel_oferta = (str(_fv("offer_scope") or sist_constr.get("nivelOferta") or "").strip())
+    # Rohbau = doar structură; Tragwerk+Fenster = + deschideri; Schlüsselfertig sau necunoscut = tot
+    include_openings = nivel_oferta != "Rohbau/Tragwerk"
+    include_finishes = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
+    include_utilities = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
+    include_stairs = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
+    include_fireplace = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
+
+    # 5. Structură totală (fundație + pereți + planșeu + acoperiș) × acces șantier × teren
+    sist_coeffs = pricing_coeffs.get("sistem_constructiv", {})
+    structure_total = (
         cost_foundation["total_cost"] +
-        cost_openings["total_cost"] +
+        cost_walls["total_cost"] +
         cost_floors_ceilings["total_cost"] +
-        cost_roof["total_cost"] +
-        cost_utilities["total_cost"] +
-        cost_stairs["total_cost"] +
-        cost_fireplace["total_cost"]
+        cost_roof["total_cost"]
     )
+    # Mapare valori formular (RO/altă limbă) la cheile din DB (DE)
+    _acces_to_key = {
+        "Leicht (LKW 40t)": "Leicht (LKW 40t)", "Mittel": "Mittel", "Schwierig": "Schwierig",
+        "Ușor (camion 40t)": "Leicht (LKW 40t)", "Mediu": "Mittel", "Dificil": "Schwierig",
+    }
+    _teren_to_key = {
+        "Eben": "Eben", "Leichte Hanglage": "Leichte Hanglage", "Starke Hanglage": "Starke Hanglage",
+        "Plan": "Eben", "Pantă ușoară": "Leichte Hanglage", "Pantă mare": "Starke Hanglage",
+    }
+    acces_santier_raw = _fv("site_access") or sist_constr.get("accesSantier") or (frontend_input.get("logistica") or {}).get("accesSantier")
+    acces_santier = _acces_to_key.get(str(acces_santier_raw or "").strip(), (acces_santier_raw or "").strip())
+    acces_factor = 1.0
+    if acces_santier and sist_coeffs.get("acces_santier_factor"):
+        acces_factor = float(sist_coeffs["acces_santier_factor"].get(acces_santier, 1.0))
+    teren_raw = _fv("terrain") or sist_constr.get("teren") or (frontend_input.get("logistica") or {}).get("teren")
+    teren = _teren_to_key.get(str(teren_raw or "").strip(), (teren_raw or "").strip())
+    teren_factor = 1.0
+    if teren and sist_coeffs.get("teren_factor"):
+        teren_factor = float(sist_coeffs["teren_factor"].get(teren, 1.0))
+    structure_total = structure_total * acces_factor * teren_factor
+    if plan_index == 0:
+        print(f"✅ [PRICING] Acces șantier: {acces_santier_raw!r} → factor {acces_factor}; Teren: {teren_raw!r} → factor {teren_factor}")
+
+    total_plan_cost = (
+        structure_total +
+        (cost_openings["total_cost"] if include_openings else 0.0) +
+        (cost_finishes["total_cost"] if include_finishes else 0.0) +
+        (cost_utilities["total_cost"] if include_utilities else 0.0) +
+        (cost_stairs["total_cost"] if include_stairs else 0.0) +
+        (cost_fireplace["total_cost"] if include_fireplace else 0.0)
+    )
+
+    # Strom-/Wasseranschluss: pauschal o singură dată per proiect (doar la parter)
+    has_utilitati = _fv("utilities_connection")
+    has_utilitati = has_utilitati if (has_utilitati is not None and has_utilitati != "") else sist_constr.get("utilitati", True)
+    if is_ground_floor and not has_utilitati:
+        total_plan_cost = total_plan_cost + float(sist_coeffs.get("utilitati_anschluss_price", 0))
 
     # 6. CALCUL BASEMENT (dacă există și NU e deja un plan dedicat beci)
     # Când has_dedicated_basement_plan = True, beciul e calculat pe planul dedicat; nu mai adăugăm bloc aici.
@@ -432,8 +454,8 @@ def calculate_pricing_for_plan(
         
         # Pereți interiori pentru basement (folosim ariile calculate cu coeficienții)
         cost_walls_basement = calculate_walls_details(
-            system_coeffs, w_int_net_structure_basement, 0.0,  # Nu avem pereți exteriori pentru basement
-            system=system_constructie, prefab_type=prefab_type
+            system_coeffs, w_int_net_structure_basement, 0.0,
+            system=system_constructie
         )
         
         # Finisaje interioare pentru basement (folosim ariile calculate cu coeficienții)
@@ -499,14 +521,13 @@ def calculate_pricing_for_plan(
             }
             print(f"      ✅ Utilități beci nelocuibil: {cost_utilities_basement['total_cost']:,.0f} EUR (arie: {floor_area_basement:.2f} m², doar curent + canalizare)")
         
-        # Nu avem deschideri pentru basement (nu avem ferestre/uși exterioare)
-        # Nu avem acoperiș pentru basement
-        # Nu avem scări pentru basement (sunt calculate la ground floor)
-        
+        # Structura beciului (pereți + planșeu) se înmulțește cu acces șantier și teren
+        structure_basement = cost_walls_basement["total_cost"] + cost_floors_basement["total_cost"]
+        structure_basement = structure_basement * acces_factor * teren_factor
+
         total_basement_cost = (
-            cost_walls_basement["total_cost"] +
+            structure_basement +
             cost_finishes_basement["total_cost"] +
-            cost_floors_basement["total_cost"] +
             cost_utilities_basement["total_cost"]
         )
         
@@ -525,20 +546,40 @@ def calculate_pricing_for_plan(
         basement_type = "locuibil" if has_basement_livable else "nelocuibil"
         print(f"✅ [PRICING] Basement calculat ({basement_type}): {cost_basement['total_cost']:,.0f} EUR")
 
+    # Breakdown: componente excluse prin nivel ofertă apar cu cost 0; structura e afișată cu factorii acces × teren aplicați
+    def _zero_if_excluded(cost_dict: dict, include: bool) -> dict:
+        if include:
+            return cost_dict
+        return {"total_cost": 0.0, "detailed_items": []}
+
+    def _scale_cost_dict(d: dict, scale: float) -> dict:
+        if scale == 1.0:
+            return d
+        out = {"total_cost": round(d["total_cost"] * scale, 2), "detailed_items": []}
+        for it in d.get("detailed_items", []):
+            item = dict(it)
+            if "cost" in item:
+                item["cost"] = round(item["cost"] * scale, 2)
+            if "total_cost" in item:
+                item["total_cost"] = round(item["total_cost"] * scale, 2)
+            out["detailed_items"].append(item)
+        return out
+
+    structure_scale = acces_factor * teren_factor
     return {
         "total_cost_eur": round(total_plan_cost, 2),
-        "total_area_m2": floor_area,  # Suprafața utilă a etajului (din area_data.surfaces.floor_m2)
+        "total_area_m2": floor_area,
         "currency": "EUR",
         "breakdown": {
-            "foundation": cost_foundation,
-            "structure_walls": cost_walls,
-            "floors_ceilings": cost_floors_ceilings,
-            "roof": cost_roof,
-            "openings": cost_openings,
-            "finishes": cost_finishes,
-            "utilities": cost_utilities,
-            "stairs": cost_stairs,
-            "fireplace": cost_fireplace,
+            "foundation": _scale_cost_dict(cost_foundation, structure_scale),
+            "structure_walls": _scale_cost_dict(cost_walls, structure_scale),
+            "floors_ceilings": _scale_cost_dict(cost_floors_ceilings, structure_scale),
+            "roof": _scale_cost_dict(cost_roof, structure_scale),
+            "openings": _zero_if_excluded(cost_openings, include_openings),
+            "finishes": _zero_if_excluded(cost_finishes, include_finishes),
+            "utilities": _zero_if_excluded(cost_utilities, include_utilities),
+            "stairs": _zero_if_excluded(cost_stairs, include_stairs),
+            "fireplace": _zero_if_excluded(cost_fireplace, include_fireplace),
             "basement": cost_basement
         }
     }

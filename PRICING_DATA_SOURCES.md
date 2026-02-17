@@ -201,15 +201,16 @@ Acest document descrie **tot ce conține scriptul care construiește prețul ofe
 
 **Conține:**
 - **Sistem constructiv**: `sistemConstructiv.tipSistem` (CLT, HOLZRAHMEN, MASSIVHOLZ)
-- **Grad prefabricare**: `sistemConstructiv.gradPrefabricare` (MODULE, PANOURI, SANTIER)
+- **Acces șantier**: `sistemConstructiv.accesSantier` (Leicht, Mittel, Schwierig) – factor pe structura totală
+- **Teren**: `sistemConstructiv.teren` (Eben, Leichte Hanglage, Starke Hanglage) – factor pe structura totală
 - **Tip fundație**: `sistemConstructiv.tipFundatie` (Placă, Piloți, Soclu)
 - **Finisaje interioare**: `materialeFinisaj.finisajInterior_ground`, `finisajInterior_floor_1`, etc.
 - **Finisaje exterioare**: `materialeFinisaj.fatada_ground`, `fatada_floor_1`, etc.
 - **Înălțime etaje**: `sistemConstructiv.inaltimeEtaje` (2.50m, 2.70m, 2.85m)
 - **Înălțime pereți mansardă**: `sistemConstructiv.inaltimePeretiMansarda`
-- **Înălțime ferestre**: `ferestreUsi.bodentiefeFenster` (1.0m, 1.5m, 2.0m)
-- **Înălțime uși**: `ferestreUsi.turhohe` (2.05m, 2.2m)
-- **Calitate geamuri**: `ferestreUsi.windowQuality` (3-fach verglast, 3-fach verglast Passiv)
+- **Înălțime ferestre**: `ferestreUsi.bodentiefeFenster` (doar pentru calculul ariei)
+- **Înălțime uși**: `ferestreUsi.turhohe` (doar pentru calculul ariei)
+- **Fensterart**: `ferestreUsi.windowQuality` (2-fach, 3-fach, 3-fach Passiv) – determină prețul €/m² ferestre
 - **Performanță energetică**: `performanta.nivelEnergetic` (Standard, KfW 55, KfW 40, KfW 40+)
 - **Tip încălzire**: `performanta.tipIncalzire` (Gaz, Pompa de căldură, Electric)
 - **Ventilație**: `performanta.ventilatie` (True/False)
@@ -235,12 +236,10 @@ Acest document descrie **tot ce conține scriptul care construiește prețul ofe
 - `area_int_net`: Aria netă pereți interiori (m²) - **din `area_data.walls.interior.net_area_m2_structure`**
 - `area_ext_net`: Aria netă pereți exteriori (m²) - **din `area_data.walls.exterior.net_area_m2`**
 - `system`: Sistem constructiv (CLT, HOLZRAHMEN, MASSIVHOLZ) - **din `frontend_data.sistemConstructiv.tipSistem`**
-- `prefab_type`: Grad prefabricare (MODULE, PANOURI, SANTIER) - **din `frontend_data.sistemConstructiv.gradPrefabricare`**
 
 **Calcul:**
-- Preț unitar bază: `pricing_coeffs.system.base_unit_prices[system][interior/exterior]`
-- Modificator prefabricare: `pricing_coeffs.system.prefabrication_modifiers[prefab_type]`
-- Cost final: `area × (preț_unit × modificator)`
+- Preț unitar: `pricing_coeffs.system.base_unit_prices[system][interior/exterior]` (fără modificator prefabricare)
+- Cost pereți: `area × preț_unit`. **Acces șantier** și **teren** se aplică ulterior pe **întreaga structură** (fundație + pereți + planșeu + acoperiș) în `calculator.py`.
 
 **Output:**
 - `total_cost`: Cost total structură pereți
@@ -286,8 +285,7 @@ Acest document descrie **tot ce conține scriptul care construiește prețul ofe
 
 **Input:**
 - `openings_list`: Lista deschiderilor - **din `openings_measurements.json` (RasterScan)**
-- `material`: Material tâmplărie (PVC, Lemn-Aluminiu, Aluminiu, Lemn) - **hardcodat "Lemn-Aluminiu"**
-- `frontend_data`: Pentru înălțimi și calitate geamuri - **din `frontend_data.json`**
+- `frontend_data`: Pentru înălțimi (doar arie) și Fensterart - **din `frontend_data.json`**
 
 **Structură deschidere:**
 ```json
@@ -299,16 +297,16 @@ Acest document descrie **tot ce conține scriptul care construiește prețul ofe
 ```
 
 **Calcul:**
-- **Înălțime ferestre**: Din `frontend_data.ferestreUsi.bodentiefeFenster` (1.0m, 1.5m, 2.0m)
-- **Înălțime uși**: Din `frontend_data.ferestreUsi.turhohe` (2.05m, 2.2m)
-- **Arie**: `width_m × height_m`
-- **Preț unitar**: `pricing_coeffs.openings.windows_unit_prices_per_m2[material]` sau `doors_*_unit_prices_per_m2[material]`
-- **Modificator calitate geamuri**: `pricing_coeffs.openings.window_quality_multiplier` (1.25x sau 1.6x)
-- **Cost final**: `area × preț_unit × modificator_calitate`
+- **Înălțime ferestre**: Din `frontend_data.ferestreUsi.bodentiefeFenster` – folosit **doar pentru arie** (width × height).
+- **Înălțime uși**: Din `frontend_data.ferestreUsi.turhohe` – folosit **doar pentru arie**.
+- **Arie**: `width_m × height_m`.
+- **Uși**: preț €/m² din `door_interior_price_per_m2` sau `door_exterior_price_per_m2` (după status).
+- **Ferestre**: preț €/m² din `windows_price_per_m2` (2-fach / 3-fach / 3-fach Passiv) conform `windowQuality`.
+- **Cost final**: `arie × preț_per_m²` (fără material tâmplărie, fără modificator calitate suplimentar).
 
 **Output:**
 - `total_cost`: Cost total deschideri
-- `detailed_items`: Lista cu toate deschiderile (fiecare cu cost individual)
+- `detailed_items`: Lista cu toate deschiderile (fiecare cu cost individual; label tip: Interior/Exterior sau tip geam)
 
 ---
 

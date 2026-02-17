@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import os
+import time
 import cv2
 import numpy as np
 import torch
@@ -2176,6 +2177,10 @@ def run_cubicasa_detection(
             raise RuntimeError(f"Lipsă 02_ai_walls_closed.png în {steps_dir} (rulează mai întâi faza 1)")
         # Pentru scale detection etc. folosim 00_original.png din steps_dir
         image_path = steps_dir / "00_original.png"
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise RuntimeError(f"Nu pot citi imaginea: {image_path}")
+        h_orig, w_orig = img.shape[:2]
         # Continuăm direct la secțiunea brute force (mai jos)
     else:
         # Faza 0 (all) sau 1 (doar Raster API + AI walls)
@@ -2285,10 +2290,15 @@ def run_cubicasa_detection(
                         raster_valid = False
                         for attempt in range(max_attempts):
                             if attempt > 0:
+                                time.sleep(2 * attempt)  # backoff: 2s, 4s
                                 print(f"      🔄 Reîncerc RasterScan API ({attempt + 1}/{max_attempts})...")
                             response = requests.post(url, json=payload, headers=headers, timeout=120)
                             if response.status_code != 200:
+                                is_retryable = response.status_code >= 500 or response.status_code == 429
                                 print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
+                                if is_retryable and attempt < max_attempts - 1:
+                                    print(f"      🔄 Eroare retry-abilă (5xx/429), reîncerc...")
+                                    continue
                                 break
                             result = response.json()
                             print(f"      ✅ RasterScan API răspuns primit")
@@ -3188,6 +3198,9 @@ def run_cubicasa_detection(
     else:
         # WORKFLOW NORMAL (FĂRĂ CROP RASTERSCAN)
         print(f"   ℹ️ Folosesc workflow-ul normal (fără crop RasterScan)")
+        
+        # run_phase==2 nu setează h_orig/w_orig; folosim dimensiunile din ai_walls_final
+        h_orig, w_orig = ai_walls_final.shape[:2]
         
         # Kernel repair pentru restul procesării
         min_dim = min(h_orig, w_orig) 

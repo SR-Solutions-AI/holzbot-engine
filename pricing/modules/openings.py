@@ -1,82 +1,65 @@
-def calculate_openings_details(coeffs: dict, openings_list: list, material: str, frontend_data: dict | None = None) -> dict:
+def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data: dict | None = None) -> dict:
+    """
+    Cost deschideri: arie = lățime × înălțime (înălțimea vine doar din formular, pentru calcul suprafață; nu afectează prețul).
+    Uși: un preț €/m² interior, unul exterior. Ferestre: preț 2-fach sau 3-fach (din formular Fensterart).
+    """
     items = []
     total = 0.0
-    
-    # Determinăm înălțimile și coeficientul pentru calitatea geamurilor din formular
-    window_height_m = 1.25  # Default
-    door_height_m = 2.05  # Default
-    window_quality_multiplier = 1.25  # Default (3-fach verglast)
-    
-    if frontend_data:
-        ferestre_usi = frontend_data.get("ferestreUsi", {})
-        
-        # Înălțime ferestre bazată pe bodentiefeFenster
+
+    ferestre_usi = frontend_data.get("ferestreUsi", {}) if frontend_data else {}
+    # Înălțimi doar pentru calculul ariei (nu pentru preț)
+    window_height_m = 1.25
+    door_height_m = 2.05
+
+    if frontend_data and ferestre_usi:
+        # Bodentiefe Fenster → înălțime ferestre (doar pentru suprafață)
         bodentiefe = ferestre_usi.get("bodentiefeFenster", "")
         if bodentiefe == "Nein":
-            window_height_m = 1.0  # 1m pentru toate geamurile
+            window_height_m = 1.0
         elif bodentiefe == "Ja – einzelne":
-            window_height_m = 1.5  # 1.5m pentru fiecare geam
+            window_height_m = 1.5
         elif bodentiefe == "Ja – mehrere / große Glasflächen":
-            window_height_m = 2.0  # 2m pentru toate geamurile
-        
-        # Înălțime uși bazată pe turhohe
+            window_height_m = 2.0
+        # Türhöhe → înălțime uși (doar pentru suprafață)
         turhohe = ferestre_usi.get("turhohe", "")
         if turhohe == "Erhöht / Sondermaß (2,2+ m)":
-            door_height_m = 2.2  # 2.2m pentru uși înalte
-        
-        # Coeficient pentru calitatea geamurilor
-        window_quality = ferestre_usi.get("windowQuality", "")
-        if window_quality == "3-fach verglast":
-            window_quality_multiplier = 1.25
-        elif window_quality == "3-fach verglast, Passiv":
-            window_quality_multiplier = 1.6
-        # Dacă windowQuality lipsește sau e invalid, folosim default 3-fach (1.25x)
-    
+            door_height_m = 2.2
+        elif turhohe == "Standard (2m)":
+            door_height_m = 2.0
+
+    # Prețuri: uși interior/exterior (€/m²), ferestre după Fensterart (2-fach / 3-fach)
+    door_int_price = float(coeffs.get("door_interior_price_per_m2", 0))
+    door_ext_price = float(coeffs.get("door_exterior_price_per_m2", 0))
+    windows_prices = coeffs.get("windows_price_per_m2", {})
+    window_quality = (ferestre_usi.get("windowQuality", "3-fach verglast") if frontend_data else "3-fach verglast")
+    window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
+
     for op in openings_list:
         obj_type = op.get("type", "unknown")
         width = float(op.get("width_m", 0.0))
-        
-        # Folosim înălțimile din formular
         height = door_height_m if "door" in obj_type else window_height_m
         area = width * height
-        
-        # Determinare categorie preț
-        category_key = "windows_unit_prices_per_m2"
-        is_exterior = True
-        
+
         if "door" in obj_type:
-            if op.get("status") == "exterior":
-                category_key = "doors_exterior_unit_prices_per_m2"
-                is_exterior = True
-            else:
-                category_key = "doors_interior_unit_prices_per_m2"
-                is_exterior = False
-        elif "window" in obj_type:
-            category_key = "windows_unit_prices_per_m2"
+            is_exterior = op.get("status") == "exterior"
+            price_per_m2 = door_ext_price if is_exterior else door_int_price
+            door_status = op.get("status", "interior")
+        else:
             is_exterior = True
-            
-        # Preț unitar
-        cat_prices = coeffs.get(category_key, {})
-        price_per_m2 = cat_prices.get(material, 0.0)
-        
-        # Aplicăm coeficientul pentru calitatea geamurilor (doar pentru ferestre)
-        if "window" in obj_type:
-            price_per_m2 = price_per_m2 * window_quality_multiplier
-        
+            price_per_m2 = window_price_per_m2
+            door_status = None
+
         cost = area * price_per_m2
         total += cost
-        
-        # Item detaliat
-        # Păstrăm status-ul original pentru uși (exterior/interior)
-        door_status = op.get("status", "interior") if "door" in obj_type else None
-        
+
+        material_label = "Interior" if not is_exterior and "door" in obj_type else ("Exterior" if "door" in obj_type else window_quality)
         items.append({
             "id": op.get("id"),
             "name": f"{obj_type.replace('_', ' ').title()} #{op.get('id')}",
             "type": obj_type,
             "location": "Exterior" if is_exterior else "Interior",
-            "status": door_status if door_status else ("exterior" if is_exterior else "interior"),  # Păstrăm status-ul pentru uși
-            "material": material,
+            "status": door_status if door_status else ("exterior" if is_exterior else "interior"),
+            "material": material_label,
             "width_m": round(width, 2),
             "height_m": round(height, 2),
             "dimensions_m": f"{width:.2f} x {height:.2f}",
@@ -88,5 +71,5 @@ def calculate_openings_details(coeffs: dict, openings_list: list, material: str,
     return {
         "total_cost": round(total, 2),
         "items": items,
-        "detailed_items": items,  # alias for PDF and consumers expecting detailed_items
+        "detailed_items": items,
     }

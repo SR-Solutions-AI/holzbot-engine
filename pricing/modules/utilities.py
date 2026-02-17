@@ -131,47 +131,49 @@ def calculate_utilities_details(
 
 def calculate_fireplace_details(
     fireplace_type: str | None,
-    total_floors: int
+    total_floors: int,
+    fireplace_coeffs: dict | None = None,
 ) -> dict:
     """
     Calculează costurile pentru semineu și horn (coș de fum).
-    
+    Prețurile vin din pricing_coeffs["fireplace"]["prices"] dacă sunt furnizate.
+
     Args:
         fireplace_type: Tipul de semineu ales (sau None/"Kein Kamin" dacă nu e selectat)
         total_floors: Numărul total de etaje (pentru calcul horn)
-    
+        fireplace_coeffs: Dict cu "prices": { "Kein Kamin": 0, "Klassischer Holzofen": ..., } din DB
+
     Returns:
         Dict cu breakdown pentru semineu și horn
     """
     items = []
     total_cost = 0.0
-    
-    # Prețuri pentru fiecare tip de semineu
+
+    prices_map = (fireplace_coeffs or {}).get("prices", {})
     fireplace_prices = {
-        "Kein Kamin": 0,
-        "Klassischer Holzofen": 8500,
-        "Moderner Design-Kaminofen": 12000,
-        "Pelletofen (automatisch)": 11000,
-        "Einbaukamin": 14000,
-        "Kachel-/wassergeführter Kamin": 18000
+        "Kein Kamin": prices_map.get("Kein Kamin", 0),
+        "Klassischer Holzofen": prices_map.get("Klassischer Holzofen", 4200),
+        "Moderner Design-Kaminofen": prices_map.get("Moderner Design-Kaminofen", 6500),
+        "Pelletofen (automatisch)": prices_map.get("Pelletofen (automatisch)", 8500),
+        "Einbaukamin": prices_map.get("Einbaukamin", 7200),
+        "Kachel-/wassergeführter Kamin": prices_map.get("Kachel-/wassergeführter Kamin", 9500),
     }
-    
-    # Nume pentru fiecare tip de semineu
+    if "Kachel-/wassergeführter Kamin" in prices_map:
+        fireplace_prices["Kachel-/wassergeführter Kamin"] = prices_map["Kachel-/wassergeführter Kamin"]
+
     fireplace_names = {
         "Kein Kamin": "Kein Kamin",
-        "Klassischer Holzofen": "Klassischer Holzofen – ca. 8.500 €",
-        "Moderner Design-Kaminofen": "Moderner Design-Kaminofen - ca. 12.000 €",
-        "Pelletofen (automatisch)": "Pelletofen (automatisch) – ca. 11.000 €",
-        "Einbaukamin": "Einbaukamin - ca. 14.000 €",
-        "Kachel-/wassergeführter Kamin": "Kachel-/wassergeführter Kamin - ca. 18.000 €"
+        "Klassischer Holzofen": "Klassischer Holzofen",
+        "Moderner Design-Kaminofen": "Moderner Design-Kaminofen",
+        "Pelletofen (automatisch)": "Pelletofen (automatisch)",
+        "Einbaukamin": "Einbaukamin",
+        "Kachel-/wassergeführter Kamin": "Kachel-/wassergeführter Kamin",
     }
-    
-    # Verificăm dacă există semineu
+
     if fireplace_type and fireplace_type != "Kein Kamin" and fireplace_type in fireplace_prices:
-        # Cost semineu bazat pe tip
-        fireplace_cost = fireplace_prices[fireplace_type]
+        fireplace_cost = float(fireplace_prices[fireplace_type])
         total_cost += fireplace_cost
-        
+
         fireplace_name = fireplace_names.get(fireplace_type, "Kamin")
         items.append({
             "category": "fireplace",
@@ -180,13 +182,12 @@ def calculate_fireplace_details(
             "quantity": 1,
             "total_cost": round(fireplace_cost, 2)
         })
-        
-        # Cost horn per etaj: 4500 EUR standard + 1500 EUR per etaj
+
         horn_base_cost = 4500.0
         horn_cost_per_floor = 1500.0
         horn_total_cost = horn_base_cost + (horn_cost_per_floor * total_floors)
         total_cost += horn_total_cost
-        
+
         items.append({
             "category": "chimney",
             "name": f"Schornstein (4500€ Standardpreis + 1500€ pro Geschoss für {total_floors} Geschosse)",
@@ -194,7 +195,7 @@ def calculate_fireplace_details(
             "quantity": 1,
             "total_cost": round(horn_total_cost, 2)
         })
-    
+
     return {
         "total_cost": round(total_cost, 2),
         "detailed_items": items

@@ -25,9 +25,13 @@ try:
     foundation_price = coeffs.get('foundation', {}).get('unit_price_per_m2', {}).get('Placă')
     print(f"   - Preț Placă Beton: {foundation_price} EUR/m2 (Ar trebui să fie 210.0)")
     
-    # Verificăm ferestrele
-    window_price = coeffs.get('openings', {}).get('windows_unit_prices_per_m2', {}).get('PVC')
-    print(f"   - Preț Fereastră PVC: {window_price} EUR/m2 (Ar trebui să fie 550.0)")
+    # Verificăm deschiderile (uși interior/exterior; ferestre 2-fach/3-fach)
+    openings = coeffs.get('openings', {})
+    door_int = openings.get('door_interior_price_per_m2')
+    win_prices = openings.get('windows_price_per_m2') or {}
+    window_2 = win_prices.get('2-fach verglast') if isinstance(win_prices, dict) else openings.get('window_2_fach_price')
+    print(f"   - Uși interior: {door_int} EUR/m2")
+    print(f"   - Ferestre 2-fach: {window_2} EUR/m2")
 
     # Verificăm CLT
     clt_price = coeffs.get('system', {}).get('base_unit_prices', {}).get('CLT', {}).get('exterior')

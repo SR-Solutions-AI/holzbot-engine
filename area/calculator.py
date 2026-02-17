@@ -23,7 +23,8 @@ def calculate_areas_for_plan(
     stairs_area_m2: float | None,
     is_single_plan: bool,
     frontend_data: dict | None = None,
-    is_top_floor: bool = False
+    is_top_floor: bool = False,
+    floor_height_m_by_option: dict | None = None,
 ) -> dict:
     """
     Folosește direct valorile de arie (Net și Gross) furnizate, fără a le recalcula 
@@ -43,17 +44,19 @@ def calculate_areas_for_plan(
     interior_length_m_structure = float(avg.get("interior_meters_structure", avg.get("interior_meters", 0.0)))  # Skeleton interior
     # Exterior rămâne același (outline albastru) pentru structură
     
-    # Determinăm înălțimea pereților din formular
+    # Determinăm înălțimea pereților: din Preisdatenbank (floor_height_m_by_option) sau fallback din eticheta din formular
     wall_height_m = STANDARD_WALL_HEIGHT_M  # Default
     if frontend_data:
         inaltime_etaje = frontend_data.get("inaltimeEtaje", "")
-        if "Komfort" in inaltime_etaje or "2,70" in inaltime_etaje:
+        if floor_height_m_by_option and inaltime_etaje and inaltime_etaje in floor_height_m_by_option:
+            wall_height_m = float(floor_height_m_by_option[inaltime_etaje])
+        elif "Komfort" in inaltime_etaje or "2,70" in inaltime_etaje:
             wall_height_m = 2.70
         elif "Hoch" in inaltime_etaje or "2,85" in inaltime_etaje:
             wall_height_m = 2.85
         else:
             wall_height_m = 2.50
-        
+
         # Pentru ultimul etaj (mansardă), folosim înălțimea pereților mansardei dacă e specificată
         if is_top_floor:
             inaltime_pereti_mansarda = frontend_data.get("inaltimePeretiMansarda")

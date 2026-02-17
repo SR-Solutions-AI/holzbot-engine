@@ -7,6 +7,7 @@ Conține funcții pentru apelul API, generarea imaginilor, alinierea brute-force
 from __future__ import annotations
 
 import os
+import time
 import cv2
 import numpy as np
 import json
@@ -104,9 +105,27 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
             "Content-Type": "application/json"
         }
         
-        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        max_attempts = 3
+        response = None
+        for attempt in range(max_attempts):
+            try:
+                if attempt > 0:
+                    time.sleep(2 * attempt)
+                    print(f"      🔄 Reîncerc RasterScan API ({attempt + 1}/{max_attempts})...")
+                response = requests.post(url, json=payload, headers=headers, timeout=120)
+            except requests.exceptions.Timeout:
+                print(f"      ⚠️ RasterScan API timeout (120s)")
+                if attempt < max_attempts - 1:
+                    continue
+                return None
+            if response.status_code == 200:
+                break
+            is_retryable = response.status_code >= 500 or response.status_code == 429
+            print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
+            if not is_retryable or attempt >= max_attempts - 1:
+                return None
         
-        if response.status_code == 200:
+        if response is not None and response.status_code == 200:
             result = response.json()
             print(f"      ✅ RasterScan API răspuns primit")
             
@@ -154,12 +173,10 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
                 'api_dimensions': (new_w_api, new_h_api),
                 'raster_dir': raster_dir
             }
-        else:
-            print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
-            return None
+        return None
             
     except requests.exceptions.Timeout:
-        print(f"      ⚠️ RasterScan API timeout (120s)")
+        print(f"      ⚠️ RasterScan API timeout (120s) - toate încercările eșuate")
         return None
     except Exception as e:
         print(f"      ⚠️ RasterScan API eroare: {e}")

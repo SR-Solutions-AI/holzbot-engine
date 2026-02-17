@@ -115,3 +115,8 @@ httpx>=0.25.0
 pydantic>=2.0.0
 supabase>=2.0.0
 gotrue>=1.0.0
+
+# holzbot-roof (vizualizări 3D acoperiș)
+plotly>=5.18.0
+pyvista>=0.43.0
+kaleido>=0.2.0

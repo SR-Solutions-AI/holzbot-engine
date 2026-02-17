@@ -1165,13 +1165,6 @@ def generate_walls_from_room_coordinates(
         print(f"      ❌ walls_overlay_mask nu este disponibilă. Nu pot continua generarea fișierelor de pereți.")
         return None
 
-    # ✅ Salvăm 01_walls_from_coords.png ca DOAR segmentele acceptate pe fundal negru (fără overlay)
-    segments_path = output_dir / "01_walls_from_coords.png"
-    segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)  # Fundal negru
-    segments_img[accepted_wall_segments_mask > 0] = [255, 255, 255]  # Pereți albi
-    cv2.imwrite(str(segments_path), segments_img)
-    print(f"      💾 Salvat: {segments_path.name} (doar segmente pereți pe fundal negru)")
-    
     # ✅ Flood fill din cele 4 colțuri (fără dilatare). Eliminăm pixel de perete dacă ≥2 din cei 4 vecini (N,S,E,W) sunt flood.
     print(f"      🌊 Flood fill din 4 colțuri, elimin pereți cu ≥2 vecini flood...")
     
@@ -1208,6 +1201,13 @@ def generate_walls_from_room_coordinates(
         walls_overlay_mask = walls_mask_validated.copy()
     else:
         print(f"      ℹ️ Nu s-au găsit pixeli de perete de eliminat")
+    
+    # ✅ Salvăm 01_walls_from_coords.png DUPĂ curățarea flood fill (pereți fără linii extra)
+    segments_path = output_dir / "01_walls_from_coords.png"
+    segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)  # Fundal negru
+    segments_img[accepted_wall_segments_mask > 0] = [255, 255, 255]  # Pereți albi (curățați)
+    cv2.imwrite(str(segments_path), segments_img)
+    print(f"      💾 Salvat: {segments_path.name} (segmente pereți curățate cu flood fill din colțuri)")
     
     # ✅ Recalculăm walls_barrier din segmentele acceptate (1px) DUPĂ eliminare; workflow-ul continuă pe baza pixelilor eliminați
     wall_thickness_barrier = max(5, int(w_orig * 0.00005))

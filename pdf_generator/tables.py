@@ -90,7 +90,7 @@ def create_inputs_info_table(inputs: dict, enforcer: GermanEnforcer) -> Table:
     # Traducem etichetele hardcodate
     label_map = {
         "tipSistem": enforcer.get("Sistem constructiv"),
-        "gradPrefabricare": enforcer.get("Grad prefabricare"),
+        "accesSantier": enforcer.get("Baustellenzufahrt"),
         "tipFundatie": enforcer.get("Tip fundație"),
         "tipAcoperis": enforcer.get("Tip acoperiș"),
         "nivelOferta": enforcer.get("Nivel ofertă"),

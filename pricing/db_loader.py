@@ -29,28 +29,48 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
 
     data_map = {row["key"]: float(row["value"]) for row in params_res.data}
 
-    return {
+    # Baustellenzufahrt (accesSantier): toate cele 3 opțiuni din form influențează prețul
+    _elec_base = float(data_map.get("electricity_base_price", 60.0))
+    _heat_base = float(data_map.get("heating_base_price", 70.0))
+
+    out = {
         "foundation": {
             "unit_price_per_m2": {
-                "Placă": data_map.get("unit_price_placa", 0),
-                "Piloți": data_map.get("unit_price_piloti", 0),
-                "Soclu": data_map.get("unit_price_soclu", 0)
+                # Form: Untergeschoss / Fundament
+                "Kein Keller (nur Bodenplatte)": data_map.get("unit_price_placa", 120),
+                "Keller (unbeheizt / Nutzkeller)": data_map.get("unit_price_keller_nutzkeller", 145),
+                "Keller (mit einfachem Ausbau)": data_map.get("unit_price_keller_ausbau", 185),
+                # Legacy / Pfahlgründung (când pilons=True se aplică în plus)
+                "Placă": data_map.get("unit_price_placa", 120),
+                "Piloți": data_map.get("unit_price_piloti", 180),
+                "Soclu": data_map.get("unit_price_soclu", 95),
             }
         },
         "system": {
             "base_unit_prices": {
+                "Blockbau": { "interior": data_map.get("clt_interior_price", 0), "exterior": data_map.get("clt_exterior_price", 0) },
                 "CLT": { "interior": data_map.get("clt_interior_price", 0), "exterior": data_map.get("clt_exterior_price", 0) },
                 "CLT Premium": { "interior": data_map.get("clt_interior_price", 0), "exterior": data_map.get("clt_exterior_price", 0) },
+                "Holzrahmen": { "interior": data_map.get("holzrahmen_interior_price", 0), "exterior": data_map.get("holzrahmen_exterior_price", 0) },
                 "HOLZRAHMEN": { "interior": data_map.get("holzrahmen_interior_price", 0), "exterior": data_map.get("holzrahmen_exterior_price", 0) },
                 "Holzrahmen Standard": { "interior": data_map.get("holzrahmen_interior_price", 0), "exterior": data_map.get("holzrahmen_exterior_price", 0) },
-                "MASSIVHOLZ": { "interior": data_map.get("massivholz_interior_price", 0), "exterior": data_map.get("massivholz_exterior_price", 0) },
-                "Massivholz": { "interior": data_map.get("massivholz_interior_price", 0), "exterior": data_map.get("massivholz_exterior_price", 0) }
+                "Massivholz": { "interior": data_map.get("massivholz_interior_price", 0), "exterior": data_map.get("massivholz_exterior_price", 0) },
+                "MASSIVHOLZ": { "interior": data_map.get("massivholz_interior_price", 0), "exterior": data_map.get("massivholz_exterior_price", 0) }
             },
-            "prefabrication_modifiers": {
-                "MODULE": data_map.get("prefab_modifier_module", 1.0),
-                "PANOURI": data_map.get("prefab_modifier_panouri", 1.0),
-                "SANTIER": data_map.get("prefab_modifier_santier", 1.0)
-            }
+        },
+        # Acces șantier și teren: factori cu care se înmulțește prețul întreg al structurii (fundație + pereți + planșeu + acoperiș)
+        "sistem_constructiv": {
+            "acces_santier_factor": {
+                "Leicht (LKW 40t)": data_map.get("acces_santier_leicht_factor", 1.0),
+                "Mittel": data_map.get("acces_santier_mittel_factor", 1.1),
+                "Schwierig": data_map.get("prefab_modifier_santier", 1.25),
+            },
+            "teren_factor": {
+                "Eben": data_map.get("teren_eben_factor", 1.0),
+                "Leichte Hanglage": data_map.get("teren_leichte_hanglage_factor", 1.05),
+                "Starke Hanglage": data_map.get("teren_starke_hanglage_factor", 1.15),
+            },
+            "utilitati_anschluss_price": data_map.get("utilitati_anschluss_price", 2500),
         },
         "roof": {
             "overhang_m": data_map.get("overhang_m", 0.4),
@@ -59,6 +79,20 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "tile_price_per_m2": data_map.get("tile_price_per_m2", 0),
             "metal_price_per_m2": data_map.get("metal_price_per_m2", 0),
             "membrane_price_per_m2": data_map.get("membrane_price_per_m2", 0),
+            # Dämmung (form: daemmung)
+            "daemmung_keine_price": data_map.get("daemmung_keine_price", 0),
+            "daemmung_zwischensparren_price": data_map.get("daemmung_zwischensparren_price", 55),
+            "daemmung_aufsparren_price": data_map.get("daemmung_aufsparren_price", 75),
+            # Unterdach (form: unterdach)
+            "unterdach_folie_price": data_map.get("unterdach_folie_price", 12),
+            "unterdach_schalung_folie_price": data_map.get("unterdach_schalung_folie_price", 28),
+            # Dachstuhl-Typ (form: dachstuhlTyp)
+            "dachstuhl_sparrendach_price": data_map.get("dachstuhl_sparrendach_price", 95),
+            "dachstuhl_pfettendach_price": data_map.get("dachstuhl_pfettendach_price", 110),
+            "dachstuhl_kehlbalkendach_price": data_map.get("dachstuhl_kehlbalkendach_price", 105),
+            "dachstuhl_sonderkonstruktion_price": data_map.get("dachstuhl_sonderkonstruktion_price", 130),
+            "sichtdachstuhl_zuschlag_price": data_map.get("sichtdachstuhl_zuschlag_price", 25),
+            "panta_acoperis_zuschlag_per_grad": data_map.get("panta_acoperis_zuschlag_per_grad", 0.5),
             # Sadiki-specific roof cover prices (if present in DB)
             "roof_shingle_price_per_m2": data_map.get("roof_shingle_price_per_m2", 0),
             "roof_metal_tile_price_per_m2": data_map.get("roof_metal_tile_price_per_m2", 0),
@@ -94,52 +128,87 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             }
         },
         "openings": {
-            "windows_unit_prices_per_m2": {
-                "PVC": data_map.get("window_pvc_price", 0),
-                "Lemn": data_map.get("window_lemn_price", 0),
-                "Aluminiu": data_map.get("window_aluminiu_price", 0),
-                "Lemn-Aluminiu": data_map.get("window_lemn_aluminiu_price", 0),
-                "Premium Holz-Alu": data_map.get("window_premium_wood", 0),  # optional
-                # Sadiki-specific options
-                "Aluminiu cu barieră termică": data_map.get("window_aluminiu_termo", 0),
-                "PVC 7 camere": data_map.get("window_pvc_7_camere", 0),
-                "Oțel (profil subțire, tip loft)": data_map.get("window_otel_loft", 0),
-                "Lemn stratificat (triplustrat)": data_map.get("window_lemn_triplustrat", 0),
-                "Ferestre fixe panoramice (curtain wall)": data_map.get("window_curtain_wall", 0),
-            },
-            "doors_interior_unit_prices_per_m2": {
-                "PVC": data_map.get("door_int_pvc_price", 0),
-                "Lemn": data_map.get("door_int_lemn_price", 0),
-                "Aluminiu": data_map.get("door_int_aluminiu_price", 0),
-                "Lemn-Aluminiu": data_map.get("door_int_lemn_aluminiu_price", 0),
-                "Premium Holz-Alu": data_map.get("door_int_lemn_aluminiu_price", 0),
-                # Sadiki-specific options
-                "Aluminiu cu barieră termică": data_map.get("door_int_aluminiu_termo", 0),
-                "PVC 7 camere": data_map.get("door_int_pvc_7_camere", 0),
-                "Oțel (profil subțire, tip loft)": data_map.get("door_int_otel_loft", 0),
-                "Lemn stratificat (triplustrat)": data_map.get("door_int_lemn_triplustrat", 0),
-                "Ferestre fixe panoramice (curtain wall)": data_map.get("door_int_curtain_wall", 0),
-            },
-            "doors_exterior_unit_prices_per_m2": {
-                "PVC": data_map.get("door_ext_pvc_price", 0),
-                "Lemn": data_map.get("door_ext_lemn_price", 0),
-                "Aluminiu": data_map.get("door_ext_aluminiu_price", 0),
-                "Lemn-Aluminiu": data_map.get("door_ext_lemn_aluminiu_price", 0),
-                "Premium Holz-Alu": data_map.get("door_ext_lemn_aluminiu_price", 0),
-                # Sadiki-specific options
-                "Aluminiu cu barieră termică": data_map.get("door_ext_aluminiu_termo", 0),
-                "PVC 7 camere": data_map.get("door_ext_pvc_7_camere", 0),
-                "Oțel (profil subțire, tip loft)": data_map.get("door_ext_otel_loft", 0),
-                "Lemn stratificat (triplustrat)": data_map.get("door_ext_lemn_triplustrat", 0),
-                "Ferestre fixe panoramice (curtain wall)": data_map.get("door_ext_curtain_wall", 0),
+            # Uși: un preț per m² pentru interior, unul pentru exterior (folosit doar pentru calcul arie × preț)
+            "door_interior_price_per_m2": data_map.get("door_interior_price", data_map.get("door_standard_2m_price", 0)),
+            "door_exterior_price_per_m2": data_map.get("door_exterior_price", data_map.get("door_standard_2m_price", 0)),
+            # Ferestre: doar 2 straturi sau 3 straturi (alegere din formular Fensterart)
+            "windows_price_per_m2": {
+                "2-fach verglast": data_map.get("window_2_fach_price", data_map.get("window_3fach_verglast_price", 320)),
+                "3-fach verglast": data_map.get("window_3_fach_price", data_map.get("window_3fach_verglast_price", 420)),
+                "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
             }
         },
-        "area": { "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0), "ceiling_coefficient_per_m2": data_map.get("ceiling_coeff_per_m2", 0) },
+        "area": {
+            "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0),
+            "ceiling_coefficient_per_m2": data_map.get("ceiling_coeff_per_m2", 0),
+            # Geschosshöhe: înălțimi (m) per opțiune – folosite la calculul ariilor pereți, nu la preț
+            "floor_height_m": {
+                "Standard (2,50 m)": float(data_map.get("inaltime_etaje_standard_m", 2.5)),
+                "Komfort (2,70 m)": float(data_map.get("inaltime_etaje_komfort_m", 2.7)),
+                "Hoch (2,85+ m)": float(data_map.get("inaltime_etaje_hoch_m", 2.85)),
+            },
+        },
         "stairs": { "price_per_stair_unit": data_map.get("price_per_stair_unit", 0), "railing_price_per_stair": data_map.get("railing_price_per_stair", 0) },
         "utilities": {
-            "electricity": { "coefficient_electricity_per_m2": data_map.get("electricity_base_price", 60.0), "energy_performance_modifiers": { "Standard": 1.0 } },
-            "heating": { "coefficient_heating_per_m2": data_map.get("heating_base_price", 70.0), "type_coefficients": { "Gaz": 1.0 } },
+            "electricity": {
+                "coefficient_electricity_per_m2": data_map.get("electricity_base_price", 60.0),
+                "energy_performance_modifiers": {
+                    "Standard": 1.0 + (data_map.get("nivel_energetic_standard_price", 0) / max(_elec_base, 1)),
+                    "KfW 55": 1.0 + (data_map.get("nivel_energetic_kfw55_price", 25) / max(_elec_base, 1)),
+                    "KfW 40": 1.0 + (data_map.get("nivel_energetic_kfw40_price", 45) / max(_elec_base, 1)),
+                    "KfW 40+": 1.0 + (data_map.get("nivel_energetic_kfw40plus_price", 65) / max(_elec_base, 1)),
+                }
+            },
+            "heating": {
+                "coefficient_heating_per_m2": data_map.get("heating_base_price", 70.0),
+                "type_coefficients": {
+                    "Gas": data_map.get("tip_incalzire_gas_price", 55) / max(_heat_base, 1),
+                    "Wärmepumpe": data_map.get("tip_incalzire_waermepumpe_price", 95) / max(_heat_base, 1),
+                    "Elektrisch": data_map.get("tip_incalzire_elektrisch_price", 45) / max(_heat_base, 1),
+                    "Gaz": data_map.get("tip_incalzire_gas_price", 55) / max(_heat_base, 1),
+                },
+                "energy_performance_modifiers": {
+                    "Standard": 1.0,
+                    "KfW 55": 1.0 + (data_map.get("nivel_energetic_kfw55_price", 25) / max(_heat_base, 1)),
+                    "KfW 40": 1.0 + (data_map.get("nivel_energetic_kfw40_price", 45) / max(_heat_base, 1)),
+                    "KfW 40+": 1.0 + (data_map.get("nivel_energetic_kfw40plus_price", 65) / max(_heat_base, 1)),
+                }
+            },
             "sewage": { "coefficient_sewage_per_m2": data_map.get("sewage_base_price", 45.0) },
             "ventilation": { "coefficient_ventilation_per_m2": data_map.get("ventilation_base_price", 55.0) }
+        },
+        "fireplace": {
+            "prices": {
+                "Kein Kamin": data_map.get("tip_semineu_kein_price", 0),
+                "Klassischer Holzofen": data_map.get("tip_semineu_holzofen_price", 4200),
+                "Moderner Design-Kaminofen": data_map.get("tip_semineu_design_price", 6500),
+                "Pelletofen (automatisch)": data_map.get("tip_semineu_pelletofen_price", 8500),
+                "Einbaukamin": data_map.get("tip_semineu_einbaukamin_price", 7200),
+                "Kachel-/wassergeführter Kamin": data_map.get("tip_semineu_kachel_price", 9500),
+            }
         }
     }
+
+    # Opțiuni custom (din Preisdatenbank): același tag, apar în formular și aici în pricing
+    try:
+        opt_res = client.table("tenant_form_options").select("field_tag, option_label, option_value, price_key").eq("tenant_id", tenant_id).execute()
+        if opt_res.data:
+            for row in opt_res.data:
+                tag = (row.get("field_tag") or "").strip()
+                label = (row.get("option_label") or row.get("option_value") or "").strip()
+                pk = (row.get("price_key") or "").strip()
+                if not tag or not label or not pk:
+                    continue
+                val = float(data_map.get(pk, 0))
+                if tag == "system_type":
+                    out.setdefault("system", {}).setdefault("base_unit_prices", {})[label] = {"interior": val, "exterior": val}
+                elif tag == "site_access":
+                    out.setdefault("sistem_constructiv", {}).setdefault("acces_santier_factor", {})[label] = val
+                elif tag == "terrain":
+                    out.setdefault("sistem_constructiv", {}).setdefault("teren_factor", {})[label] = val
+                elif tag == "foundation_type":
+                    out.setdefault("foundation", {}).setdefault("unit_price_per_m2", {})[label] = val
+    except Exception:
+        pass
+
+    return out

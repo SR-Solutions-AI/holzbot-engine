@@ -25,7 +25,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 
-from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT, RUNS_ROOT
+from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT, RUNS_ROOT, OUTPUT_ROOT, JOBS_ROOT
 from config.frontend_loader import load_frontend_data_for_run
 from branding.db_loader import fetch_tenant_branding
 
@@ -297,7 +297,7 @@ STATIC_TRANSLATIONS = {
     "Anzahl Fenster": "Anzahl Fenster",
     "Anzahl Türen": "Anzahl Türen",
     "detektiert": "detektiert",
-    "Grad prefabricare": "Vorfabrizierungsgrad",
+    "Baustellenzufahrt": "Baustellenzufahrt",
     "Tip fundație": "Fundamenttyp",
     "Sistem constructiv": "Bausystem",
     "Tip acoperiș": "Dachtyp",
@@ -319,6 +319,9 @@ STATIC_TRANSLATIONS = {
     "Ușor (camion 40t)": "Leicht (LKW 40t)",
     "Mediu": "Mittel",
     "Dificil": "Schwierig",
+    "Leicht (LKW 40t)": "Leicht (LKW 40t)",
+    "Mittel": "Mittel",
+    "Schwierig": "Schwierig",
     "Plan": "Eben",
     "Pantă ușoară": "Leichte Hanglage",
     "Pantă mare": "Starke Hanglage",
@@ -1669,7 +1672,7 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     performanta = frontend_data.get("performanta", {})
     
     tip_sistem = sistem_constructiv.get("tipSistem", "HOLZRAHMEN")
-    grad_prefabricare = sistem_constructiv.get("gradPrefabricare", "—")
+    acces_santier = sistem_constructiv.get("accesSantier") or frontend_data.get("logistica", {}).get("accesSantier", "—")
     tip_fundatie = sistem_constructiv.get("tipFundatie", "—")
     tip_acoperis = sistem_constructiv.get("tipAcoperis", "Satteldach")
     material_acoperis = materiale_finisaj.get("materialAcoperis", "—")
@@ -1737,7 +1740,7 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     
     # Traduce valorile
     tip_sistem_de = enforcer.get(tip_sistem) if tip_sistem else "Holzrahmenbau"
-    grad_prefabricare_de = enforcer.get(grad_prefabricare) if grad_prefabricare and grad_prefabricare != "—" else "—"
+    acces_santier_de = enforcer.get(acces_santier) if acces_santier and acces_santier != "—" else "—"
     tip_fundatie_de = enforcer.get(tip_fundatie) if tip_fundatie and tip_fundatie != "—" else "—"
     tip_acoperis_de = enforcer.get(tip_acoperis) if tip_acoperis else "Satteldach"
     material_acoperis_de = enforcer.get(material_acoperis) if material_acoperis and material_acoperis != "—" else "—"
@@ -1792,13 +1795,28 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     
     # Informații despre sistem constructiv
     overview_items.append(f"<b>{enforcer.get('Bausystem')}:</b> <b>{tip_sistem_de}</b>")
-    if grad_prefabricare_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Grad prefabricare')}:</b> <b>{grad_prefabricare_de}</b>")
+    if acces_santier_de != "—":
+        overview_items.append(f"<b>{enforcer.get('Baustellenzufahrt')}:</b> <b>{acces_santier_de}</b>")
     if tip_fundatie_de != "—":
         overview_items.append(f"<b>{enforcer.get('Tip fundație')}:</b> <b>{tip_fundatie_de}</b>")
     overview_items.append(f"<b>{enforcer.get('Dachtyp')}:</b> <b>{tip_acoperis_de}</b>")
     if material_acoperis_de != "—":
         overview_items.append(f"<b>{enforcer.get('Dachmaterial')}:</b> <b>{material_acoperis_de}</b>")
+    
+    # Dämmung & Dachdeckung (din formular)
+    dd = frontend_data.get("daemmungDachdeckung") or {}
+    daemmung = dd.get("daemmung")
+    dachdeckung = dd.get("dachdeckung")
+    unterdach = dd.get("unterdach")
+    dachstuhl_typ = dd.get("dachstuhlTyp")
+    if daemmung:
+        overview_items.append(f"<b>{enforcer.get('Dämmung')}:</b> <b>{enforcer.get(daemmung) or daemmung}</b>")
+    if dachdeckung:
+        overview_items.append(f"<b>{enforcer.get('Dachdeckung')}:</b> <b>{enforcer.get(dachdeckung) or dachdeckung}</b>")
+    if unterdach:
+        overview_items.append(f"<b>{enforcer.get('Unterdach')}:</b> <b>{enforcer.get(unterdach) or unterdach}</b>")
+    if dachstuhl_typ:
+        overview_items.append(f"<b>{enforcer.get('Dachstuhl-Typ')}:</b> <b>{enforcer.get(dachstuhl_typ) or dachstuhl_typ}</b>")
     
     # Semineu și horn - afișăm ce s-a selectat din formular
     print(f"🔍 [PDF] tip_semineu value: '{tip_semineu}', type: {type(tip_semineu)}")
@@ -2130,6 +2148,39 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
 
             plans_data.append({"info": plan, "type": p_data["floor_type"], "pricing": p_json})
 
+    # ✅ Înlocuiește roof breakdown cu roof_pricing.json dacă există (pentru top floor, când roof e inclus)
+    # Căutăm roof_pricing în toate locațiile posibile (OUTPUT_ROOT, JOBS_ROOT/output, RUNNER_ROOT/output)
+    def _find_roof_pricing_path() -> Path | None:
+        for base in (OUTPUT_ROOT / run_id, JOBS_ROOT / run_id / "output", RUNNER_ROOT / "output" / run_id):
+            p = base / "roof" / "roof_3d" / "entire" / "mixed" / "roof_pricing.json"
+            if p.exists():
+                return p
+        return output_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_pricing.json"
+    roof_pricing_path = _find_roof_pricing_path()
+    roof_pricing_total_eur: float | None = None  # Preț acoperiș din workflow nou (roof_metrics + formular)
+    if roof_pricing_path and roof_pricing_path.exists() and inclusions.get("roof", False):
+        try:
+            with open(roof_pricing_path, encoding="utf-8") as f:
+                roof_pricing = json.load(f)
+            items = roof_pricing.get("detailed_items") or roof_pricing.get("items", [])
+            total_roof = roof_pricing.get("total_cost", 0.0)
+            if items and total_roof > 0:
+                roof_pricing_total_eur = total_roof
+                roof_breakdown = {"total_cost": total_roof, "items": items, "detailed_items": items}
+                # Adaugă la planul TOP FLOOR (ultimul după sortare) sau singurul plan (clădire cu 1 etaj)
+                top_entry = next((e for e in reversed(plans_data) if e.get("type") != "ground_floor"), None)
+                if top_entry is None and len(plans_data) == 1:
+                    top_entry = plans_data[0]  # Casă cu 1 etaj – acel etaj are acoperișul
+                if top_entry:
+                    p_json = top_entry["pricing"]
+                    old_roof = p_json.get("breakdown", {}).get("roof", {})
+                    old_cost = old_roof.get("total_cost", 0.0)
+                    p_json["breakdown"]["roof"] = roof_breakdown
+                    p_json["total_cost_eur"] = p_json.get("total_cost_eur", 0.0) - old_cost + total_roof
+                    print(f"✅ [PDF] Roof pricing din roof_pricing.json aplicat la top floor: {total_roof:,.2f} EUR")
+        except Exception as e:
+            print(f"⚠️ [PDF] Eroare la încărcarea roof_pricing.json: {e}")
+
     # ✅ INIȚIALIZARE ENFORCER (fără collect & process_translation_queue)
     print("🇩🇪 [PDF] Initializing GermanEnforcer (Direct Table Translation Mode)...")
     enforcer = GermanEnforcer()
@@ -2275,6 +2326,20 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
                 turen_content.append(Paragraph(f"Gesamtpreis Türen: {_money(doors_total_price)}", styles["Body"]))
             turen_content.append(Spacer(1, 2*mm))
             story.append(KeepTogether(turen_content))
+
+        # Dach / Dämmung & Dachdeckung – preț acoperiș din roof_pricing.json (workflow nou) sau fallback la plans_data
+        roof_total_price = roof_pricing_total_eur if roof_pricing_total_eur is not None and roof_pricing_total_eur > 0 else 0.0
+        if roof_total_price == 0:
+            for entry in plans_data:
+                bd = entry.get("pricing", {}).get("breakdown", {})
+                roof_total_price += bd.get("roof", {}).get("total_cost", 0.0)
+        if inclusions.get("roof", False) and roof_total_price > 0:
+            dach_content = [
+                Paragraph(f"<b>Dach / Dämmung & Dachdeckung</b>", styles["H3"]),
+                Paragraph(f"Gesamtpreis Dach: {_money(roof_total_price)}", styles["Body"]),
+                Spacer(1, 2*mm),
+            ]
+            story.append(KeepTogether(dach_content))
         
         # Pregătim imagini pentru afișare side by side
         plan_images = []
@@ -2614,13 +2679,13 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     # Sistem constructiv
     if sistem_constructiv:
         tip_sistem = sistem_constructiv.get("tipSistem", "—")
-        grad_prefabricare = sistem_constructiv.get("gradPrefabricare", "—")
+        acces_santier = sistem_constructiv.get("accesSantier") or logistica.get("accesSantier", "—")
         tip_fundatie = sistem_constructiv.get("tipFundatie", "—")
         tip_acoperis = sistem_constructiv.get("tipAcoperis", "—")
         
         summary_items.append(f"<b>{enforcer.get('Sistem constructiv')}:</b> {enforcer.get(tip_sistem) if tip_sistem != '—' else '—'}")
-        if grad_prefabricare and grad_prefabricare != "—":
-            summary_items.append(f"<b>{enforcer.get('Grad prefabricare')}:</b> {enforcer.get(grad_prefabricare)}")
+        if acces_santier and acces_santier != "—":
+            summary_items.append(f"<b>{enforcer.get('Baustellenzufahrt')}:</b> {enforcer.get(acces_santier)}")
         if tip_fundatie and tip_fundatie != "—":
             summary_items.append(f"<b>{enforcer.get('Tip fundație')}:</b> {enforcer.get(tip_fundatie)}")
         if tip_acoperis and tip_acoperis != "—":
@@ -3082,11 +3147,10 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     incalzire = frontend_data.get("incalzire", {})
     
     tip_sistem = sistem_constructiv.get("tipSistem")
-    grad_prefabricare = sistem_constructiv.get("gradPrefabricare")
+    acces_santier = sistem_constructiv.get("accesSantier")
     tip_fundatie = sistem_constructiv.get("tipFundatie")
     tip_acoperis = sistem_constructiv.get("tipAcoperis")
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
-    acces_santier = sistem_constructiv.get("accesSantier")
     teren = sistem_constructiv.get("teren")
     utilitati = sistem_constructiv.get("utilitati")
     tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci")
@@ -3106,7 +3170,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     
     story.append(Paragraph("<b>Step – General project information / Building structure</b>", styles["H3"]))
     story.append(Paragraph(f"Construction system: {_en(tip_sistem)}", styles["Body"]))
-    if grad_prefabricare: story.append(Paragraph(f"Prefabrication level: {_en(grad_prefabricare)}", styles["Body"]))
     story.append(Paragraph(f"Offer level: {_en(nivel_oferta)}", styles["Body"]))
     story.append(Paragraph(f"Site access: {_en(acces_santier)}", styles["Body"]))
     story.append(Paragraph(f"Terrain: {_en(teren)}", styles["Body"]))
@@ -3465,27 +3528,20 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         openings = breakdown.get("openings", {})
         story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
         story.append(Paragraph(
-            "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m² × Quality Multiplier (for windows). "
-            "Each opening: area = width (m) × height (m).",
+            "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m². "
+            "Area = width (m) × height (m). Heights from form (Bodentiefe, Türhöhe) are used only for area.",
             styles["Body"]
         ))
         story.append(Paragraph(
-            f"<b>Window height setting:</b> {_en(bodentiefe_fenster)} → All windows use height: "
-            + ("1.0 m" if bodentiefe_fenster == "Nein" else "1.5 m" if "einzelne" in str(bodentiefe_fenster) else "2.0 m"),
+            f"<b>Window height (Bodentiefe):</b> {_en(bodentiefe_fenster)} → used for area only.",
             styles["Body"]
         ))
         story.append(Paragraph(
-            f"<b>Door height setting:</b> {_en(turhohe)} → All doors use height: "
-            + ("2.2 m" if turhohe and "Erhöht" in str(turhohe) else "2.0 m"),
+            f"<b>Door height (Türhöhe):</b> {_en(turhohe)} → used for area only.",
             styles["Body"]
         ))
         story.append(Paragraph(
-            f"<b>Window quality:</b> {_en(window_quality)} → Multiplier: "
-            + ("1.25x" if window_quality == "3-fach verglast" else "1.6x" if window_quality == "3-fach verglast, Passiv" else "1.0x"),
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"<b>Window/door material:</b> {_en('Lemn-Aluminiu')} (standard, fixed)",
+            f"<b>Fensterart (window type):</b> {_en(window_quality)} → unit price per m² (2-fach / 3-fach / 3-fach Passiv). Doors: interior vs exterior price per m².",
             styles["Body"]
         ))
         opening_items = openings.get("detailed_items", openings.get("items", [])) if openings else []

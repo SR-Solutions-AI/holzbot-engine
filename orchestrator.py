@@ -32,7 +32,8 @@ from count_objects import run_count_objects_for_run
 from roof.jobs import run_roof_for_run
 from pricing.jobs import run_pricing_for_run, PricingJobResult
 from offer_builder import build_final_offer
-from pdf_generator import generate_complete_offer_pdf, generate_admin_offer_pdf, generate_admin_calculation_method_pdf
+from pdf_generator import generate_complete_offer_pdf, generate_admin_offer_pdf, generate_admin_calculation_method_pdf, generate_roof_measurements_pdf
+from roof.roof_pricing import generate_roof_pricing
 from segmenter.pdf_utils import convert_pdf_to_png
 
 # =========================================================
@@ -474,6 +475,11 @@ def run_segmentation_and_classification_for_document(
                 admin_pdf_path = None
                 calc_method_pdf_path = None
                 try:
+                    # Generează roof_pricing.json înainte de PDF (pentru ofertă cu prețuri acoperiș)
+                    try:
+                        generate_roof_pricing(run_id=run_id, frontend_data=frontend_data)
+                    except Exception as rp_err:
+                        print(f"⚠️ Roof pricing Error: {rp_err}")
                     pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None)
                     print(f"✅ [PDF] User PDF generated: {pdf_path}")
                     notify_ui("pdf_generation", pdf_path)
@@ -488,6 +494,9 @@ def run_segmentation_and_classification_for_document(
                         print(f"⚠️ Calculation Method PDF Error: {calc_err}")
                         import traceback
                         traceback.print_exc()
+                    roof_pdf_path = generate_roof_measurements_pdf(run_id=run_id, output_path=None)
+                    if roof_pdf_path:
+                        notify_ui("pdf_generation", roof_pdf_path)
                 except Exception as e:
                     print(f"⚠️ PDF Error: {e}")
                     import traceback

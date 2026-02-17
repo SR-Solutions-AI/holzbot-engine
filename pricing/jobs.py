@@ -196,7 +196,8 @@ def _run_for_single_plan(
                     stairs_area_m2=None,  # Nu avem date despre scări din raster
                     is_single_plan=is_single_plan,
                     frontend_data=frontend_data,
-                    is_top_floor=is_top_floor_plan
+                    is_top_floor=is_top_floor_plan,
+                    floor_height_m_by_option=pricing_coeffs.get("area", {}).get("floor_height_m"),
                 )
                 
                 use_raster_data = True
@@ -266,6 +267,21 @@ def _run_for_single_plan(
         
         is_basement_plan = basement_plan_index is not None and plan_index == basement_plan_index
         has_dedicated_basement_plan = basement_plan_index is not None
+
+        # Scriem măsurătorile planului pentru agregare la final în measurements.json
+        measurements_plan = {
+            "plan_id": plan.plan_id,
+            "plan_index": plan_index,
+            "floor_type": floor_type,
+            "is_ground_floor": is_ground_floor,
+            "is_top_floor": is_top_floor,
+            "areas": dict(area_data) if isinstance(area_data, dict) else {},
+            "openings": list(openings_data) if openings_data else [],
+        }
+        measurements_plan_file = work_dir / "measurements_plan.json"
+        with open(measurements_plan_file, "w", encoding="utf-8") as f:
+            json.dump(measurements_plan, f, indent=2, ensure_ascii=False)
+
         result = calculate_pricing_for_plan(
             area_data=area_data, 
             openings_data=openings_data, 
@@ -349,12 +365,68 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
     
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {
-            executor.submit(_run_for_single_plan, run_id, plan, idx, frontend_data, total_plans, pricing_coeffs, plans, basement_plan_index): plan 
+            executor.submit(_run_for_single_plan, run_id, plan, idx, frontend_data, total_plans, pricing_coeffs, plans, basement_plan_index): plan
             for idx, plan in enumerate(plans)
         }
         for fut in as_completed(futures):
             res = fut.result()
             results.append(res)
             print(f"   {'✅' if res.success else '❌'} {res.plan_id}: {res.message}")
-            
+
+    # Agregare measurements.json: toate măsurătorile din rulare (arii, deschideri, acoperiș)
+    try:
+        run_dir = get_run_dir(run_id)
+        plans_measurements = []
+        for plan in plans:
+            mp_path = plan.stage_work_dir / "measurements_plan.json"
+            if mp_path.exists():
+                with open(mp_path, "r", encoding="utf-8") as f:
+                    plans_measurements.append(json.load(f))
+            else:
+                plans_measurements.append({"plan_id": plan.plan_id, "error": "measurements_plan.json missing"})
+        roof_aggregate = {}
+        roof_dir = run_dir / "roof"
+        if roof_dir.exists():
+            for plan in plans:
+                roof_plan = roof_dir / plan.plan_id / "roof_estimation.json"
+                if roof_plan.exists():
+                    try:
+                        with open(roof_plan, "r", encoding="utf-8") as f:
+                            roof_aggregate[plan.plan_id] = json.load(f)
+                    except Exception:
+                        roof_aggregate[plan.plan_id] = {"error": "read failed"}
+            roof_3d = run_dir / "roof" / "roof_3d"
+            if roof_3d.exists():
+                for m in ("floor_roof_angles.json", "floor_roof_types.json"):
+                    p = roof_3d / m
+                    if p.exists():
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                roof_aggregate[f"_roof_3d_{p.stem}"] = json.load(f)
+                        except Exception:
+                            pass
+                entire = roof_3d / "entire"
+                if entire.exists():
+                    for sub in entire.iterdir():
+                        if sub.is_dir():
+                            for name in ("roof_metrics.json", "roof_pricing.json"):
+                                q = sub / name
+                                if q.exists():
+                                    try:
+                                        with open(q, "r", encoding="utf-8") as f:
+                                            roof_aggregate[f"_roof_3d_entire_{sub.name}_{name}"] = json.load(f)
+                                    except Exception:
+                                        pass
+        measurements = {
+            "run_id": run_id,
+            "plans": plans_measurements,
+            "roof": roof_aggregate,
+        }
+        out_path = run_dir / "measurements.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(measurements, f, indent=2, ensure_ascii=False)
+        print(f"   📐 [PRICING] Scris {out_path}")
+    except Exception as e:
+        print(f"   ⚠️ [PRICING] Nu s-a putut scrie measurements.json: {e}")
+
     return results

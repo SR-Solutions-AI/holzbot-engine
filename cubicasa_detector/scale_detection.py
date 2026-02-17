@@ -88,67 +88,87 @@ Dacă nu găsești suma totală, returnează null.
 """
 
 
-def call_gemini(image_path, prompt, api_key):
-    """API REST Direct (v1beta) pentru Gemini."""
+def _repair_scale_json_with_gpt(raw_text: str, prompt: str):
+    """Fallback: GPT construiește JSON valid din răspunsul raw Gemini."""
+    schema_hint = (
+        "Object with room_name (str), area_m2 (float or null). "
+        "Or object with total_sum_m2 (float or null)."
+    )
     try:
-        with open(image_path, 'rb') as f:
-            image_data = base64.b64encode(f.read()).decode('utf-8')
-        
-        ext = Path(image_path).suffix.lower()
-        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
-        mime_type = mime_map.get(ext, 'image/jpeg')
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-        
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": mime_type, "data": image_data}},
-                    {"text": prompt}
-                ]
-            }],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1000}
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if response.status_code != 200:
-            print(f"⚠️  Gemini HTTP {response.status_code}")
-            return None
-        
-        result = response.json()
-        if 'candidates' not in result or not result['candidates']: return None
-        
-        text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
-        if not text: return None
-        
-        # Gemini poate răspunde cu markdown code fences (```json ... ```), sau chiar cu un
-        # bloc care nu conține un obiect JSON. Încercăm să extragem robust JSON-ul.
-        if text.startswith("```"):
-            lines = text.splitlines()
-            # eliminăm prima linie (``` sau ```json) și ultima linie (```) dacă există
-            if lines and lines[0].lstrip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from common.json_repair import repair_json_with_gpt
+        return repair_json_with_gpt(raw_text, schema_hint)
+    except Exception as e:
+        print(f"   [scale] GPT repair failed: {e}")
+        return None
 
-        # Dacă avem extra text, extragem primul obiect JSON { ... }
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        candidate = text
-        if start != -1 and end > start:
-            candidate = text[start:end]
 
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            # Evităm să spargem pipeline-ul pentru răspunsuri non-JSON (rate-limit / refuz / text liber).
-            preview = " ".join(text.split())[:160]
-            print(f"⚠️  Gemini returned non-JSON: {preview!r}")
-            return None
-        
+def call_gemini(image_path, prompt, api_key, max_retries=2):
+    """API REST Direct (v1beta) pentru Gemini. Retry la non-JSON."""
+    try:
+        for attempt in range(max_retries + 1):
+            with open(image_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+
+            ext = Path(image_path).suffix.lower()
+            mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
+            mime_type = mime_map.get(ext, 'image/jpeg')
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+
+            gen_config = {"temperature": 0.0, "maxOutputTokens": 1000, "responseMimeType": "application/json"}
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": mime_type, "data": image_data}},
+                        {"text": prompt + "\n\nIMPORTANT: Răspunde DOAR cu un obiect JSON valid, fără text înainte sau după."}
+                    ]
+                }],
+                "generationConfig": gen_config
+            }
+
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+
+            if response.status_code != 200:
+                print(f"⚠️  Gemini HTTP {response.status_code}")
+                return None
+
+            result = response.json()
+            if 'candidates' not in result or not result['candidates']:
+                return None
+
+            text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
+            if not text:
+                return None
+
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].lstrip().startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            candidate = text
+            if start != -1 and end > start:
+                candidate = text[start:end]
+
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                preview = " ".join(text.split())[:160]
+                print(f"⚠️  Gemini returned non-JSON: {preview!r}, încerc GPT repair...")
+                repaired = _repair_scale_json_with_gpt(text, prompt)
+                if repaired is not None:
+                    return repaired
+                if attempt < max_retries:
+                    continue
+                return None
+        return None
     except Exception as e:
         print(f"⚠️  Gemini error: {e}")
         return None
