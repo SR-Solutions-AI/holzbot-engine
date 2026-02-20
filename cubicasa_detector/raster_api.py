@@ -780,11 +780,12 @@ def brute_force_alignment(
                 top_results.pop()
         
         def run_scale_search(scales_arr, save_step_indices=None):
-            """Rulează ambele direcții (API→Orig, Orig→API) pentru scale date. Optional: salvează step overlay la indici."""
+            """Pentru fiecare scale: calculează suprapunerea în AMBELE direcții; score = min(s1, s2) ca ambele măști să fie bune simultan."""
             total = len(scales_arr)
             log_every = max(1, total // 15)
-            tested_a, tested_b = 0, 0
             for idx, scale in enumerate(scales_arr):
+                score_a2o, pos_a2o, size_a2o = None, None, None
+                score_o2a, pos_o2a, size_o2a = None, None, None
                 # API → Original
                 new_w = int(binary_api.shape[1] * scale)
                 new_h = int(binary_api.shape[0] * scale)
@@ -792,33 +793,53 @@ def brute_force_alignment(
                     api_scaled = cv2.resize(binary_api, (new_w, new_h))
                     result_match = cv2.matchTemplate(binary_orig, api_scaled, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
-                    add_to_top_results({
-                        'direction': 'api_to_orig', 'scale': float(scale), 'rotation': 0,
-                        'position': (int(max_loc[0]), int(max_loc[1])),
-                        'score': float(max_val), 'template_size': (int(new_w), int(new_h))
-                    })
-                    tested_a += 1
-                    if save_step_indices is not None and idx in save_step_indices:
-                        cfg = {'direction': 'api_to_orig', 'scale': float(scale), 'position': (int(max_loc[0]), int(max_loc[1])), 'score': float(max_val), 'template_size': (new_w, new_h)}
-                        _save_step_overlay(binary_orig, binary_api, cfg, brute_steps_dir / f"step_api2orig_scale_{scale:.2f}_score_{max_val:.3f}.png")
+                    score_a2o = float(max_val)
+                    pos_a2o = (int(max_loc[0]), int(max_loc[1]))
+                    size_a2o = (new_w, new_h)
                 # Original → API
-                new_w = int(binary_orig.shape[1] * scale)
-                new_h = int(binary_orig.shape[0] * scale)
-                if new_w <= binary_api.shape[1] and new_h <= binary_api.shape[0] and new_w >= 30 and new_h >= 30:
-                    orig_scaled = cv2.resize(binary_orig, (new_w, new_h))
+                new_w_o = int(binary_orig.shape[1] * scale)
+                new_h_o = int(binary_orig.shape[0] * scale)
+                if new_w_o <= binary_api.shape[1] and new_h_o <= binary_api.shape[0] and new_w_o >= 30 and new_h_o >= 30:
+                    orig_scaled = cv2.resize(binary_orig, (new_w_o, new_h_o))
                     result_match = cv2.matchTemplate(binary_api, orig_scaled, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
+                    score_o2a = float(max_val)
+                    pos_o2a = (int(max_loc[0]), int(max_loc[1]))
+                    size_o2a = (new_w_o, new_h_o)
+                # Un singur candidat per scale: score = min(ambele) ca suprapunerea să fie bună pentru AMBELE măști
+                if score_a2o is not None and score_o2a is not None:
+                    combined_score = min(score_a2o, score_o2a)
+                    use_a2o = score_a2o >= score_o2a
+                    add_to_top_results({
+                        'direction': 'api_to_orig' if use_a2o else 'orig_to_api',
+                        'scale': float(scale), 'rotation': 0,
+                        'position': pos_a2o if use_a2o else pos_o2a,
+                        'template_size': size_a2o if use_a2o else size_o2a,
+                        'score': combined_score,
+                        'score_api2orig': score_a2o,
+                        'score_orig2api': score_o2a,
+                    })
+                elif score_a2o is not None:
+                    add_to_top_results({
+                        'direction': 'api_to_orig', 'scale': float(scale), 'rotation': 0,
+                        'position': pos_a2o, 'template_size': size_a2o, 'score': float(score_a2o),
+                        'score_api2orig': score_a2o, 'score_orig2api': None,
+                    })
+                elif score_o2a is not None:
                     add_to_top_results({
                         'direction': 'orig_to_api', 'scale': float(scale), 'rotation': 0,
-                        'position': (int(max_loc[0]), int(max_loc[1])),
-                        'score': float(max_val), 'template_size': (int(new_w), int(new_h))
+                        'position': pos_o2a, 'template_size': size_o2a, 'score': float(score_o2a),
+                        'score_api2orig': None, 'score_orig2api': score_o2a,
                     })
-                    tested_b += 1
-                    if save_step_indices is not None and idx in save_step_indices:
-                        cfg = {'direction': 'orig_to_api', 'scale': float(scale), 'position': (int(max_loc[0]), int(max_loc[1])), 'score': float(max_val), 'template_size': (new_w, new_h)}
-                        _save_step_overlay(binary_api, binary_orig, cfg, brute_steps_dir / f"step_orig2api_scale_{scale:.2f}_score_{max_val:.3f}.png")
+                if save_step_indices is not None and idx in save_step_indices:
+                    if score_a2o is not None:
+                        _save_step_overlay(binary_orig, binary_api, {'direction': 'api_to_orig', 'scale': float(scale), 'position': pos_a2o, 'score': score_a2o, 'template_size': size_a2o}, brute_steps_dir / f"step_api2orig_scale_{scale:.2f}_score_{score_a2o:.3f}.png")
+                    if score_o2a is not None:
+                        _save_step_overlay(binary_api, binary_orig, {'direction': 'orig_to_api', 'scale': float(scale), 'position': pos_o2a, 'score': score_o2a, 'template_size': size_o2a}, brute_steps_dir / f"step_orig2api_scale_{scale:.2f}_score_{score_o2a:.3f}.png")
                 if idx % log_every == 0 and top_results:
-                    print(f"         ⏳ Test {idx+1}/{total}: scale={scale:.2f}x... Best: {top_results[0]['score']:.4f}")
+                    c = top_results[0]
+                    s2 = f" (api2orig={c.get('score_api2orig', c['score']):.3f}, orig2api={c.get('score_orig2api', c['score']):.3f})" if c.get('score_orig2api') is not None else ""
+                    print(f"         ⏳ Test {idx+1}/{total}: scale={scale:.2f}x... Best combined: {top_results[0]['score']:.4f}{s2}")
         
         # Faza 1: interval focus 0.8–1.2 (marime originală, scale aproape 1:1)
         scales_focus = np.arange(FOCUS_SCALE_MIN, FOCUS_SCALE_MAX + FOCUS_STEP / 2, FOCUS_STEP)
@@ -843,7 +864,11 @@ def brute_force_alignment(
             print(f"      ⚠️ Nu s-au găsit rezultate valide pentru brute force")
             return None
         
-        print(f"      ✅ Best score: {top_results[0]['score']:.4f}")
+        best_first = top_results[0]
+        if best_first.get('score_api2orig') is not None and best_first.get('score_orig2api') is not None:
+            print(f"      ✅ Best score (ambele măști): {best_first['score']:.4f} (api→orig: {best_first['score_api2orig']:.4f}, orig→api: {best_first['score_orig2api']:.4f})")
+        else:
+            print(f"      ✅ Best score: {best_first['score']:.4f}")
         
         # Salvare top 5 candidați în brute_steps
         for i, cfg in enumerate(top_results[:5]):

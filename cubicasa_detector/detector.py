@@ -2151,6 +2151,7 @@ def run_cubicasa_detection(
     run_phase: int = 0,
     reused_model=None,
     reused_device=None,
+    raster_timings: list | None = None,
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
@@ -2213,6 +2214,7 @@ def run_cubicasa_detection(
             # 2a. RASTER TO VECTOR API CALL
             if steps_dir:
                 try:
+                    _rt_api = time.time()
                     print(f"   🔄 Apel RasterScan API pentru vectorizare...")
             
                     # Creăm folderul raster
@@ -2784,8 +2786,13 @@ def run_cubicasa_detection(
                     print(f"      ⚠️ RasterScan API timeout (120s)")
                 except Exception as e:
                     print(f"      ⚠️ RasterScan API eroare: {e}")
+                finally:
+                    if raster_timings is not None:
+                        raster_timings.append(("Raster P1: API + imagini", time.time() - _rt_api))
     
         # ✅ ADAPTIVE STRATEGY (tot în run_phase != 2)
+        if raster_timings is not None:
+            _rt_ai = time.time()
         LARGE_IMAGE_THRESHOLD = 3000  # px
         USE_TILING = h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD
         
@@ -2887,6 +2894,8 @@ def run_cubicasa_detection(
         ai_walls_closed = ai_walls_raw.copy()
         
         save_step("02_ai_walls_closed", ai_walls_closed, str(steps_dir))
+        if raster_timings is not None:
+            raster_timings.append(("Raster P1: AI walls", time.time() - _rt_ai))
         if run_phase == 1:
             return {"model": model, "device": device}
     
@@ -2901,6 +2910,7 @@ def run_cubicasa_detection(
         if raster_dir.exists():
             # Verificăm dacă există deja configurația salvată (cache)
             config_path = raster_dir / "brute_force_best_config.json"
+            _rt_bf = time.time() if raster_timings is not None else None
             if config_path.exists():
                 try:
                     with open(config_path, 'r') as f:
@@ -2921,7 +2931,7 @@ def run_cubicasa_detection(
                         orig_walls = cv2.imread(str(orig_walls_path), cv2.IMREAD_GRAYSCALE)
                         
                         if api_walls_mask is not None and orig_walls is not None:
-                            best_config = brute_force_alignment(
+                                best_config = brute_force_alignment(
                                 api_walls_mask,
                                 orig_walls,
                                 raster_dir,
@@ -2931,6 +2941,8 @@ def run_cubicasa_detection(
                     import traceback
                     print(f"      ⚠️ Eroare brute force pentru api_walls_mask: {e}")
                     traceback.print_exc()
+            if _rt_bf is not None and raster_timings is not None:
+                raster_timings.append(("Raster P2: Brute force", time.time() - _rt_bf))
             
             # Dacă avem configurația, aplicăm transformarea și generăm crop-ul
             if best_config is not None:
@@ -2947,6 +2959,8 @@ def run_cubicasa_detection(
                             api_walls_mask = cv2.imread(str(raster_dir / "api_walls_mask.png"), cv2.IMREAD_GRAYSCALE)
                             
                             if api_walls_mask is not None:
+                                if raster_timings is not None:
+                                    _rt_ov = time.time()
                                 # Aplicăm transformarea și generăm overlay-ul
                                 apply_alignment_and_generate_overlay(
                                     best_config,
@@ -2962,6 +2976,8 @@ def run_cubicasa_detection(
                                     original_img,
                                     api_result
                                 )
+                                if raster_timings is not None:
+                                    raster_timings.append(("Raster P2: Overlay + crop", time.time() - _rt_ov))
                                 
                                 # ============================================================
                                 # GENEREZ PEREȚI DIN COORDONATELE CAMERELOR
@@ -2972,6 +2988,7 @@ def run_cubicasa_detection(
                                 # ✅ Wrap în try-except pentru a permite workflow-ul să continue chiar dacă generarea pereților eșuează
                                 walls_result = None
                                 try:
+                                    _rt_wfc = time.time() if raster_timings is not None else None
                                     walls_result = generate_walls_from_room_coordinates(
                                         original_img,
                                         best_config,
@@ -2979,10 +2996,14 @@ def run_cubicasa_detection(
                                         str(steps_dir),
                                         gemini_api_key
                                     )
+                                    if _rt_wfc is not None and raster_timings is not None:
+                                        raster_timings.append(("Raster P2: Walls from room coords", time.time() - _rt_wfc))
                                 except Exception as walls_error:
                                     import traceback
                                     print(f"      ⚠️ Eroare la generarea pereților din coordonate: {walls_error}")
                                     traceback.print_exc()
+                                    if raster_timings is not None and _rt_wfc is not None:
+                                        raster_timings.append(("Raster P2: Walls from room coords", time.time() - _rt_wfc))
                                     # ✅ Verificăm dacă room_scales.json a fost salvat în ciuda erorii
                                     room_scales_path = Path(steps_dir) / "raster_processing" / "walls_from_coords" / "room_scales.json"
                                     if room_scales_path.exists():
@@ -3117,10 +3138,14 @@ def run_cubicasa_detection(
         # rooms.png va fi generat DUPĂ validarea pereților în raster_processing
         
         # 2. Detectare interior/exterior folosind masca RasterScan
+        if raster_timings is not None:
+            _rt_ie = time.time()
         indoor_mask, outdoor_mask = detect_interior_exterior_from_raster(
             api_walls_mask_crop,
             steps_dir=str(steps_dir)
         )
+        if raster_timings is not None:
+            raster_timings.append(("Raster P2: Interior/exterior", time.time() - _rt_ie))
         
         # 3. Citim scala din room_scales.json generat de RasterScan (NU calculăm din nou!)
         if crop_img is not None:

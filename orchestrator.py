@@ -285,7 +285,7 @@ def run_segmentation_and_classification_for_document(
     # Debug output
     print(f"\n📊 CLASSIFICATION SUMMARY:")
     print(f"   Total plans detected: {len(plans)}")
-    from collections import Counter
+    from collections import Counter, defaultdict
     label_counts = Counter(p.label for p in plans)
     for label, count in label_counts.items():
         print(f"   {label}: {count}")
@@ -359,6 +359,7 @@ def run_segmentation_and_classification_for_document(
         # ✅ STEP 5.5: RasterScan Processing (generează room_scales.json)
         # Acest pas apelează RasterScan API și generează pereții corecți + lista de camere + room_scales.json
         # DUPĂ ce avem lista de camere, putem calcula scale detection (STEP 6)
+        raster_timings = []  # (nume_pas, durata) din fiecare plan, agregate la final
         with Timer("STEP 5.5: RasterScan Processing") as t:
             print(f"\n{'='*60}")
             print(f"[RasterScan] Starting RasterScan processing for run: {run_id}")
@@ -373,6 +374,7 @@ def run_segmentation_and_classification_for_document(
                 run_cubicasa_phase1(
                     plan_image=plan.plan_image,
                     output_dir=plan.stage_work_dir,
+                    raster_timings=raster_timings,
                 )
                 print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK", flush=True)
             for plan in plans:
@@ -387,7 +389,7 @@ def run_segmentation_and_classification_for_document(
                 # Phase 2 în paralel pentru toate planurile (brute force + room_scales.json)
                 def do_phase2(plan):
                     print(f"[RasterScan] Phase 2 {plan.plan_id} → brute force + room_scales.json", flush=True)
-                    run_cubicasa_phase2(output_dir=plan.stage_work_dir)
+                    run_cubicasa_phase2(output_dir=plan.stage_work_dir, raster_timings=raster_timings)
                     print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes", flush=True)
                 with ThreadPoolExecutor(max_workers=len(plans) or 1) as executor:
                     futs = {executor.submit(do_phase2, plan): plan for plan in plans}
@@ -414,6 +416,13 @@ def run_segmentation_and_classification_for_document(
             print(f"[RasterScan] RasterScan Processing Complete")
             print(f"{'='*60}\n")
         pipeline_timer.add_step("RasterScan Processing", t.end_time - t.start_time)
+        # Pași detaliați Raster (agregare pe toate planurile)
+        if raster_timings:
+            by_name = defaultdict(float)
+            for name, dur in raster_timings:
+                by_name[name] += dur
+            for name, dur in sorted(by_name.items(), key=lambda x: -x[1]):
+                pipeline_timer.add_step(f"  └ {name}", dur)
         
         if not raster_ok:
             print(f"\n⛔ [Pipeline] Camerele nu sunt calculate pentru toate planurile.", flush=True)
