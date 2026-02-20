@@ -1378,26 +1378,43 @@ def generate_walls_from_room_coordinates(
             print(f"      [BLACKLIST] EROARE: {e}")
             traceback.print_exc()
 
-    # ✅ Flood fill din cele 4 colțuri. Eliminăm pixel de perete dacă ≥2 vecini (N,S,E,W) sunt flood,
-    # DAR nu eliminăm colțuri/joncțiuni (pixeli cu ≥2 vecini pereți în 8-conectivitate), ca să nu rămână găuri.
-    print(f"      🌊 Flood fill din 4 colțuri, elimin pereți cu ≥2 vecini flood (păstrând colțurile)...")
+    # ✅ Flood fill din colțuri + margini. Eliminăm orice pixel care nu e negru și are ≥2 vecini (N,S,E,W) flood,
+    # DAR nu eliminăm joncțiunile (≥2 vecini pereți în 8-conectivitate), ca să nu rămână găuri.
+    # Perete = orice pixel cu culoare diferită de negru (mask > 0), pentru a acoperi și antialiasing/gri.
+    print(f"      🌊 Flood fill din colțuri + margini, elimin pereți (orice pixel ≠ negru) cu ≥2 vecini flood...")
     
-    flood_base = (255 - accepted_wall_segments_mask).astype(np.uint8)
-    corners = [(0, 0), (w_orig - 1, 0), (0, h_orig - 1), (w_orig - 1, h_orig - 1)]
+    # Perete = orice pixel care nu e negru (robust la mască 2D sau valori 0/255/gri)
+    if accepted_wall_segments_mask.ndim == 3:
+        is_wall = np.any(accepted_wall_segments_mask > 0, axis=-1)
+    else:
+        is_wall = (accepted_wall_segments_mask > 0).copy()
+    flood_base = np.where(is_wall, 0, 255).astype(np.uint8)
+    
+    # Seed-uri: cele 4 colțuri + puncte pe margini (la fiecare ~50px) ca să acoperim tot exteriorul
+    seeds = [(0, 0), (w_orig - 1, 0), (0, h_orig - 1), (w_orig - 1, h_orig - 1)]
+    step = max(1, min(50, w_orig // 10, h_orig // 10))
+    for px in range(0, w_orig, step):
+        seeds.append((px, 0))
+        seeds.append((px, h_orig - 1))
+    for py in range(0, h_orig, step):
+        seeds.append((0, py))
+        seeds.append((w_orig - 1, py))
     flood_any = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    
-    for corner_idx, (cx, cy) in enumerate(corners):
-        if flood_base[cy, cx] == 255:
-            region_mask = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
-            img_copy = flood_base.copy()
-            cv2.floodFill(img_copy, region_mask, (cx, cy), 128 + corner_idx, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
-            r = region_mask[1:-1, 1:-1] > 0
-            flood_any[r] = 255
+    for cx, cy in seeds:
+        if cy >= h_orig or cx >= w_orig:
+            continue
+        if flood_base[cy, cx] != 255:
+            continue
+        region_mask = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
+        img_copy = flood_base.copy()
+        cv2.floodFill(img_copy, region_mask, (cx, cy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+        r = region_mask[1:-1, 1:-1] > 0
+        flood_any[r] = 255
     
     walls_to_remove = np.zeros((h_orig, w_orig), dtype=np.uint8)
     for y in range(h_orig):
         for x in range(w_orig):
-            if accepted_wall_segments_mask[y, x] == 0:
+            if not is_wall[y, x]:
                 continue
             n_flood = 0
             for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
@@ -1406,14 +1423,13 @@ def generate_walls_from_room_coordinates(
                     n_flood += 1
             if n_flood < 2:
                 continue
-            # Nu eliminăm joncțiuni (colțuri/T): pixel cu ≥2 vecini pereți în 8-conectivitate
             n_wall = 0
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     if dx == 0 and dy == 0:
                         continue
                     ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and accepted_wall_segments_mask[ny, nx] > 0:
+                    if 0 <= ny < h_orig and 0 <= nx < w_orig and is_wall[ny, nx]:
                         n_wall += 1
             if n_wall >= 2:
                 continue

@@ -66,8 +66,16 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
         
         # Salvăm copia preprocesată în folderul raster
         preprocessed_path = raster_dir / "00_original_preprocessed.png"
-        cv2.imwrite(str(preprocessed_path), api_img)
-        print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
+        try:
+            if not cv2.imwrite(str(preprocessed_path), api_img):
+                print(f"      ⚠️ Nu s-a putut salva {preprocessed_path.name}")
+        except OSError as e:
+            if e.errno == 28:
+                print(f"      ⚠️ Disc plin: nu s-a salvat {preprocessed_path.name}")
+            else:
+                raise
+        else:
+            print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
         
         # Scale-down doar pentru trimiterea la Raster: max 1000px pe latura lungă (restul pipeline-ului nu se atinge)
         MAX_RASTER_SIDE = 1000
@@ -83,11 +91,19 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
             new_w_api, new_h_api = w_api, h_api
 
         # Salvăm imaginea care se trimite la API (scale/raster) – nume explicit ca să fie ușor de găsit
-        api_img_path = raster_dir / "input_resized.jpg"
-        cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        request_png_path = raster_dir / "raster_request.png"
-        cv2.imwrite(str(request_png_path), api_img)
-        print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
+        try:
+            api_img_path = raster_dir / "input_resized.jpg"
+            cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            request_png_path = raster_dir / "raster_request.png"
+            if not cv2.imwrite(str(request_png_path), api_img):
+                print(f"      ⚠️ Nu s-a putut salva {request_png_path.name}")
+            else:
+                print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
+        except OSError as e:
+            if e.errno == 28:
+                print(f"      ⚠️ Disc plin: nu s-a salvat request image")
+            else:
+                raise
 
         # Convertim în base64 (folosim JPEG comprimat)
         _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -128,14 +144,24 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
                 return None
         
         if response is not None and response.status_code == 200:
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception as e:
+                print(f"      ⚠️ RasterScan API: eroare parsare JSON: {e}")
+                return None
             print(f"      ✅ RasterScan API răspuns primit")
             
             # Salvăm răspunsul JSON
             json_path = raster_dir / "response.json"
-            with open(json_path, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"      📄 Salvat: {json_path.name}")
+            try:
+                with open(json_path, 'w') as f:
+                    json.dump(result, f, indent=2)
+                print(f"      📄 Salvat: {json_path.name}")
+            except OSError as e:
+                if e.errno == 28:
+                    print(f"      ⚠️ Disc plin: nu s-a salvat {json_path.name}")
+                else:
+                    raise
             
             # Salvăm SVG, DXF, și imaginea procesată dacă există
             if isinstance(result, dict):
@@ -201,12 +227,18 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
             orig_w = max(1, int(round(new_w_api / scale_factor)))
             orig_h = max(1, int(round(new_h_api / scale_factor)))
             request_info_path = raster_dir / "raster_request_info.json"
-            with open(request_info_path, 'w') as f:
-                json.dump({
-                    "request_w": int(new_w_api), "request_h": int(new_h_api),
-                    "original_w": orig_w, "original_h": orig_h,
-                    "scale_factor": float(scale_factor)
-                }, f, indent=2)
+            try:
+                with open(request_info_path, 'w') as f:
+                    json.dump({
+                        "request_w": int(new_w_api), "request_h": int(new_h_api),
+                        "original_w": orig_w, "original_h": orig_h,
+                        "scale_factor": float(scale_factor)
+                    }, f, indent=2)
+            except OSError as e:
+                if e.errno == 28:
+                    print(f"      ⚠️ Disc plin: nu s-a salvat {request_info_path.name}")
+                else:
+                    raise
 
             # Returnăm rezultatul cu scale_factor pentru transformări ulterioare
             return {
@@ -678,6 +710,15 @@ def brute_force_alignment(
     try:
         print(f"\n      🔥 BRUTE FORCE: Căutare transformare între API walls și original walls...")
         
+        # Masca de la Raster trebuie readusă la marimea originală (cea înainte de trimitere la API) pentru brute force
+        h_orig, w_orig = orig_walls.shape[:2]
+        if api_walls_mask.shape[0] != h_orig or api_walls_mask.shape[1] != w_orig:
+            api_walls_mask = cv2.resize(
+                api_walls_mask, (w_orig, h_orig),
+                interpolation=cv2.INTER_NEAREST
+            )
+            print(f"      📐 Mască API readusă la marimea originală: {w_orig}x{h_orig}")
+        
         print(f"      📊 API walls: {api_walls_mask.shape[1]} x {api_walls_mask.shape[0]}")
         print(f"      📊 Original walls: {orig_walls.shape[1]} x {orig_walls.shape[0]}")
         
@@ -725,13 +766,10 @@ def brute_force_alignment(
                 else:
                     raise
         
-        # Interval scale 10%–1000% (0.1–10.0): template poate fi de la 1/10 la 10× față de cealaltă imagine
-        # Pas fin (0.01) = multe iterații pentru suprapuneri cât mai exacte
-        SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.1, 10.0, 0.01
-        scales = np.arange(SCALE_MIN, SCALE_MAX + SCALE_STEP / 2, SCALE_STEP)
-        
-        print(f"      📊 Scale: {SCALE_MIN*100:.0f}% – {SCALE_MAX*100:.0f}% (pas {SCALE_STEP}), {len(scales)} valori")
-        print(f"      📊 Rotații: 1 (0°) | Total teste: 2× (API→Orig + Orig→API), skip când template > imagine")
+        # Brute force inteligent: mai întâi interval 0.8–1.2 (scale aproape 1:1); doar dacă nu găsim acuratețe mare, trecem la 0.1–10.0
+        FOCUS_SCALE_MIN, FOCUS_SCALE_MAX, FOCUS_STEP = 0.8, 1.2, 0.005
+        FULL_SCALE_MIN, FULL_SCALE_MAX, FULL_STEP = 0.1, 10.0, 0.01
+        ACCURACY_THRESHOLD = 0.48  # peste acest score în [0.8, 1.2] rămânem pe interval focus
         
         top_results = []
         
@@ -741,104 +779,71 @@ def brute_force_alignment(
             if len(top_results) > max_results:
                 top_results.pop()
         
-        # Indici pentru salvarea pașilor (10 scale reprezentative, uniform distribuite)
-        n_scale = len(scales)
-        step_indices = list(np.linspace(0, max(0, n_scale - 1), min(10, n_scale), dtype=int))
+        def run_scale_search(scales_arr, save_step_indices=None):
+            """Rulează ambele direcții (API→Orig, Orig→API) pentru scale date. Optional: salvează step overlay la indici."""
+            total = len(scales_arr)
+            log_every = max(1, total // 15)
+            tested_a, tested_b = 0, 0
+            for idx, scale in enumerate(scales_arr):
+                # API → Original
+                new_w = int(binary_api.shape[1] * scale)
+                new_h = int(binary_api.shape[0] * scale)
+                if new_w <= binary_orig.shape[1] and new_h <= binary_orig.shape[0] and new_w >= 30 and new_h >= 30:
+                    api_scaled = cv2.resize(binary_api, (new_w, new_h))
+                    result_match = cv2.matchTemplate(binary_orig, api_scaled, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
+                    add_to_top_results({
+                        'direction': 'api_to_orig', 'scale': float(scale), 'rotation': 0,
+                        'position': (int(max_loc[0]), int(max_loc[1])),
+                        'score': float(max_val), 'template_size': (int(new_w), int(new_h))
+                    })
+                    tested_a += 1
+                    if save_step_indices is not None and idx in save_step_indices:
+                        cfg = {'direction': 'api_to_orig', 'scale': float(scale), 'position': (int(max_loc[0]), int(max_loc[1])), 'score': float(max_val), 'template_size': (new_w, new_h)}
+                        _save_step_overlay(binary_orig, binary_api, cfg, brute_steps_dir / f"step_api2orig_scale_{scale:.2f}_score_{max_val:.3f}.png")
+                # Original → API
+                new_w = int(binary_orig.shape[1] * scale)
+                new_h = int(binary_orig.shape[0] * scale)
+                if new_w <= binary_api.shape[1] and new_h <= binary_api.shape[0] and new_w >= 30 and new_h >= 30:
+                    orig_scaled = cv2.resize(binary_orig, (new_w, new_h))
+                    result_match = cv2.matchTemplate(binary_api, orig_scaled, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
+                    add_to_top_results({
+                        'direction': 'orig_to_api', 'scale': float(scale), 'rotation': 0,
+                        'position': (int(max_loc[0]), int(max_loc[1])),
+                        'score': float(max_val), 'template_size': (int(new_w), int(new_h))
+                    })
+                    tested_b += 1
+                    if save_step_indices is not None and idx in save_step_indices:
+                        cfg = {'direction': 'orig_to_api', 'scale': float(scale), 'position': (int(max_loc[0]), int(max_loc[1])), 'score': float(max_val), 'template_size': (new_w, new_h)}
+                        _save_step_overlay(binary_api, binary_orig, cfg, brute_steps_dir / f"step_orig2api_scale_{scale:.2f}_score_{max_val:.3f}.png")
+                if idx % log_every == 0 and top_results:
+                    print(f"         ⏳ Test {idx+1}/{total}: scale={scale:.2f}x... Best: {top_results[0]['score']:.4f}")
         
-        # Testare API -> Original
-        print(f"      🚀 Testare API walls → Original walls...")
-        total = len(scales)
-        tested = 0
+        # Faza 1: interval focus 0.8–1.2 (marime originală, scale aproape 1:1)
+        scales_focus = np.arange(FOCUS_SCALE_MIN, FOCUS_SCALE_MAX + FOCUS_STEP / 2, FOCUS_STEP)
+        print(f"      📊 Faza 1 – interval focus 80%–120% (pas {FOCUS_STEP}): {len(scales_focus)} valori")
+        step_indices_focus = list(np.linspace(0, max(0, len(scales_focus) - 1), min(10, len(scales_focus)), dtype=int))
+        run_scale_search(scales_focus, save_step_indices=step_indices_focus)
         
-        for idx, scale in enumerate(scales):
-            tested += 1
-            
-            log_every = max(50, total // 20)
-            if idx % log_every == 0 or tested == 1:
-                print(f"         ⏳ Test {tested}/{total}: scale={scale:.2f}x...")
-            
-            api_rot = binary_api.copy()
-            
-            new_w = int(api_rot.shape[1] * scale)
-            new_h = int(api_rot.shape[0] * scale)
-            
-            if new_w > binary_orig.shape[1] or new_h > binary_orig.shape[0]:
-                continue
-            if new_w < 30 or new_h < 30:
-                continue
-            
-            api_scaled = cv2.resize(api_rot, (new_w, new_h))
-            
-            result_match = cv2.matchTemplate(binary_orig, api_scaled, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
-            
-            config = {
-                'direction': 'api_to_orig',
-                'scale': float(scale),
-                'rotation': 0,
-                'position': (int(max_loc[0]), int(max_loc[1])),
-                'score': float(max_val),
-                'template_size': (int(new_w), int(new_h))
-            }
-            add_to_top_results(config)
-            
-            if idx in step_indices:
-                _save_step_overlay(binary_orig, binary_api, config, brute_steps_dir / f"step_api2orig_scale_{scale:.2f}_score_{max_val:.3f}.png")
-            
-            if idx % log_every == 0 and top_results:
-                print(f"            ✅ Score: {max_val:.4f} (Best: {top_results[0]['score']:.4f})")
+        use_full_range = True
+        if top_results and top_results[0]['score'] >= ACCURACY_THRESHOLD:
+            print(f"      ✅ Găsit score bun în interval 0.8–1.2: {top_results[0]['score']:.4f} (>= {ACCURACY_THRESHOLD}). Folosesc doar interval focus.")
+            use_full_range = False
         
-        if top_results:
-            print(f"      ✅ Finalizat API→Orig: {tested}/{total} teste, best score: {top_results[0]['score']:.4f}")
-        else:
-            print(f"      ⚠️ Nu s-au găsit rezultate valide pentru API→Orig")
-        
-        # Testare Original -> API
-        print(f"      🚀 Testare Original walls → API walls...")
-        tested = 0
-        
-        for idx, scale in enumerate(scales):
-            tested += 1
-            
-            if idx % log_every == 0 or tested == 1:
-                print(f"         ⏳ Test {tested}/{total}: scale={scale:.2f}x...")
-            
-            orig_rot = binary_orig.copy()
-            
-            new_w = int(orig_rot.shape[1] * scale)
-            new_h = int(orig_rot.shape[0] * scale)
-            
-            if new_w > binary_api.shape[1] or new_h > binary_api.shape[0]:
-                continue
-            if new_w < 30 or new_h < 30:
-                continue
-            
-            orig_scaled = cv2.resize(orig_rot, (new_w, new_h))
-            
-            result_match = cv2.matchTemplate(binary_api, orig_scaled, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
-            
-            config = {
-                'direction': 'orig_to_api',
-                'scale': float(scale),
-                'rotation': 0,
-                'position': (int(max_loc[0]), int(max_loc[1])),
-                'score': float(max_val),
-                'template_size': (int(new_w), int(new_h))
-            }
-            add_to_top_results(config)
-            
-            if idx in step_indices:
-                _save_step_overlay(binary_api, binary_orig, config, brute_steps_dir / f"step_orig2api_scale_{scale:.2f}_score_{max_val:.3f}.png")
-            
-            if idx % log_every == 0 and top_results:
-                print(f"            ✅ Score: {max_val:.4f} (Best: {top_results[0]['score']:.4f})")
+        if use_full_range:
+            # Faza 2: interval complet 0.1–10.0
+            top_results.clear()
+            scales_full = np.arange(FULL_SCALE_MIN, FULL_SCALE_MAX + FULL_STEP / 2, FULL_STEP)
+            print(f"      📊 Faza 2 – interval complet 10%–1000% (pas {FULL_STEP}): {len(scales_full)} valori")
+            step_indices_full = list(np.linspace(0, max(0, len(scales_full) - 1), min(10, len(scales_full)), dtype=int))
+            run_scale_search(scales_full, save_step_indices=step_indices_full)
         
         if not top_results:
             print(f"      ⚠️ Nu s-au găsit rezultate valide pentru brute force")
             return None
         
-        print(f"      ✅ Finalizat Orig→API: {tested}/{total} teste, best score: {top_results[0]['score']:.4f}")
+        print(f"      ✅ Best score: {top_results[0]['score']:.4f}")
         
         # Salvare top 5 candidați în brute_steps
         for i, cfg in enumerate(top_results[:5]):
@@ -850,11 +855,14 @@ def brute_force_alignment(
         
         best = top_results[0]
         
-        # Rafinare: scale mai fin în jurul scalei alese (±0.1, pas 0.01)
+        # Rafinare: scale mai fin în jurul scalei alese (±0.1, pas 0.005)
         ref_scale = best['scale']
         ref_direction = best['direction']
-        refine_scales = np.clip(np.arange(ref_scale - 0.10, ref_scale + 0.105, 0.005), SCALE_MIN, SCALE_MAX)
-        print(f"      🔧 Rafinare scale: {len(refine_scales)} valori în [{refine_scales[0]:.2f}, {refine_scales[-1]:.2f}] (pas 0.005)")
+        refine_min = max(FOCUS_SCALE_MIN, ref_scale - 0.10) if not use_full_range else max(FULL_SCALE_MIN, ref_scale - 0.10)
+        refine_max = min(FOCUS_SCALE_MAX, ref_scale + 0.105) if not use_full_range else min(FULL_SCALE_MAX, ref_scale + 0.105)
+        refine_scales = np.unique(np.clip(np.arange(refine_min, refine_max + 0.0025, 0.005), refine_min, refine_max))
+        if len(refine_scales):
+            print(f"      🔧 Rafinare scale: {len(refine_scales)} valori în [{refine_scales[0]:.2f}, {refine_scales[-1]:.2f}] (pas 0.005)")
         for scale in refine_scales:
             if ref_direction == 'api_to_orig':
                 new_w = int(binary_api.shape[1] * scale)

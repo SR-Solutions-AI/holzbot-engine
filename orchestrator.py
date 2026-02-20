@@ -367,7 +367,7 @@ def run_segmentation_and_classification_for_document(
             # Încărcăm planurile pentru acest run
             plans = load_plan_infos(run_id, "scale")  # Folosim "scale" pentru că output_dir va fi în scale/
             raster_scan_failed = False
-            # Phase 1 în paralel pentru toate planurile (Raster API + AI walls → 02_ai_walls_closed)
+            # Phase 1 secvențial (NU în paralel) ca să nu trimitem toate planurile la Raster API în același timp
             def do_phase1(plan):
                 print(f"[RasterScan] Phase 1 {plan.plan_id} → Raster API + 02_ai_walls_closed", flush=True)
                 run_cubicasa_phase1(
@@ -375,17 +375,14 @@ def run_segmentation_and_classification_for_document(
                     output_dir=plan.stage_work_dir,
                 )
                 print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK", flush=True)
-            with ThreadPoolExecutor(max_workers=len(plans) or 1) as executor:
-                futs = {executor.submit(do_phase1, plan): plan for plan in plans}
-                for fut in as_completed(futs):
-                    plan = futs[fut]
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-                        raster_scan_failed = True
+            for plan in plans:
+                try:
+                    do_phase1(plan)
+                except Exception as e:
+                    print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    raster_scan_failed = True
             if not raster_scan_failed:
                 # Phase 2 în paralel pentru toate planurile (brute force + room_scales.json)
                 def do_phase2(plan):
