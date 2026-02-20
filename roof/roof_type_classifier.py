@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-ROOF_TYPES = ("1_w", "2_w", "4_w", "4.5_w")
+ROOF_TYPES = ("0_w", "1_w", "2_w", "4_w", "4.5_w")
 
 
 PROMPT_ROOF_TYPE_PER_FLOOR = """You are an expert in roof types for residential buildings.
@@ -19,6 +19,7 @@ These images show exterior views (side views) of a building with {num_floors} fl
 Floors from bottom to top: {floor_names}
 
 For each floor, say what roof type you see. Roof types (you can use the code or describe in words):
+- 0_w = flat roof, no slope / Flachdach (perfectly flat, no pitch)
 - 1_w = single slope / Satteldach einseitig
 - 2_w = gable, two slopes / Satteldach
 - 4_w = hip, four slopes / Walmdach
@@ -99,16 +100,44 @@ def _dict_to_floor_result(data: dict, num_floors: int) -> Dict[int, str]:
                 out[idx] = t
             elif isinstance(t, str):
                 nv = t.replace(".", "_").replace(" ", "_").strip().lower()
-                mapping = {"1w": "1_w", "2w": "2_w", "4w": "4_w", "45w": "4.5_w", "4_5w": "4.5_w"}
+                mapping = {"0w": "0_w", "1w": "1_w", "2w": "2_w", "4w": "4_w", "45w": "4.5_w", "4_5w": "4.5_w"}
                 if nv in mapping:
                     out[idx] = mapping[nv]
         elif isinstance(val, str) and val in ROOF_TYPES:
             out[idx] = val
         elif isinstance(val, str):
             nv = val.replace(".", "_").replace(" ", "_").strip().lower()
-            mapping = {"1w": "1_w", "2w": "2_w", "4w": "4_w", "45w": "4.5_w", "4_5w": "4.5_w"}
+            mapping = {"0w": "0_w", "1w": "1_w", "2w": "2_w", "4w": "4_w", "45w": "4.5_w", "4_5w": "4.5_w"}
             if nv in mapping:
                 out[idx] = mapping[nv]
+    return out
+
+
+def _parse_roof_types_natural_language(text: str, num_floors: int) -> Dict[int, str]:
+    """Extrage tipuri acoperiș din text natural (ex: 'parter ... flat roofs (0_w)', 'etaj_1 ... 2_w')."""
+    out: Dict[int, str] = {}
+    if not text or num_floors < 1:
+        return out
+    # Caută per etaj: nume etaj urmat (în ~200 caractere) de un cod 0_w, 1_w, 2_w, 4_w, 4.5_w
+    text_lower = text.lower()
+    for idx in range(num_floors):
+        if idx == 0:
+            names = ["parter", "ground floor", "ground", "eg ", "erdgeschoss", "floor 0"]
+        else:
+            names = [f"etaj_{idx}", f"etaj {idx}", f"floor {idx}", f"floor_{idx}"]
+        for name in names:
+            pos = text_lower.find(name)
+            if pos < 0:
+                continue
+            snippet = text[pos : pos + 220]
+            for code in ROOF_TYPES:
+                if code in snippet:
+                    out[idx] = code
+                    break
+            if idx not in out and ("flat" in snippet or "flachdach" in snippet):
+                out[idx] = "0_w"
+            if idx in out:
+                break
     return out
 
 
@@ -117,7 +146,8 @@ def _parse_roof_types_response(text: str, num_floors: int) -> Dict[int, str]:
     out: Dict[int, str] = {}
     if not text:
         return out
-    text = text.strip()
+    original_text = text.strip()
+    text = original_text
     # Elimină prefixe tip "Here is the JSON requested:" etc. (oricare ordine cuvinte)
     for prefix in (
         "here is the json requested:",
@@ -150,17 +180,23 @@ def _parse_roof_types_response(text: str, num_floors: int) -> Dict[int, str]:
             except json.JSONDecodeError:
                 pass
         if not data:
-            m2 = re.search(r"\{[^}]*\"parter\"[^}]*\"(?:1_w|2_w|4_w|4\.5_w)\"[^}]*\}", text)
+            m2 = re.search(r"\{[^}]*\"parter\"[^}]*\"(?:0_w|1_w|2_w|4_w|4\.5_w)\"[^}]*\}", text)
             if m2:
                 try:
                     data = json.loads(m2.group(0))
                 except json.JSONDecodeError:
-                    return out
-            else:
-                return out
+                    pass
+            if not data:
+                return _parse_roof_types_natural_language(original_text, num_floors)
     if not isinstance(data, dict):
-        return out
-    return _dict_to_floor_result(data, num_floors)
+        return _parse_roof_types_natural_language(original_text, num_floors)
+    out = _dict_to_floor_result(data, num_floors)
+    if len(out) < num_floors:
+        nl = _parse_roof_types_natural_language(original_text, num_floors)
+        for i in range(num_floors):
+            if i not in out and i in nl:
+                out[i] = nl[i]
+    return out
 
 
 def _build_roof_types_json_with_gpt(gemini_raw_text: str, num_floors: int) -> Dict[int, str]:
@@ -168,7 +204,7 @@ def _build_roof_types_json_with_gpt(gemini_raw_text: str, num_floors: int) -> Di
     floor_keys = ["parter"] + [f"etaj_{i}" for i in range(1, num_floors)]
     schema_hint = (
         f"JSON object with exactly these keys: {', '.join(floor_keys)}. "
-        "Each value must be one of: 1_w, 2_w, 4_w, 4.5_w (roof type codes)."
+        "Each value must be one of: 0_w, 1_w, 2_w, 4_w, 4.5_w (roof type codes)."
     )
     try:
         from common.json_repair import repair_json_with_gpt
@@ -251,10 +287,16 @@ def classify_roof_types_per_floor(
         built = _build_roof_types_json_with_gpt(text, num_floors)
         if built:
             return built
-        # Fallback: încercăm parse local (dacă Gemini a returnat deja JSON valid)
+        # Fallback: parse local (JSON sau limbaj natural: "parter ... flat roofs (0_w)" etc.)
         types_result = _parse_roof_types_response(text, num_floors)
         if len(types_result) == num_floors:
             print(f"   [RoofTypeClassifier] Fallback parse local: types={types_result} – FOLOSIM.", flush=True)
+            return types_result
+        if types_result:
+            for i in range(num_floors):
+                if i not in types_result:
+                    types_result[i] = "2_w"
+            print(f"   [RoofTypeClassifier] Parse parțial + completare 2_w: types={types_result} – FOLOSIM.", flush=True)
             return types_result
         print(f"   [RoofTypeClassifier] Nici ChatGPT nu a putut construi rezultat complet – NU FOLOSIM.", flush=True)
     except Exception as e:

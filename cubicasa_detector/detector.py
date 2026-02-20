@@ -2254,24 +2254,35 @@ def run_cubicasa_detection(
                     cv2.imwrite(str(preprocessed_path), api_img)
                     print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
             
-                    # Redimensionăm imaginea dacă e prea mare (API limit ~4MB)
-                    MAX_API_DIM = 2048
+                    # Scale-down doar pentru trimitere la Raster: max 1000px pe latura lungă
+                    MAX_RASTER_SIDE = 1000
                     h_api, w_api = api_img.shape[:2]
                     scale_factor = 1.0
-            
-                    if max(h_api, w_api) > MAX_API_DIM:
-                        scale_factor = MAX_API_DIM / max(h_api, w_api)
-                        new_w_api = int(w_api * scale_factor)
-                        new_h_api = int(h_api * scale_factor)
+                    if max(h_api, w_api) > MAX_RASTER_SIDE:
+                        scale_factor = MAX_RASTER_SIDE / max(h_api, w_api)
+                        new_w_api = max(1, int(w_api * scale_factor))
+                        new_h_api = max(1, int(h_api * scale_factor))
                         api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
-                        print(f"      📐 Redimensionat pentru API: {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
+                        print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
                     else:
                         new_w_api, new_h_api = w_api, h_api
-            
-                    # Salvăm imaginea pentru API
+
+                    # Salvăm dimensiunile request vs original ca să putem converti coordonatele din JSON (request space) în original
+                    request_info_path = raster_dir / "raster_request_info.json"
+                    with open(request_info_path, 'w') as f:
+                        json.dump({
+                            "request_w": int(new_w_api), "request_h": int(new_h_api),
+                            "original_w": int(w_api), "original_h": int(h_api),
+                            "scale_factor": float(scale_factor)
+                        }, f, indent=2)
+
+                    # Salvăm imaginea care se trimite la API (scale/raster) – nume explicit
                     api_img_path = raster_dir / "input_resized.jpg"
                     cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            
+                    request_png_path = raster_dir / "raster_request.png"
+                    cv2.imwrite(str(request_png_path), api_img)
+                    print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
+
                     # Convertim în base64 (folosim JPEG comprimat)
                     _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     image_base64 = base64.b64encode(buffer).decode('utf-8')
@@ -2341,8 +2352,36 @@ def run_cubicasa_detection(
                                             with open(img_path, 'wb') as f:
                                                 f.write(img_data)
                                             print(f"      📄 Salvat: {img_path.name}")
+                                            nparr = np.frombuffer(img_data, np.uint8)
+                                            img_decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                            if img_decoded is not None:
+                                                raster_out_path = raster_dir / "raster_out.png"
+                                                cv2.imwrite(str(raster_out_path), img_decoded)
+                                                response_png_path = raster_dir / "raster_response.png"
+                                                cv2.imwrite(str(response_png_path), img_decoded)
+                                                print(f"      📄 Salvat (răspuns de la Raster): {response_png_path.name}")
                                         except Exception as e:
                                             print(f"      ⚠️ Eroare salvare imagine: {e}")
+                            
+                                # Fallback: imaginea poate fi în result['data']['image'] (API o returnează acolo)
+                                response_png_path = raster_dir / "raster_response.png"
+                                if not response_png_path.exists():
+                                    for maybe_img in (result.get('processed_image'), result.get('output_image'),
+                                                      (result.get('data') or {}).get('image') if isinstance(result.get('data'), dict) else None):
+                                        if isinstance(maybe_img, str):
+                                            try:
+                                                img_str = maybe_img
+                                                if ',' in img_str:
+                                                    img_str = img_str.split(',')[1]
+                                                img_data = base64.b64decode(img_str)
+                                                nparr = np.frombuffer(img_data, np.uint8)
+                                                img_decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                                if img_decoded is not None:
+                                                    cv2.imwrite(str(response_png_path), img_decoded)
+                                                    print(f"      📄 Salvat (răspuns de la Raster): {response_png_path.name}")
+                                                    break
+                                            except Exception:
+                                                pass
                             
                                 # Generăm imagini din datele vectoriale
                                 data = result.get('data', result)
@@ -2695,6 +2734,14 @@ def run_cubicasa_detection(
                                         nparr = np.frombuffer(img_data, np.uint8)
                                         api_processed_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                                     
+                                        # Size-up imaginea de la API la original cu același factor pe ambele axe (păstrăm aspect ratio)
+                                        if scale_factor < 1.0 and api_processed_img is not None:
+                                            scale_up = 1.0 / scale_factor
+                                            target_w = max(1, int(round(api_processed_img.shape[1] * scale_up)))
+                                            target_h = max(1, int(round(api_processed_img.shape[0] * scale_up)))
+                                            api_processed_img = cv2.resize(api_processed_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                                            print(f"      📐 Size-up imagine API la original (aspect ratio păstrat): {api_processed_img.shape[1]}x{api_processed_img.shape[0]}")
+                                    
                                         # Detectăm pereții din imaginea API (gri, nu colorați)
                                         api_gray = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2GRAY)
                                         api_hsv = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2HSV)
@@ -2706,6 +2753,18 @@ def run_cubicasa_detection(
                                         api_walls_path = raster_dir / "api_walls_mask.png"
                                         cv2.imwrite(str(api_walls_path), api_walls_mask)
                                         print(f"      📄 Salvat: {api_walls_path.name}")
+                                        # Actualizăm raster_request_info cu dimensiunile reale ale mastii (pentru conversie request→original corectă)
+                                        try:
+                                            request_info_path = raster_dir / "raster_request_info.json"
+                                            if request_info_path.exists():
+                                                with open(request_info_path, 'r') as f:
+                                                    req_info = json.load(f)
+                                                req_info["mask_w"] = int(api_walls_mask.shape[1])
+                                                req_info["mask_h"] = int(api_walls_mask.shape[0])
+                                                with open(request_info_path, 'w') as f:
+                                                    json.dump(req_info, f, indent=2)
+                                        except Exception:
+                                            pass
                                         # Notă: Brute force pentru api_walls_mask va fi executat mai târziu,
                                         # după generarea 02_ai_walls_closed.png (vezi linia ~2814)
                                         

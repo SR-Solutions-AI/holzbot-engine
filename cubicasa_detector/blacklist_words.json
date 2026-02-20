@@ -1,0 +1,21 @@
+{
+  "blacklist_terms": [
+    "pool",
+    "Pool",
+    "POOL",
+    "piscina",
+    "Piscina",
+    "pisc.",
+    "pisc",
+    "piscine",
+    "Piscine",
+    "schwimmbad",
+    "Schwimmbad",
+    "swimming",
+    "Swimming",
+    "bazin",
+    "Bazin",
+    "pool area",
+    "Pool Area"
+  ]
+}

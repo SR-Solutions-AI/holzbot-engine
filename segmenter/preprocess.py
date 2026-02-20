@@ -49,8 +49,9 @@ def remove_hatched_areas(gray: np.ndarray) -> np.ndarray:
     mean_norm = cv2.normalize(mean_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    _, strong = cv2.threshold(mean_norm, 120, 255, cv2.THRESH_BINARY)
-    _, lowvar = cv2.threshold(var_norm, 40, 255, cv2.THRESH_BINARY_INV)
+    # Praguri mai conservatoare: mai puțin clasificat ca hașură (curățare mai puțin agresivă)
+    _, strong = cv2.threshold(mean_norm, 140, 255, cv2.THRESH_BINARY)
+    _, lowvar = cv2.threshold(var_norm, 35, 255, cv2.THRESH_BINARY_INV)
 
     hatch_mask = cv2.bitwise_and(strong, lowvar)
     hatch_mask = cv2.morphologyEx(hatch_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
@@ -85,8 +86,7 @@ def remove_residual_noise(gray: np.ndarray) -> np.ndarray:
     denoised = cv2.medianBlur(gray, 5)
     save_debug(denoised, STEP_DIRS["hatch"], "1_median_blur.jpg")
     
-    # Pas 2: Morfologie Opening (elimină puncte izolate foarte mici)
-    # Kernel mic (2x2) pentru a nu afecta liniile subțiri ale planului
+    # Pas 2: Morfologie Opening cu kernel mic (2x2) – curățare ușoară, păstrăm liniile subțiri
     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     opened = cv2.morphologyEx(denoised, cv2.MORPH_OPEN, kernel_small)
     save_debug(opened, STEP_DIRS["hatch"], "2_morphology_open.jpg")
@@ -124,14 +124,12 @@ def remove_residual_noise(gray: np.ndarray) -> np.ndarray:
     save_debug(clean_mask, STEP_DIRS["hatch"], "3_components_mask.jpg")
     print(f"      • Eliminate {removed_count} puncte mici (min_area={min_area}px)")
     
-    # Pas 4: Bilateral filter (smoothing păstrând marginile)
-    # Acest filtru face smoothing pe zone uniforme dar păstrează edge-urile ascuțite
-    # Perfect pentru a elimina zgomotul fin rămas păstrând liniile planului
-    final = cv2.bilateralFilter(cleaned, d=5, sigmaColor=50, sigmaSpace=50)
+    # Pas 4: Bilateral filter (smoothing păstrând marginile) – parametri mai slabi ca să păstrăm mai mult detaliu
+    final = cv2.bilateralFilter(cleaned, d=5, sigmaColor=35, sigmaSpace=35)
     save_debug(final, STEP_DIRS["hatch"], "4_bilateral_final.jpg")
     
-    # Pas 5 (opțional): Un ultim threshold pentru a te asigura că totul e alb-negru curat
-    _, final_binary = cv2.threshold(final, 240, 255, cv2.THRESH_BINARY)
+    # Pas 5: Threshold mai permisiv (200 în loc de 240) ca să nu ștergem linii deschise/gri
+    _, final_binary = cv2.threshold(final, 200, 255, cv2.THRESH_BINARY)
     save_debug(final_binary, STEP_DIRS["hatch"], "5_final_clean.jpg")
     
     print("   └─ ✅ Puncte reziduale eliminate!")

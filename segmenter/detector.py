@@ -1,4 +1,9 @@
 # file: engine/runner/segmenter/detector.py
+"""
+Pipeline vechi de segmentare (pereți, clustere, crop-uri geometrice).
+NU ESTE FOLOSIT în fluxul principal: orchestratorul folosește segmenter/jobs.py (Gemini Crop).
+Păstrat pentru compatibilitate / rulare manuală / fallback.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,9 +20,10 @@ from .preprocess import (
 from .clusters import detect_wall_zones
 
 
-def segment_page_image(page_path: str | Path) -> list[str]:
+def segment_page_image(page_path: str | Path, crop_name_prefix: str = "") -> list[str]:
     """
     Rulează pipeline-ul de segmentare pe O singură imagine (pagini deja în PNG).
+    crop_name_prefix: prefix pentru fișierele crop (ex. page_001_) când procesezi mai multe pagini.
     RETURN: listă de path-uri (str) către planurile decupate.
     """
     page_path = Path(page_path)
@@ -30,7 +36,7 @@ def segment_page_image(page_path: str | Path) -> list[str]:
     outlines = detect_outlines(no_hatch)
     thick = filter_thick_lines(outlines)
     solid = solidify_walls(thick)
-    crop_paths = detect_wall_zones(img, solid)
+    crop_paths = detect_wall_zones(img, solid, crop_name_prefix=crop_name_prefix)
     print("🏁 Procesare pagină completă!\n")
     return crop_paths
 
@@ -76,8 +82,9 @@ def segment_document(input_path: str | Path, output_dir: str | Path) -> list[str
         if ext == ".pdf":
             pages_dir = get_output_dir() / "pdf_pages"
             png_pages = convert_pdf_to_png(f, pages_dir)
-            for pth in png_pages:
-                plan_paths = segment_page_image(pth)
+            for page_idx, pth in enumerate(png_pages, start=1):
+                prefix = f"page_{page_idx:03d}_" if len(png_pages) > 1 else ""
+                plan_paths = segment_page_image(pth, crop_name_prefix=prefix)
                 all_plan_paths.extend(plan_paths)
         else:
             plan_paths = segment_page_image(f)

@@ -17,6 +17,166 @@ except ImportError:
     TESSERACT_AVAILABLE = False
     print("⚠️ pytesseract nu este disponibil. Detectarea textului va fi dezactivată.")
 
+# Normalizare pentru match OCR: elimină diacritice (garáž -> garaz) pentru potrivire mai bună
+_DIACRITIC_MAP = (
+    ("á", "a"), ("à", "a"), ("ä", "a"), ("â", "a"), ("ă", "a"),
+    ("é", "e"), ("è", "e"), ("ë", "e"), ("ě", "e"),
+    ("í", "i"), ("ì", "i"), ("ï", "i"), ("î", "i"),
+    ("ó", "o"), ("ò", "o"), ("ö", "o"), ("ô", "o"),
+    ("ú", "u"), ("ù", "u"), ("ü", "u"), ("ů", "u"),
+    ("ý", "y"), ("ř", "r"), ("š", "s"), ("č", "c"), ("ž", "z"),
+    ("ń", "n"), ("ł", "l"), ("ș", "s"), ("ț", "t"), ("ď", "d"), ("ľ", "l"),
+)
+
+
+def _normalize_for_match(s: str) -> str:
+    """Lowercase + fără diacritice, pentru comparație tolerantă OCR."""
+    s = s.lower().strip()
+    for a, b in _DIACRITIC_MAP:
+        s = s.replace(a, b)
+    return s
+
+
+def _sharpen_light(img: np.ndarray) -> np.ndarray:
+    """Sharpening ușor pentru OCR pe regiuni (text mai clar)."""
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    return cv2.filter2D(img, -1, kernel)
+
+
+# Regiuni de scanat pentru etichete (garaj, carport, etc.) – procente (y1, x1, y2, x2), scale, psm
+# Format: (y1_frac, x1_frac, y2_frac, x2_frac, scale, psm)
+# PSM 11 = sparse text, PSM 6 = single block (pentru zone mici)
+GARAGE_SCAN_REGIONS = [
+    (0.00, 0.00, 1.00, 1.00, 2, "11"),   # Întreaga imagine, zoom 2x
+    (0.15, 0.05, 0.75, 0.95, 3, "11"),   # Zona clădirii, zoom 3x
+    (0.55, 0.30, 0.95, 0.90, 2, "11"),   # Zona inferioară (zufahrt, vorplatz, garaj)
+    (0.20, 0.55, 0.60, 0.90, 4, "6"),   # Zona garaj (dreapta/jos), zoom 4x, PSM 6
+]
+
+
+def _deduplicate_detections(
+    detections: list, min_dist_px: int = 100
+) -> list:
+    """Elimină detecții duplicate (prea aproape). Păstrează prima la fiecare poziție."""
+    if not detections:
+        return []
+    # Sortăm după confidență descrescător ca să păstrăm cea mai bună la fiecare loc
+    sorted_det = sorted(detections, key=lambda d: d[5], reverse=True)
+    unique = []
+    for d in sorted_det:
+        x, y, w, h, text, conf = d
+        cx, cy = x + w // 2, y + h // 2
+        too_close = any(
+            abs(cx - (u[0] + u[2] // 2)) < min_dist_px and abs(cy - (u[1] + u[3] // 2)) < min_dist_px
+            for u in unique
+        )
+        if not too_close:
+            unique.append(d)
+    return unique
+
+
+def run_ocr_scan_regions(
+    image: np.ndarray,
+    search_terms: list,
+    scan_regions: list = None,
+    lang: str = "deu+eng",
+    min_conf: int = 25,
+) -> list:
+    """
+    OCR pe sub-regiuni cu zoom și sharpen (algoritm etichete plan arhitectural).
+    Caută termenii în fiecare regiune, mapează coordonatele înapoi la imaginea originală,
+    deduplică și returnează lista (x, y, w, h, text, conf).
+
+    Args:
+        image: Imagine BGR sau grayscale
+        search_terms: Cuvinte-cheie (ex: garage, garaj, carport)
+        scan_regions: Listă (y1, x1, y2, x2, scale, psm) – fracțiuni 0–1; default GARAGE_SCAN_REGIONS
+        lang: Limba Tesseract
+        min_conf: Confidență minimă (0–100) pentru a accepta o detecție
+
+    Returns:
+        Lista de tuple (x, y, w, h, text, conf) în coordonate imagine originală, deduplicate.
+    """
+    if not TESSERACT_AVAILABLE:
+        return []
+    if scan_regions is None:
+        scan_regions = GARAGE_SCAN_REGIONS
+
+    h_orig, w_orig = image.shape[:2]
+    if len(image.shape) == 2:
+        img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        img = image.copy()
+
+    all_hits = []
+    for region in scan_regions:
+        y1f, x1f, y2f, x2f, scale, psm = region
+        x1 = int(w_orig * x1f)
+        y1 = int(h_orig * y1f)
+        x2 = int(w_orig * x2f)
+        y2 = int(h_orig * y2f)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crop_up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        crop_up = _sharpen_light(crop_up)
+        rgb = cv2.cvtColor(crop_up, cv2.COLOR_BGR2RGB)
+
+        try:
+            data = pytesseract.image_to_data(
+                rgb, lang=lang, config=f"--psm {psm}", output_type=pytesseract.Output.DICT
+            )
+        except Exception:
+            continue
+
+        for i, word in enumerate(data["text"]):
+            word = (word or "").strip()
+            if len(word) < 2:
+                continue
+            raw_conf = data["conf"][i]
+            if isinstance(raw_conf, int):
+                conf = raw_conf
+            elif isinstance(raw_conf, str) and raw_conf.strip() != "":
+                try:
+                    conf = int(raw_conf)
+                except (ValueError, TypeError):
+                    conf = 0
+            else:
+                conf = 0
+            if conf < min_conf:
+                continue
+            word_lower = word.lower()
+            word_norm = _normalize_for_match(word)
+            matched = False
+            for term in search_terms:
+                term_lower = term.lower()
+                term_norm = _normalize_for_match(term)
+                if term_lower in word_lower or term_norm in word_norm:
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+            # Coordonate înapoi în spațiul imaginii originale
+            bx = data["left"][i] / scale + x1
+            by = data["top"][i] / scale + y1
+            bw = max(5, data["width"][i] / scale)
+            bh = max(5, data["height"][i] / scale)
+            bx, by = int(bx), int(by)
+            bw, bh = int(bw), int(bh)
+            # Clip la imagine
+            bx = max(0, min(bx, w_orig - 1))
+            by = max(0, min(by, h_orig - 1))
+            bw = min(bw, w_orig - bx)
+            bh = min(bh, h_orig - by)
+            if bw < 5 or bh < 5:
+                continue
+            all_hits.append((bx, by, bw, bh, word, float(conf)))
+
+    return _deduplicate_detections(all_hits, min_dist_px=100)
+
 
 def preprocess_image_for_ocr(image: np.ndarray) -> np.ndarray:
     """
@@ -268,19 +428,19 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
             # Colectăm TOATE detecțiile pentru debug
             all_detections.append((x, y, width, height, text_clean, conf))
             
-            # Verificăm direct dacă textul detectat se potrivește cu termenii căutați (EXACT CA LA TERASA)
+            # Verificăm direct dacă textul detectat se potrivește cu termenii căutați
             found_term = None
+            text_lower = text_clean.lower()
+            text_norm = _normalize_for_match(text_clean)
             for term in search_terms:
                 term_lower = term.lower()
-                text_lower = text_clean.lower()
-                
+                term_norm = _normalize_for_match(term)
                 # Match exact (case-insensitive)
-                if term_lower == text_lower:
+                if term_lower == text_lower or term_norm == text_norm:
                     found_term = term
                     break
-                
                 # Match dacă termenul este conținut în text (ex: "carport" în "Carport 22.40 m²")
-                if term_lower in text_lower:
+                if term_lower in text_lower or term_norm in text_norm:
                     found_term = term
                     break
             
@@ -419,19 +579,17 @@ def run_ocr_on_zones(image: np.ndarray, search_terms: list, steps_dir: str = Non
                         # Colectăm TOATE detecțiile pentru debug
                         all_detections.append((orig_x, orig_y, orig_width, orig_height, text_clean, conf))
                         
-                        # Verificăm direct dacă textul detectat se potrivește cu termenii căutați (EXACT CA LA TERASA)
+                        # Verificăm direct dacă textul detectat se potrivește cu termenii căutați
                         found_term = None
+                        text_lower_zone = text_clean.lower()
+                        text_norm_zone = _normalize_for_match(text_clean)
                         for term in search_terms:
                             term_lower = term.lower()
-                            text_lower = text_clean.lower()
-                            
-                            # Match exact (case-insensitive)
-                            if term_lower == text_lower:
+                            term_norm = _normalize_for_match(term)
+                            if term_lower == text_lower_zone or term_norm == text_norm_zone:
                                 found_term = term
                                 break
-                            
-                            # Match dacă termenul este conținut în text (ex: "carport" în "Carport 22.40 m²")
-                            if term_lower in text_lower:
+                            if term_lower in text_lower_zone or term_norm in text_norm_zone:
                                 found_term = term
                                 break
                         

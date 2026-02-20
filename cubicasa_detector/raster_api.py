@@ -69,24 +69,26 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
         cv2.imwrite(str(preprocessed_path), api_img)
         print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
         
-        # Redimensionăm imaginea dacă e prea mare (API limit ~4MB)
-        MAX_API_DIM = 2048
+        # Scale-down doar pentru trimiterea la Raster: max 1000px pe latura lungă (restul pipeline-ului nu se atinge)
+        MAX_RASTER_SIDE = 1000
         h_api, w_api = api_img.shape[:2]
         scale_factor = 1.0
-        
-        if max(h_api, w_api) > MAX_API_DIM:
-            scale_factor = MAX_API_DIM / max(h_api, w_api)
-            new_w_api = int(w_api * scale_factor)
-            new_h_api = int(h_api * scale_factor)
+        if max(h_api, w_api) > MAX_RASTER_SIDE:
+            scale_factor = MAX_RASTER_SIDE / max(h_api, w_api)
+            new_w_api = max(1, int(w_api * scale_factor))
+            new_h_api = max(1, int(h_api * scale_factor))
             api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
-            print(f"      📐 Redimensionat pentru API: {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
+            print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
         else:
             new_w_api, new_h_api = w_api, h_api
-        
-        # Salvăm imaginea pentru API
+
+        # Salvăm imaginea care se trimite la API (scale/raster) – nume explicit ca să fie ușor de găsit
         api_img_path = raster_dir / "input_resized.jpg"
         cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        
+        request_png_path = raster_dir / "raster_request.png"
+        cv2.imwrite(str(request_png_path), api_img)
+        print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
+
         # Convertim în base64 (folosim JPEG comprimat)
         _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         image_base64 = base64.b64encode(buffer).decode('utf-8')
@@ -163,9 +165,49 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
                             with open(img_path, 'wb') as f:
                                 f.write(img_data)
                             print(f"      📄 Salvat: {img_path.name}")
+                            nparr = np.frombuffer(img_data, np.uint8)
+                            img_decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if img_decoded is not None:
+                                raster_out_path = raster_dir / "raster_out.png"
+                                cv2.imwrite(str(raster_out_path), img_decoded)
+                                response_png_path = raster_dir / "raster_response.png"
+                                cv2.imwrite(str(response_png_path), img_decoded)
+                                print(f"      📄 Salvat (răspuns de la Raster): {response_png_path.name}")
                         except Exception as e:
                             print(f"      ⚠️ Eroare salvare imagine: {e}")
-            
+
+            # Fallback: imaginea poate fi în result['data']['image'] sau result['processed_image']
+            if isinstance(result, dict):
+                response_png_path = raster_dir / "raster_response.png"
+                if not response_png_path.exists():
+                    for maybe_img in (result.get('processed_image'), result.get('output_image'),
+                                      (result.get('data') or {}).get('image') if isinstance(result.get('data'), dict) else None):
+                        if isinstance(maybe_img, str):
+                            try:
+                                img_str = maybe_img
+                                if ',' in img_str:
+                                    img_str = img_str.split(',')[1]
+                                img_data = base64.b64decode(img_str)
+                                nparr = np.frombuffer(img_data, np.uint8)
+                                img_decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                if img_decoded is not None:
+                                    cv2.imwrite(str(response_png_path), img_decoded)
+                                    print(f"      📄 Salvat (răspuns de la Raster, fallback): {response_png_path.name}")
+                                    break
+                            except Exception:
+                                pass
+
+            # Salvăm dimensiunile request vs original ca să putem converti coordonatele din JSON (request space) în original
+            orig_w = max(1, int(round(new_w_api / scale_factor)))
+            orig_h = max(1, int(round(new_h_api / scale_factor)))
+            request_info_path = raster_dir / "raster_request_info.json"
+            with open(request_info_path, 'w') as f:
+                json.dump({
+                    "request_w": int(new_w_api), "request_h": int(new_h_api),
+                    "original_w": orig_w, "original_h": orig_h,
+                    "scale_factor": float(scale_factor)
+                }, f, indent=2)
+
             # Returnăm rezultatul cu scale_factor pentru transformări ulterioare
             return {
                 'result': result,
@@ -551,6 +593,16 @@ def generate_api_walls_mask(api_result: Dict[str, Any]) -> Optional[np.ndarray]:
         if api_processed_img is None:
             return None
         
+        # Size-up imaginea de la API la original cu același factor pe ambele axe (păstrăm aspect ratio)
+        scale_factor = api_result.get('scale_factor', 1.0)
+        if scale_factor < 1.0:
+            scale_up = 1.0 / scale_factor
+            api_w, api_h = api_processed_img.shape[1], api_processed_img.shape[0]
+            target_w = max(1, int(round(api_w * scale_up)))
+            target_h = max(1, int(round(api_h * scale_up)))
+            api_processed_img = cv2.resize(api_processed_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            print(f"      📐 Size-up imagine API la original (aspect ratio păstrat): {target_w}x{target_h}")
+        
         # Detectăm pereții din imaginea API (gri, nu colorați)
         api_gray = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2GRAY)
         api_hsv = cv2.cvtColor(api_processed_img, cv2.COLOR_BGR2HSV)
@@ -759,12 +811,16 @@ def brute_force_alignment(
         
         # Găsim cel mai bun rezultat
         best = top_results[0]
+        # Dimensiunile mastii API (spațiul în care brute-force a aliniat) – necesare pentru transformarea coordonatelor JSON (request space → mask space → original)
+        best['mask_w'] = int(api_walls_mask.shape[1])
+        best['mask_h'] = int(api_walls_mask.shape[0])
         print(f"\n      🏆 CEL MAI BUN REZULTAT:")
         print(f"         Score: {best['score']:.4f}")
         print(f"         Direcție: {best['direction']}")
         print(f"         Scale: {best['scale']:.3f}x")
         print(f"         Poziție: {best['position']}")
         print(f"         Template size: {best['template_size']}")
+        print(f"         Mask size (API): {best['mask_w']}x{best['mask_h']}")
         
         # Salvăm configurația
         config_path = raster_dir / "brute_force_best_config.json"
@@ -799,6 +855,96 @@ def brute_force_alignment(
         best_overlay_path = raster_dir / "brute_force_best_overlay.png"
         cv2.imwrite(str(best_overlay_path), overlay_binary)
         print(f"      📄 Salvat: {best_overlay_path.name}")
+        
+        # walls_brute.png: același overlay + punct albastru la fiecare capăt de perete din Raster
+        # Coordonatele din JSON sunt în REQUEST space (imaginea trimisă la API); trebuie request→mask→overlay
+        response_json_path = raster_dir / "response.json"
+        walls_brute_img = overlay_binary.copy()
+        if response_json_path.exists():
+            try:
+                with open(response_json_path, 'r') as f:
+                    result_data = json.load(f)
+                data = result_data.get('data', result_data)
+                h_overlay, w_overlay = walls_brute_img.shape[:2]
+                # Request vs response: când API returnează alt sizing, JSON e în response space
+                req_w = best.get('request_w')
+                req_h = best.get('request_h')
+                mask_w = best.get('mask_w') or api_walls_mask.shape[1]
+                mask_h = best.get('mask_h') or api_walls_mask.shape[0]
+                scale_factor = 1.0
+                request_info_path = raster_dir / "raster_request_info.json"
+                if request_info_path.exists():
+                    try:
+                        with open(request_info_path, 'r') as f:
+                            ri = json.load(f)
+                        req_w = ri.get('request_w', req_w)
+                        req_h = ri.get('request_h', req_h)
+                        mask_w = ri.get('mask_w', mask_w)
+                        mask_h = ri.get('mask_h', mask_h)
+                        scale_factor = ri.get('scale_factor', 1.0)
+                    except Exception:
+                        pass
+                scale_up = (1.0 / scale_factor) if (scale_factor and 0 < scale_factor < 1.0) else 1.0
+                expected_mask_w = (req_w * scale_up) if req_w else 0
+                expected_mask_h = (req_h * scale_up) if req_h else 0
+                tol = 0.08
+                request_matches_response = (
+                    mask_w and mask_h and expected_mask_w and expected_mask_h
+                    and abs(mask_w - expected_mask_w) <= max(2, expected_mask_w * tol)
+                    and abs(mask_h - expected_mask_h) <= max(2, expected_mask_h * tol)
+                )
+                if request_matches_response:
+                    r2m_x = (mask_w / req_w) if (req_w and req_w > 0) else 1.0
+                    r2m_y = (mask_h / req_h) if (req_h and req_h > 0) else 1.0
+                else:
+                    r2m_x = scale_up
+                    r2m_y = scale_up
+                
+                def api_to_overlay_coords(x, y):
+                    # Request space → mask space → overlay (original) space
+                    x_m = x * r2m_x
+                    y_m = y * r2m_y
+                    if best['direction'] == 'api_to_orig':
+                        ox = x_m * best['scale'] + best['position'][0]
+                        oy = y_m * best['scale'] + best['position'][1]
+                    else:
+                        ox = (x_m - best['position'][0]) / best['scale']
+                        oy = (y_m - best['position'][1]) / best['scale']
+                    return int(round(ox)), int(round(oy))
+                
+                radius = max(3, min(12, w_overlay // 200))
+                blue_bgr = (255, 0, 0)
+                n_pts = 0
+                def point_xy(pt):
+                    if isinstance(pt, dict):
+                        return pt.get('x', 0), pt.get('y', 0)
+                    return pt[0], pt[1]
+                
+                if 'walls' in data and data['walls']:
+                    for wall in data['walls']:
+                        pos = wall.get('position')
+                        if not pos or len(pos) != 2:
+                            continue
+                        try:
+                            x1, y1 = api_to_overlay_coords(*point_xy(pos[0]))
+                            x2, y2 = api_to_overlay_coords(*point_xy(pos[1]))
+                        except (IndexError, TypeError):
+                            continue
+                        for (px, py) in [(x1, y1), (x2, y2)]:
+                            if 0 <= px < w_overlay and 0 <= py < h_overlay:
+                                cv2.circle(walls_brute_img, (px, py), radius, blue_bgr, -1)
+                                n_pts += 1
+                walls_brute_path = raster_dir / "walls_brute.png"
+                cv2.imwrite(str(walls_brute_path), walls_brute_img)
+                print(f"      📄 Salvat: {walls_brute_path.name} ({n_pts} capete pereți)")
+            except Exception as e:
+                import traceback
+                print(f"      ⚠️ walls_brute.png: {e}")
+                traceback.print_exc()
+                cv2.imwrite(str(raster_dir / "walls_brute.png"), overlay_binary)
+        else:
+            cv2.imwrite(str(raster_dir / "walls_brute.png"), overlay_binary)
+            print(f"      📄 Salvat: walls_brute.png (fără response.json)")
         
         return best
         
@@ -843,22 +989,48 @@ def apply_alignment_and_generate_overlay(
         
         data = result_data.get('data', result_data)
         
-        # Funcție de transformare coordonate API -> Original (FĂRĂ ROTAȚII)
+        # Request vs response: când API returnează alt sizing decât request, JSON e în response space
+        req_w = req_h = mask_w = mask_h = scale_factor = None
+        request_info_path = raster_dir / "raster_request_info.json"
+        if request_info_path.exists():
+            try:
+                with open(request_info_path, 'r') as f:
+                    ri = json.load(f)
+                req_w, req_h = ri.get('request_w'), ri.get('request_h')
+                mask_w, mask_h = ri.get('mask_w'), ri.get('mask_h')
+                scale_factor = ri.get('scale_factor', 1.0)
+            except Exception:
+                pass
+        if not mask_w or not mask_h:
+            mask_w, mask_h = best_config.get('mask_w'), best_config.get('mask_h')
+        if not req_w or not req_h:
+            req_w, req_h = mask_w, mask_h
+        scale_up = (1.0 / scale_factor) if (scale_factor and 0 < scale_factor < 1.0) else 1.0
+        expected_mask_w = (req_w * scale_up) if req_w else 0
+        expected_mask_h = (req_h * scale_up) if req_h else 0
+        tol = 0.08
+        request_matches_response = (
+            mask_w and mask_h and expected_mask_w and expected_mask_h
+            and abs(mask_w - expected_mask_w) <= max(2, expected_mask_w * tol)
+            and abs(mask_h - expected_mask_h) <= max(2, expected_mask_h * tol)
+        )
+        if request_matches_response:
+            r2m_x = (mask_w / req_w) if (req_w and req_w > 0) else 1.0
+            r2m_y = (mask_h / req_h) if (req_h and req_h > 0) else 1.0
+        else:
+            r2m_x = r2m_y = scale_up
+        
         def api_to_original_coords(x, y):
-            """Transformă coordonate din sistemul API la original"""
+            """Transformă coordonate din REQUEST space (JSON) la original"""
+            x_m = x * r2m_x
+            y_m = y * r2m_y
             if best_config['direction'] == 'api_to_orig':
-                # Transformare directă: API -> Original
-                x_scaled = x * best_config['scale']
-                y_scaled = y * best_config['scale']
-                orig_x = x_scaled + best_config['position'][0]
-                orig_y = y_scaled + best_config['position'][1]
+                orig_x = x_m * best_config['scale'] + best_config['position'][0]
+                orig_y = y_m * best_config['scale'] + best_config['position'][1]
                 return int(orig_x), int(orig_y)
             else:
-                # orig_to_api - inversăm transformarea
-                x_in_template = x - best_config['position'][0]
-                y_in_template = y - best_config['position'][1]
-                orig_x = x_in_template / best_config['scale']
-                orig_y = y_in_template / best_config['scale']
+                orig_x = (x_m - best_config['position'][0]) / best_config['scale']
+                orig_y = (y_m - best_config['position'][1]) / best_config['scale']
                 return int(orig_x), int(orig_y)
         
         # Desenăm rooms și doors pe original

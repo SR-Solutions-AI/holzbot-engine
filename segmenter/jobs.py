@@ -1,30 +1,24 @@
 # file: engine/segmenter/jobs.py
 """
-Job runner pentru segmentare și clasificare paralelă a documentelor.
-✅ THREAD-SAFE: Fiecare document primește propriul OUTPUT_DIR izolat prin thread-local storage.
+Job runner: SEGMENTARE = doar fluxul Gemini Crop. Toți pașii vechi sunt DEZACTIVAȚI:
+- nu se mai rulează: detect_wall_zones, detect_clusters, remove_hatched_areas, classifier rounds, etc.
+Pentru fiecare pagină PDF/imagine: trimitem imaginea la Gemini → primim coordonate în procente
+(box_2d: [ymin, xmin, ymax, xmax] în 0.0–1.0) + label (floor | side_view) → crop cu PIL → salvare
+în classified/blueprints (etaje) și classified/side_views (vederi laterale / secțiuni).
 """
 from __future__ import annotations
 
-import json
+import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-import cv2
-
-from .common import reset_output_folders, safe_imread, set_output_dir, STEP_DIRS
+from .common import set_output_dir, STEP_DIRS
 from .pdf_utils import convert_pdf_to_png
-from .preprocess import (
-    remove_text_regions,
-    remove_hatched_areas,
-    detect_outlines,
-    filter_thick_lines,
-    solidify_walls,
-)
-from .clusters import detect_wall_zones
-from .classifier import classify_segmented_plans, ClassificationResult
+from .gemini_crop import get_gemini_boxes_for_page, crop_and_save
+from .classifier import ClassificationResult
 
 
 @dataclass
@@ -39,107 +33,52 @@ class SegmentationJobResult:
     classification_results: List[ClassificationResult]
 
 
-def _segment_single_document(
-    doc_path: Path,
+def _segment_single_page(
+    page_path: Path,
     work_dir: Path,
-    doc_idx: int,
-    total_docs: int
+    doc_id: str,
+    doc_path: Path,
+    task_idx: int,
+    total_tasks: int,
 ) -> SegmentationJobResult:
     """
-    ✅ THREAD-SAFE: Procesează UN singur document în propriul OUTPUT_DIR izolat.
-    
-    Args:
-        doc_path: Path către document (PDF sau imagine)
-        work_dir: Directory unic pentru acest document (e.g., segmentation/src_0_input_0)
-        doc_idx: Index document (pentru logging)
-        total_docs: Total documente (pentru logging)
-    
-    Returns:
-        SegmentationJobResult cu rezultatele segmentării și clasificării
+    Procesează O singură pagină (imagine) în propriul work_dir.
+    Folosit pentru: o imagine standalone SAU o pagină dintr-un PDF (câte un folder src_*_page_001, src_*_page_002, ...).
     """
-    doc_id = f"src_{doc_idx}_{doc_path.stem}"
-    
     try:
-        print(f"\n[Segmenter] ({doc_idx}/{total_docs}) Processing: {doc_path.name}", flush=True)
-        
-        # ✅ CRITICAL: Set OUTPUT_DIR thread-local IMEDIAT
-        reset_output_folders(work_dir)
+        print(f"\n[Gemini Crop] ({task_idx}/{total_tasks}) {doc_id}: {page_path.name}", flush=True)
         set_output_dir(work_dir)
-        
-        # Conversie PDF → PNG dacă e necesar
-        if doc_path.suffix.lower() == '.pdf':
-            pages_dir = work_dir / "pdf_pages"
-            pages_dir.mkdir(exist_ok=True)
-            png_pages = convert_pdf_to_png(doc_path, pages_dir)
-            page_paths = [Path(p) for p in png_pages]
-        else:
-            page_paths = [doc_path]
-        
-        all_crops = []
-        
-        # Procesează fiecare pagină
-        for page_path in page_paths:
-            print(f"  [Segmenter] Processing page: {page_path.name}", flush=True)
-            
-            # ✅ Re-confirm OUTPUT_DIR pentru siguranță (deși e thread-local)
-            set_output_dir(work_dir)
-            
-            # Încarcă imaginea
-            img = safe_imread(page_path)
-            
-            # Pipeline de procesare
-            no_text = remove_text_regions(img)
-            gray = cv2.cvtColor(no_text, cv2.COLOR_BGR2GRAY)
-            no_hatch = remove_hatched_areas(gray)
-            edges = detect_outlines(no_hatch)
-            thick = filter_thick_lines(edges)
-            solid = solidify_walls(thick)
-            
-            # Detectează clustere (planuri)
-            crops = detect_wall_zones(img, solid)
-            all_crops.extend(crops)
-        
-        # Verifică că crops-urile au fost salvate corect
-        crops_dir = work_dir / STEP_DIRS["clusters"]["crops"]
-        if crops_dir.exists():
-            actual_crops = list(crops_dir.glob("*.jpg"))
-            print(f"  [Segmenter] ✅ Saved {len(actual_crops)} clusters in {crops_dir}", flush=True)
-        else:
-            print(f"  [Segmenter] ⚠️  No crops directory created!", flush=True)
-        
-        print(f"  [Segmenter] Total clusters detected: {len(all_crops)}", flush=True)
-        
-        # Clasificare (thread-safe prin work_dir)
-        set_output_dir(work_dir)
-        classification_results = classify_segmented_plans(work_dir)
-        
-        # Debug: Arată unde au fost clasificate planurile
-        bp_dir = work_dir / "classified" / "blueprints"
-        sp_dir = work_dir / "classified" / "siteplan"
-        sv_dir = work_dir / "classified" / "side_views"
-        tx_dir = work_dir / "classified" / "text"
-        
-        print(f"  [Segmenter] Classification results:", flush=True)
-        print(f"     blueprints: {len(list(bp_dir.glob('*.*'))) if bp_dir.exists() else 0}", flush=True)
-        print(f"     siteplan: {len(list(sp_dir.glob('*.*'))) if sp_dir.exists() else 0}", flush=True)
-        print(f"     side_views: {len(list(sv_dir.glob('*.*'))) if sv_dir.exists() else 0}", flush=True)
-        print(f"     text: {len(list(tx_dir.glob('*.*'))) if tx_dir.exists() else 0}", flush=True)
-        
+        work_dir.mkdir(parents=True, exist_ok=True)
+        for sub in (STEP_DIRS["classified"]["blueprints"], STEP_DIRS["classified"]["side_views"],
+                    STEP_DIRS["classified"]["siteplan"], STEP_DIRS["classified"]["text"],
+                    "solid_walls"):
+            (work_dir / sub).mkdir(parents=True, exist_ok=True)
+        solid_preview = work_dir / "solid_walls" / "solidified.jpg"
+        try:
+            shutil.copy(str(page_path), str(solid_preview))
+        except Exception:
+            pass
+
+        boxes = get_gemini_boxes_for_page(page_path)
+        print(f"  [Gemini Crop] {doc_id}: {len(boxes)} zone (etaje + side views)", flush=True)
+        classification_results = crop_and_save(page_path, work_dir, boxes)
+        n_bp = len([r for r in classification_results if r.label == "house_blueprint"])
+        n_sv = len([r for r in classification_results if r.label == "side_view"])
+        print(f"  [Gemini Crop] {doc_id} → blueprints: {n_bp}, side_views: {n_sv}", flush=True)
+
         return SegmentationJobResult(
             doc_id=doc_id,
             doc_path=doc_path,
             work_dir=work_dir,
             success=True,
-            message=f"Successfully processed {len(all_crops)} clusters, classified {len(classification_results)} plans",
-            total_clusters=len(all_crops),
-            classification_results=classification_results
+            message=f"Gemini Crop: {len(boxes)} zone → {len(classification_results)} planuri",
+            total_clusters=len(classification_results),
+            classification_results=classification_results,
         )
-        
     except Exception as e:
-        error_msg = f"Error processing {doc_path.name}: {e}"
-        print(f"  [Segmenter] ❌ {error_msg}", flush=True)
+        error_msg = f"Error processing {page_path.name}: {e}"
+        print(f"  [Segmenter] ❌ {doc_id}: {error_msg}", flush=True)
         traceback.print_exc()
-        
         return SegmentationJobResult(
             doc_id=doc_id,
             doc_path=doc_path,
@@ -147,7 +86,7 @@ def _segment_single_document(
             success=False,
             message=error_msg,
             total_clusters=0,
-            classification_results=[]
+            classification_results=[],
         )
 
 
@@ -157,100 +96,105 @@ def run_segmentation_for_documents(
     max_workers: int | None = None
 ) -> List[SegmentationJobResult]:
     """
-    ✅ THREAD-SAFE: Procesează multiple documente în paralel cu OUTPUT_DIR izolat per thread.
-    
-    Args:
-        input_path: Path către un document sau folder cu documente
-        output_base_dir: Directory de bază pentru output (se vor crea subdirectoare per document)
-        max_workers: Număr maxim de thread-uri (default: numărul de fișiere sau CPU count)
-    
-    Returns:
-        Lista de SegmentationJobResult pentru fiecare document
+    Procesează documente: câte un work_dir (src_* sau src_*_page_001, _page_002, ...) per pagină.
+    - Imagine unică → un folder: src_0_input_0
+    - PDF cu N pagini → N foldere: src_0_input_0_page_001, src_0_input_0_page_002, ...
     """
     input_path = Path(input_path).resolve()
     output_base_dir = Path(output_base_dir).resolve()
     output_base_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Detectează fișierele de intrare
+
     if input_path.is_dir():
         files_to_process = [
             f for f in input_path.iterdir()
-            if f.is_file() and not f.name.startswith('.')
+            if f.is_file() and not f.name.startswith(".")
         ]
         files_to_process.sort(key=lambda f: f.name)
     else:
         files_to_process = [input_path]
-    
+
     if not files_to_process:
         print("⚠️  [Segmenter] No input files found!")
         return []
-    
-    print(f"\n{'='*60}")
-    print(f"[Segmenter] Starting segmentation for {len(files_to_process)} document(s)")
-    print(f"{'='*60}\n")
-    
-    # Determină numărul de workers
-    if max_workers is None:
-        import os
-        max_workers = min(len(files_to_process), os.cpu_count() or 4)
-    
-    results: List[SegmentationJobResult] = []
-    total = len(files_to_process)
-    
-    # Procesare paralelă cu thread-local storage
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        
-        for idx, fpath in enumerate(files_to_process):
-            # Creează work_dir unic pentru fiecare document
+
+    # Construim lista de task-uri: (page_path, work_dir, doc_id, doc_path)
+    tasks: List[tuple] = []
+    for idx, fpath in enumerate(files_to_process):
+        if fpath.suffix.lower() == ".pdf":
+            pages_dir = output_base_dir / f"src_{idx}_{fpath.stem}_pdf_pages"
+            pages_dir.mkdir(parents=True, exist_ok=True)
+            png_pages = convert_pdf_to_png(fpath, pages_dir)
+            print(f"  [Segmenter] PDF {fpath.name} → {len(png_pages)} pagini → foldere src_{idx}_{fpath.stem}_page_001, ...", flush=True)
+            for p in range(1, len(png_pages) + 1):
+                page_path = Path(png_pages[p - 1])
+                work_dir = output_base_dir / f"src_{idx}_{fpath.stem}_page_{p:03d}"
+                work_dir.mkdir(parents=True, exist_ok=True)
+                doc_id = f"src_{idx}_{fpath.stem}_page_{p:03d}"
+                tasks.append((page_path, work_dir, doc_id, fpath))
+        else:
             work_dir = output_base_dir / f"src_{idx}_{fpath.stem}"
             work_dir.mkdir(parents=True, exist_ok=True)
-            
+            doc_id = f"src_{idx}_{fpath.stem}"
+            tasks.append((fpath, work_dir, doc_id, fpath))
+
+    total_tasks = len(tasks)
+    print(f"\n{'='*60}")
+    print(f"[Gemini Crop] Starting: {total_tasks} pagini/fișiere (din {len(files_to_process)} documente)")
+    print(f"{'='*60}\n")
+
+    if max_workers is None:
+        import os
+        max_workers = min(total_tasks, os.cpu_count() or 4)
+
+    results: List[SegmentationJobResult] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for task_idx, (page_path, work_dir, doc_id, doc_path) in enumerate(tasks, start=1):
             future = executor.submit(
-                _segment_single_document,
-                fpath,
+                _segment_single_page,
+                page_path,
                 work_dir,
-                idx + 1,
-                total
+                doc_id,
+                doc_path,
+                task_idx,
+                total_tasks,
             )
-            futures[future] = fpath
-        
-        # Colectează rezultatele pe măsură ce se termină
+            futures[future] = (page_path, work_dir, doc_id, doc_path)
+
         for future in as_completed(futures):
+            page_path, work_dir, doc_id, doc_path = futures[future]
             try:
                 result = future.result()
                 results.append(result)
             except Exception as e:
-                fpath = futures[future]
-                print(f"❌ [Segmenter] Unexpected error for {fpath.name}: {e}")
+                print(f"❌ [Segmenter] Unexpected error for {doc_id}: {e}")
                 traceback.print_exc()
                 results.append(
                     SegmentationJobResult(
-                        doc_id=f"src_X_{fpath.stem}",
-                        doc_path=fpath,
-                        work_dir=output_base_dir / f"src_X_{fpath.stem}",
+                        doc_id=doc_id,
+                        doc_path=doc_path,
+                        work_dir=work_dir,
                         success=False,
                         message=f"Unexpected error: {e}",
                         total_clusters=0,
-                        classification_results=[]
+                        classification_results=[],
                     )
                 )
-    
-    # Summary
+
     successful = sum(1 for r in results if r.success)
-    failed = total - successful
+    failed = total_tasks - successful
     total_clusters = sum(r.total_clusters for r in results)
     total_classified = sum(len(r.classification_results) for r in results)
-    
+
     print(f"\n{'='*60}")
-    print(f"[Segmenter] Segmentation Complete")
-    print(f"  ✅ Success: {successful}/{total}")
+    print(f"[Gemini Crop] Complete")
+    print(f"  ✅ Success: {successful}/{total_tasks}")
     if failed > 0:
-        print(f"  ❌ Failed: {failed}/{total}")
-    print(f"  📦 Total clusters: {total_clusters}")
+        print(f"  ❌ Failed: {failed}/{total_tasks}")
+    print(f"  📦 Total crops: {total_clusters}")
     print(f"  🏷️  Total classified: {total_classified}")
     print(f"{'='*60}\n")
-    
+
     return results
 
 

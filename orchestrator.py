@@ -524,9 +524,17 @@ if __name__ == "__main__":
     else:
         print("⚠️  No frontend data in ENV")
     
+    # Segmentare = doar Gemini Crop (coordonate în procente → crop → blueprints/side_views).
+    # Pipeline-ul vechi (detect_wall_zones, detect_clusters, classifier) este dezactivat.
     if args.no_classification:
-        from segmenter import segment_document
-        segment_document(args.input, build_job_root(job_id=args.job_id, prefix="segmentation_job") / "segmentation")
+        job_root = build_job_root(job_id=args.job_id, prefix="segmentation_job")
+        segmentation_out_base = job_root / "segmentation"
+        segmentation_out_base.mkdir(parents=True, exist_ok=True)
+        run_segmentation_for_documents(
+            input_path=args.input,
+            output_base_dir=segmentation_out_base,
+            max_workers=None,
+        )
     else:
         run_segmentation_and_classification_for_document(
             args.input, 

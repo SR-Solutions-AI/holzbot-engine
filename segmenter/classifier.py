@@ -71,8 +71,8 @@ PROMPT_ROUND_1_BASE = """You are an EXPERT architectural drawing classifier.
 
 CRITICAL: Return EXACTLY ONE label from this list: house_blueprint | site_blueprint | side_view | text_area
 
-1. house_blueprint = TOP-DOWN FLOOR PLAN of interior. Must show interior walls, rooms, doors.
-2. site_blueprint = SITE/LOT PLAN. Shows property boundaries, streets, context. NO interior rooms.
+1. house_blueprint = TOP-DOWN FLOOR PLAN of interior. Must show interior walls, rooms, doors. If you see ROOM AREA MEASUREMENTS in square meters (m²), e.g. "6,34 m²", "9.22 m²" for individual rooms, it is house_blueprint (NOT site_blueprint).
+2. site_blueprint = SITE/LOT PLAN. Shows property boundaries, streets, context. NO interior room layouts, NO room area in m².
 3. side_view = EXTERIOR ELEVATION or 3D PERSPECTIVE. Façade view.
 4. text_area = PAGE DOMINATED BY TEXT (>40%). Specifications, legends.
 
@@ -83,8 +83,8 @@ PROMPT_ROUND_2_EXPLICIT = """You are a FORENSIC architectural document analyzer.
 Return EXACTLY ONE: house_blueprint | site_blueprint | side_view | text_area
 
 DISTINCTIONS:
-- Interior walls visible? -> house_blueprint
-- Only property lines/streets? -> site_blueprint
+- Interior walls and rooms, or room areas in m² (e.g. "6,34 m²")? -> house_blueprint
+- Only property lines/streets, no room m²? -> site_blueprint
 - Looking at the building from the side? -> side_view
 - Mostly text? -> text_area
 
@@ -94,8 +94,8 @@ Output format: [label_only]"""
 PROMPT_ROUND_3_EXTREME = """FINAL DECISION.
 Choose: house_blueprint | site_blueprint | side_view | text_area
 
-- house_blueprint: I see rooms (kitchen, bed, bath) from above.
-- site_blueprint: I see the lot, roads, and building outline (no rooms).
+- house_blueprint: I see rooms (kitchen, bed, bath) from above, or room areas in m² (e.g. "6,34 m²").
+- site_blueprint: I see the lot, roads, and building outline only (no room layouts, no m² per room).
 - side_view: I see the roof pitch and windows from the outside.
 - text_area: I see paragraphs of text.
 
@@ -129,6 +129,17 @@ def pil_to_base64(pil_img: Image.Image) -> str:
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _pil_add_white_padding(pil_img: Image.Image, padding_pct: float = 0.12) -> Image.Image:
+    """Adaugă bordură albă în jurul imaginii (reduce trigger-uri de safety la Gemini pe planuri)."""
+    w, h = pil_img.size
+    pad_w = int(w * padding_pct)
+    pad_h = int(h * padding_pct)
+    new_w, new_h = w + 2 * pad_w, h + 2 * pad_h
+    out = Image.new("RGB", (new_w, new_h), (255, 255, 255))
+    out.paste(pil_img, (pad_w, pad_h))
+    return out
 
 
 def parse_label(text: str) -> Optional[str]:
@@ -184,14 +195,7 @@ def setup_gemini_client():
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
-        
+
         models_to_try = [
             'gemini-3-flash-preview',
             'gemini-2.5-flash',
@@ -201,7 +205,7 @@ def setup_gemini_client():
         
         for model_name in models_to_try:
             try:
-                model = genai.GenerativeModel(model_name, safety_settings=safety_settings)
+                model = genai.GenerativeModel(model_name, safety_settings=_GEMINI_SAFETY_SETTINGS)
                 debug_print(f"✅ Gemini: Model selectat '{model_name}'")
                 return model
             except Exception:
@@ -254,31 +258,81 @@ def classify_with_gpt(client, img_path: Path, prompt: str) -> Optional[str]:
         return None
 
 
+# Folosit la generate_content pentru a reduce blocările de safety pe planuri
+_GEMINI_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
+
+def _gemini_finish_reason_safety(response: Any) -> bool:
+    """True dacă răspunsul a fost blocat din motive de safety (finish_reason=2)."""
+    if not getattr(response, "candidates", None) or not response.candidates:
+        return False
+    reason = getattr(response.candidates[0], "finish_reason", None)
+    # 2 = SAFETY în API-ul Gemini
+    return reason == 2
+
+
+def _gemini_try_classify(
+    client: Any, prompt: str, pil_img: Image.Image
+) -> tuple[Optional[str], bool]:
+    """
+    Un singur apel generate_content.
+    Returnează (label sau None, was_safety_block).
+    """
+    try:
+        response = client.generate_content(
+            [prompt, pil_img],
+            generation_config={
+                "temperature": 0.0,
+                "max_output_tokens": 50,
+            },
+            safety_settings=_GEMINI_SAFETY_SETTINGS,
+        )
+        is_safety = _gemini_finish_reason_safety(response)
+        if not getattr(response, "parts", None) or not response.parts:
+            return None, is_safety
+        try:
+            text = response.text
+        except Exception:
+            return None, is_safety
+        return parse_label(text or ""), is_safety
+    except Exception:
+        return None, False
+
+
 def classify_with_gemini(client, img_path: Path, prompt: str) -> Optional[str]:
-    """Clasificare cu Gemini"""
+    """Clasificare cu Gemini. La blocare safety retry cu imagine cu padding alb / mai mică."""
     if client is None:
         return None
-    
+
     try:
         pil_img = prep_for_vlm(img_path)
-        
-        for _ in range(2):
-            try:
-                response = client.generate_content(
-                    [prompt, pil_img],
-                    generation_config={
-                        "temperature": 0.0,
-                        "max_output_tokens": 50,
-                    }
-                )
-                if response.parts:
-                    return parse_label(response.text)
-                time.sleep(1)
-            except Exception:
-                pass
-        
+        label, was_safety = _gemini_try_classify(client, prompt, pil_img)
+        if label is not None:
+            return label
+
+        if was_safety:
+            debug_print(f"   ⚠️ Gemini safety block for {img_path.name}, retry with padded/smaller image")
+
+        # Retry 1: imagine cu padding alb (reduce false positive safety pe planuri)
+        pil_padded = _pil_add_white_padding(pil_img, padding_pct=0.15)
+        label, _ = _gemini_try_classify(client, prompt, pil_padded)
+        if label is not None:
+            return label
+
+        time.sleep(0.5)
+        # Retry 2: imagine mai mică (mai puțin detaliu)
+        pil_small = prep_for_vlm(img_path, min_long_edge=640)
+        if pil_small.size != pil_img.size:
+            label, _ = _gemini_try_classify(client, prompt, pil_small)
+            if label is not None:
+                return label
+
         return None
-    
     except Exception as e:
         debug_print(f"❌ Gemini error for {img_path.name}: {e}")
         return None

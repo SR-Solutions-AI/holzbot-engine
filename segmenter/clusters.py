@@ -12,10 +12,61 @@ import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
 
+from sklearn.cluster import KMeans
+
 from .common import STEP_DIRS, save_debug, resize_bgr_max_side, get_output_dir
 from .classifier import setup_gemini_client
 
 load_dotenv()
+
+
+def _box_inside(inner: list[int], outer: list[int], tolerance: int = 2) -> bool:
+    """True dacă cutia inner este în întregime în interiorul cutiei outer (cu tolerance pixeli)."""
+    ix1, iy1, ix2, iy2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    return (
+        ix1 >= ox1 - tolerance and iy1 >= oy1 - tolerance and
+        ix2 <= ox2 + tolerance and iy2 <= oy2 + tolerance
+    )
+
+
+def _split_constituents_into_n_groups(
+    constituents: list[list[int]], n: int, by_vertical: bool
+) -> list[list[int]]:
+    """
+    Împarte constituenții în N grupuri după poziție (verticală pentru etaje, orizontală pentru clădiri).
+    Returnează N cutii: fiecare cutie = bounding box al constituenților din acel grup.
+    """
+    if not constituents or n < 2:
+        return []
+    # Centru pentru fiecare cutie
+    if by_vertical:
+        # Etaje stacked: sortăm după y (centru vertical)
+        sorted_const = sorted(
+            constituents,
+            key=lambda b: (b[1] + b[3]) / 2,
+        )
+    else:
+        # Clădiri side-by-side: sortăm după x (centru orizontal)
+        sorted_const = sorted(
+            constituents,
+            key=lambda b: (b[0] + b[2]) / 2,
+        )
+    k = len(sorted_const)
+    groups: list[list[list[int]]] = [[] for _ in range(n)]
+    for i, box in enumerate(sorted_const):
+        g = min(i * n // k, n - 1)  # partiționare uniformă
+        groups[g].append(box)
+    result: list[list[int]] = []
+    for grp in groups:
+        if not grp:
+            continue
+        x1 = min(b[0] for b in grp)
+        y1 = min(b[1] for b in grp)
+        x2 = max(b[2] for b in grp)
+        y2 = max(b[3] for b in grp)
+        result.append([x1, y1, x2, y2])
+    return result if len(result) >= 2 else []
 
 
 def _is_overlapping(box1: list[int], box2: list[int], threshold: float = 0.60) -> bool:
@@ -192,6 +243,150 @@ def merge_overlapping_boxes(boxes: list[list[int]], shape: tuple[int, int]) -> l
         boxes = new_boxes
 
     return boxes
+
+
+# Maxim 10 clustere finale; fiecare cluster trebuie să aibă minim 10% din suprafața imaginii
+MAX_CLUSTERS = 10
+MIN_CLUSTER_AREA_RATIO = 0.10
+
+
+def _box_distance(box1: list[int], box2: list[int]) -> float:
+    """Distanța între două cutii (0 dacă se suprapun). Gap pe x/y = max(0, inter_stanga - inter_dreapta)."""
+    x1, y1, x2, y2 = box1
+    xx1, yy1, xx2, yy2 = box2
+    inter_x1, inter_x2 = max(x1, xx1), min(x2, xx2)
+    inter_y1, inter_y2 = max(y1, yy1), min(y2, yy2)
+    dx = max(0, inter_x1 - inter_x2)
+    dy = max(0, inter_y1 - inter_y2)
+    return math.hypot(dx, dy)
+
+
+def merge_nearby_boxes(
+    boxes: list[list[int]],
+    shape: tuple[int, int],
+    max_boxes: int = MAX_CLUSTERS,
+    proximity_ratio: float = 0.06,
+) -> list[list[int]]:
+    """
+    Uneste cutii apropiate până când avem cel mult max_boxes.
+    proximity_ratio: două cutii se unesc dacă distanța între ele <= proximity_ratio * diagonala imaginii.
+    """
+    if len(boxes) <= max_boxes:
+        return boxes
+    h, w = shape[:2]
+    diag = math.hypot(h, w)
+    prox = proximity_ratio * diag
+    current = list(boxes)
+    while len(current) > max_boxes:
+        best_i, best_j = -1, -1
+        best_dist = 1e9
+        for i in range(len(current)):
+            for j in range(i + 1, len(current)):
+                d = _box_distance(current[i], current[j])
+                if d <= prox and d < best_dist:
+                    best_dist = d
+                    best_i, best_j = i, j
+        if best_i < 0:
+            # Niciun pair în proximity – împreunăm oricum perechea cea mai apropiată până la max_boxes
+            for i in range(len(current)):
+                for j in range(i + 1, len(current)):
+                    d = _box_distance(current[i], current[j])
+                    if d < best_dist:
+                        best_dist = d
+                        best_i, best_j = i, j
+        if best_i < 0:
+            break
+        b1, b2 = current[best_i], current[best_j]
+        merged_box = [
+            min(b1[0], b2[0]),
+            min(b1[1], b2[1]),
+            max(b1[2], b2[2]),
+            max(b1[3], b2[3]),
+        ]
+        current = [b for k, b in enumerate(current) if k != best_i and k != best_j]
+        current.append(merged_box)
+    return current
+
+
+def _iou_boxes(b1: list[int], b2: list[int]) -> float:
+    """IoU între două box-uri [x1,y1,x2,y2]. Returnează valoare în [0, 1]."""
+    x1, y1, x2, y2 = b1
+    xx1, yy1, xx2, yy2 = b2
+    inter_x1 = max(x1, xx1)
+    inter_y1 = max(y1, yy1)
+    inter_x2 = min(x2, xx2)
+    inter_y2 = min(y2, yy2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area1 = (x2 - x1) * (y2 - y1)
+    area2 = (xx2 - xx1) * (yy2 - yy1)
+    union = area1 + area2 - inter_area
+    return inter_area / union if union > 0 else 0.0
+
+
+def _merge_clusters_into_zones(
+    boxes: list[list[int]], shape: tuple[int, int]
+) -> list[list[int]] | None:
+    """
+    Dacă avem >10 cutii, verifică dacă sunt grupate în cel puțin 2 zone spațiale.
+    Grupare cu KMeans pe centrele cutiilor; pentru fiecare zonă facem union bbox.
+    Returnează lista de zone (bbox-uri) dacă există ≥2 zone bine separate, altfel None.
+    """
+    if len(boxes) <= 10:
+        return None
+    centers = np.array(
+        [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes],
+        dtype=np.float64,
+    )
+    h, w = shape[:2]
+    max_k = min(10, len(boxes))
+    # Încercăm k=2, 3, ... până găsim zone bine separate (perechi cu IoU mic)
+    for k in range(2, max_k + 1):
+        if k > len(boxes):
+            break
+        km = KMeans(n_clusters=k, random_state=42, n_init=10).fit(centers)
+        labels = km.labels_
+        zone_boxes: list[list[int]] = []
+        for c in range(k):
+            indices = np.where(labels == c)[0]
+            if len(indices) == 0:
+                continue
+            sub = [boxes[i] for i in indices]
+            union_box = [
+                min(b[0] for b in sub),
+                min(b[1] for b in sub),
+                max(b[2] for b in sub),
+                max(b[3] for b in sub),
+            ]
+            zone_boxes.append(union_box)
+        if len(zone_boxes) < 2:
+            continue
+        # Verificăm că zonele sunt bine separate: orice pereche are IoU < 0.2
+        ok = True
+        for i in range(len(zone_boxes)):
+            for j in range(i + 1, len(zone_boxes)):
+                if _iou_boxes(zone_boxes[i], zone_boxes[j]) >= 0.2:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            return zone_boxes
+    # Dacă niciun k nu dă zone bine separate, returnăm totuși 2 zone (k=2) ca fallback
+    km = KMeans(n_clusters=2, random_state=42, n_init=10).fit(centers)
+    labels = km.labels_
+    zone_boxes = []
+    for c in range(2):
+        indices = np.where(labels == c)[0]
+        sub = [boxes[i] for i in indices]
+        zone_boxes.append([
+            min(b[0] for b in sub),
+            min(b[1] for b in sub),
+            max(b[2] for b in sub),
+            max(b[3] for b in sub),
+        ])
+    return zone_boxes if len(zone_boxes) >= 2 else None
 
 
 def expand_cluster(mask: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> list[int]:
@@ -1355,7 +1550,7 @@ Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sid
 
 def _ask_ai_how_many_buildings_in_cluster(crop_img: np.ndarray) -> int:
     """
-    ✅ FUNCȚIE NOUĂ: Întreabă AI-ul câte clădiri separate există într-un cluster.
+    Întreabă AI-ul câte clădiri separate există într-un cluster (side-by-side).
     """
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -1373,7 +1568,7 @@ def _ask_ai_how_many_buildings_in_cluster(crop_img: np.ndarray) -> int:
     
     prompt = """You are an architectural analyst.
 Look at this floor plan cluster image.
-Count how many SEPARATE, DISTINCT BUILDINGS or HOUSE PLANS you can see.
+Count how many SEPARATE, DISTINCT BUILDINGS or HOUSE PLANS you can see (side by side).
 IMPORTANT:
 - If you see multiple buildings/houses side by side, count each one.
 - If you see one building with multiple floors stacked vertically, that's still ONE building.
@@ -1415,85 +1610,102 @@ Return ONLY a number (1, 2, 3...). No text."""
         return 1
 
 
-def _split_cluster_by_buildings(crop: np.ndarray, offset_x: int, offset_y: int, expected_count: int) -> list[list[int]]:
+def _ask_ai_how_many_floors_in_cluster(crop_img: np.ndarray) -> int:
     """
-    ✅ FUNCȚIE NOUĂ: Împarte un cluster în sub-zone bazat pe analiza geometrică.
-    Încearcă să găsească gap-uri verticale sau orizontale pentru a separa clădirile.
+    Întreabă AI-ul câte PLANURI DE ETAJ (etaje) separate sunt în cluster.
+    Ex.: parter + etaj 1 stacked vertical = 2. Folosit pentru a împărți clustere cu mai multe etaje.
     """
-    print(f"     🔧 Încerc să împart cluster-ul în {expected_count} părți...")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        return 1
     
-    # Convertim la grayscale și binarizăm
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+    except Exception:
+        return 1
+    
+    b64_img = _bgr_to_base64_png(crop_img)
+    
+    prompt = """You are an architectural analyst.
+Look at this image. It may contain one or more FLOOR PLAN drawings (planuri de etaj).
+Count how many SEPARATE FLOOR PLAN drawings you see.
+IMPORTANT:
+- If you see ground floor plan and first floor plan stacked vertically (or one above the other), count 2.
+- If you see 3 floor plans stacked (e.g. parter, etaj 1, etaj 2), return 3.
+- If you see only ONE floor plan drawing, return 1.
+- Count each distinct floor plan as one, even if they belong to the same building.
+Return ONLY a number (1, 2, 3...). No text."""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]
+                }
+            ],
+            max_tokens=10,
+            temperature=0.0
+        )
+        answer = response.choices[0].message.content.strip()
+        import re
+        match = re.search(r'\d+', answer)
+        if match:
+            count = int(match.group())
+            if count >= 1:
+                print(f"     [AI] Detectat {count} etaje (planuri de etaj) în cluster.")
+                return count
+        return 1
+    except Exception as e:
+        print(f"     [AI] Eroare etaje: {e}")
+        return 1
+
+
+def _split_cluster_by_buildings(
+    crop: np.ndarray, offset_x: int, offset_y: int, expected_count: int, prefer_horizontal: bool = False
+) -> list[list[int]]:
+    """
+    Împarte un cluster în sub-zone bazat pe gap-uri verticale (clădiri side-by-side)
+    sau orizontale (etaje stacked). Când prefer_horizontal=True (split după etaje),
+    se încearcă mai întâi split-ul pe rânduri.
+    """
+    print(f"     🔧 Încerc să împart cluster-ul în {expected_count} părți (prefer_horizontal={prefer_horizontal})...")
+    
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
     _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
     
     h, w = binary.shape
     
-    # Analizăm densitatea pe axe
     col_density = np.sum(binary > 0, axis=0)
     row_density = np.sum(binary > 0, axis=1)
     
-    # Smoothing
     col_smooth = cv2.GaussianBlur(col_density.astype(np.float32).reshape(-1, 1), (31, 1), 0).flatten()
     row_smooth = cv2.GaussianBlur(row_density.astype(np.float32).reshape(1, -1), (1, 31), 0).flatten()
     
-    # Normalizare
     col_norm = col_smooth / (np.max(col_smooth) + 1e-5)
     row_norm = row_smooth / (np.max(row_smooth) + 1e-5)
     
-    # Detectăm gap-uri (zone cu densitate < 5%)
-    col_gaps = np.where(col_norm < 0.05)[0]
-    row_gaps = np.where(row_norm < 0.05)[0]
+    # Gap-uri: pentru etaje stacked folosim prag puțin mai relaxat (8%) ca să prindem și titluri/linii subțiri
+    gap_threshold = 0.08 if prefer_horizontal else 0.05
+    col_gaps = np.where(col_norm < gap_threshold)[0]
+    row_gaps = np.where(row_norm < gap_threshold)[0]
     
     boxes = []
     
-    # Încercăm split vertical (dacă avem clădiri side-by-side)
-    if len(col_gaps) > w * 0.05:  # Minim 5% din lățime e gol
-        # Grupăm gap-urile continue
-        gap_groups = []
-        if len(col_gaps) > 0:
-            current_group = [col_gaps[0]]
-            for i in range(1, len(col_gaps)):
-                if col_gaps[i] - col_gaps[i-1] <= 5:  # Gap continuu
-                    current_group.append(col_gaps[i])
-                else:
-                    if len(current_group) > 20:  # Gap suficient de larg
-                        gap_groups.append(current_group)
-                    current_group = [col_gaps[i]]
-            if len(current_group) > 20:
-                gap_groups.append(current_group)
-        
-        if len(gap_groups) >= expected_count - 1:
-            print(f"     ✅ Găsit {len(gap_groups)} gap-uri verticale.")
-            # Împărțim pe verticală
-            split_positions = [int(np.median(g)) for g in gap_groups[:expected_count-1]]
-            split_positions = [0] + sorted(split_positions) + [w]
-            
-            for i in range(len(split_positions) - 1):
-                x_start = split_positions[i]
-                x_end = split_positions[i + 1]
-                
-                # Găsim zona non-goală pe această bandă
-                band = binary[:, x_start:x_end]
-                coords = np.where(band > 0)
-                if coords[0].size > 0:
-                    y_min, y_max = coords[0].min(), coords[0].max()
-                    boxes.append([
-                        offset_x + x_start,
-                        offset_y + y_min,
-                        offset_x + x_end,
-                        offset_y + y_max
-                    ])
-            
-            if len(boxes) > 1:
-                return boxes
-    
-    # Încercăm split orizontal (dacă avem etaje stacked)
-    if len(row_gaps) > h * 0.05:
+    def try_split_horizontal() -> list[list[int]]:
+        nonlocal boxes
+        if len(row_gaps) <= h * 0.05:
+            return []
         gap_groups = []
         if len(row_gaps) > 0:
             current_group = [row_gaps[0]]
             for i in range(1, len(row_gaps)):
-                if row_gaps[i] - row_gaps[i-1] <= 5:
+                if row_gaps[i] - row_gaps[i - 1] <= 5:
                     current_group.append(row_gaps[i])
                 else:
                     if len(current_group) > 20:
@@ -1501,50 +1713,134 @@ def _split_cluster_by_buildings(crop: np.ndarray, offset_x: int, offset_y: int, 
                     current_group = [row_gaps[i]]
             if len(current_group) > 20:
                 gap_groups.append(current_group)
-        
-        if len(gap_groups) >= expected_count - 1:
-            print(f"     ✅ Găsit {len(gap_groups)} gap-uri orizontale.")
-            split_positions = [int(np.median(g)) for g in gap_groups[:expected_count-1]]
-            split_positions = [0] + sorted(split_positions) + [h]
-            
-            for i in range(len(split_positions) - 1):
-                y_start = split_positions[i]
-                y_end = split_positions[i + 1]
-                
-                band = binary[y_start:y_end, :]
-                coords = np.where(band > 0)
-                if coords[1].size > 0:
-                    x_min, x_max = coords[1].min(), coords[1].max()
-                    boxes.append([
-                        offset_x + x_min,
-                        offset_y + y_start,
-                        offset_x + x_max,
-                        offset_y + y_end
-                    ])
-            
-            if len(boxes) > 1:
-                return boxes
+        if len(gap_groups) < expected_count - 1:
+            return []
+        print(f"     ✅ Găsit {len(gap_groups)} gap-uri orizontale (etaje).")
+        split_positions = [int(np.median(g)) for g in gap_groups[: expected_count - 1]]
+        split_positions = [0] + sorted(split_positions) + [h]
+        out = []
+        for i in range(len(split_positions) - 1):
+            y_start, y_end = split_positions[i], split_positions[i + 1]
+            band = binary[y_start:y_end, :]
+            coords = np.where(band > 0)
+            if coords[1].size > 0:
+                x_min, x_max = coords[1].min(), coords[1].max()
+                out.append([offset_x + x_min, offset_y + y_start, offset_x + x_max, offset_y + y_end])
+        return out if len(out) > 1 else []
     
-    print(f"     ⚠️  Nu am găsit gap-uri clare. Nu pot împărți.")
-    return []
+    def try_split_vertical() -> list[list[int]]:
+        nonlocal boxes
+        if len(col_gaps) <= w * 0.05:
+            return []
+        gap_groups = []
+        if len(col_gaps) > 0:
+            current_group = [col_gaps[0]]
+            for i in range(1, len(col_gaps)):
+                if col_gaps[i] - col_gaps[i - 1] <= 5:
+                    current_group.append(col_gaps[i])
+                else:
+                    if len(current_group) > 20:
+                        gap_groups.append(current_group)
+                    current_group = [col_gaps[i]]
+            if len(current_group) > 20:
+                gap_groups.append(current_group)
+        if len(gap_groups) < expected_count - 1:
+            return []
+        print(f"     ✅ Găsit {len(gap_groups)} gap-uri verticale.")
+        split_positions = [int(np.median(g)) for g in gap_groups[: expected_count - 1]]
+        split_positions = [0] + sorted(split_positions) + [w]
+        out = []
+        for i in range(len(split_positions) - 1):
+            x_start, x_end = split_positions[i], split_positions[i + 1]
+            band = binary[:, x_start:x_end]
+            coords = np.where(band > 0)
+            if coords[0].size > 0:
+                y_min, y_max = coords[0].min(), coords[0].max()
+                out.append([offset_x + x_start, offset_y + y_min, offset_x + x_end, offset_y + y_max])
+        return out if len(out) > 1 else []
+    
+    # Pentru etaje: încearcă mai întâi split orizontal
+    if prefer_horizontal:
+        boxes = try_split_horizontal()
+        if len(boxes) >= 2:
+            return boxes
+        boxes = try_split_vertical()
+        if len(boxes) >= 2:
+            return boxes
+        # Fără tăieri la jumătate: luăm cele N cele mai mari componente
+        print(f"     ⚠️  Nu am găsit gap-uri pentru etaje. Încerc cele {expected_count} cele mai mari componente...")
+        return _split_cluster_by_largest_components(crop, offset_x, offset_y, expected_count)
+    
+    # Comportament original: vertical (clădiri) apoi orizontal
+    boxes = try_split_vertical()
+    if len(boxes) >= 2:
+        return boxes
+    
+    boxes = try_split_horizontal()
+    if len(boxes) >= 2:
+        return boxes
+    
+    # Fără tăieri la jumătate: folosim cele N cele mai mari componente din imagine
+    print(f"     ⚠️  Nu am găsit gap-uri clare. Încerc split după cele {expected_count} cele mai mari componente...")
+    return _split_cluster_by_largest_components(crop, offset_x, offset_y, expected_count)
 
 
-def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = False) -> list[str] | list[list[int]]:
+def _split_cluster_by_largest_components(
+    crop: np.ndarray, offset_x: int, offset_y: int, expected_count: int
+) -> list[list[int]]:
+    """
+    Sparge clusterul luând cele N cele mai mari componente conectate (zone de conținut).
+    NU face tăieri la jumătate – folosește doar bounding box-urile componentelor reale.
+    """
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+    h, w = binary.shape
+    area_total = h * w
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    # stats: x, y, w, h, area; index 0 = fundal
+    if num < 2:
+        print(f"     ⚠️  Doar fundal (0 componente de conținut).")
+        return []
+
+    # Sortăm componentele (fără fundal) după arie descrescător
+    comps = []
+    for i in range(1, num):
+        x, y, bw, bh, area = stats[i]
+        if area < 0.02 * area_total:  # ignorăm zgomot sub 2% din imagine
+            continue
+        comps.append((area, x, y, x + bw, y + bh))
+
+    comps.sort(key=lambda t: t[0], reverse=True)
+    n_take = min(expected_count, len(comps))
+    if n_take < 2:
+        print(f"     ⚠️  Am găsit doar {len(comps)} componentă(e) suficient de mare.")
+        return []
+
+    boxes = []
+    for _, x1, y1, x2, y2 in comps[:n_take]:
+        boxes.append([offset_x + x1, offset_y + y1, offset_x + x2, offset_y + y2])
+
+    print(f"     ✅ Luate cele {len(boxes)} cele mai mari componente (fără tăieri la jumătate).")
+    return boxes
+
+
+def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = False, crop_name_prefix: str = "") -> list[str] | list[list[int]]:
     print("\n========================================================")
     print("[STEP 7] START Detectare clustere")
     print("========================================================")
     
-    # 1. Pre-procesare
+    # 1. Pre-procesare – kernel mai mic (3x3) ca curățarea să fie mai puțin agresivă, păstrăm mai mult detaliu
     gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) if len(mask.shape) == 3 else mask.copy()
     inv = cv2.bitwise_not(gray)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     clean = cv2.morphologyEx(cv2.dilate(inv, kernel), cv2.MORPH_OPEN, kernel)
     save_debug(clean, STEP_DIRS["clusters"]["initial"], "mask_clean.jpg")
 
     # 2. Raw Boxes
     num, _, stats, _ = cv2.connectedComponentsWithStats(clean, 8)
     boxes = [[x, y, x + bw, y + bh] for x, y, bw, bh, a in stats[1:] if a > 200]
-    
+
     print(f"🔸 [GEO] 1. Cutii brute (Raw Boxes): {len(boxes)}")
     debug_raw = _draw_debug_boxes(orig, boxes, (0, 0, 255), "Raw_")
     save_debug(debug_raw, STEP_DIRS["clusters"]["initial"], "debug_1_raw_boxes.jpg")
@@ -1568,7 +1864,12 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
     debug_mrg = _draw_debug_boxes(orig, merged, (0, 255, 255), "Mrg_")
     save_debug(debug_mrg, STEP_DIRS["clusters"]["initial"], "debug_3_merged_boxes.jpg")
 
-    
+    # 4b. Mapare: fiecare cluster merged -> lista de cutii refined (constituenții) din care s-a format
+    merged_to_constituents: dict[tuple[int, int, int, int], list[list[int]]] = {}
+    for M in merged:
+        constituents = [R for R in refined if _box_inside(R, M)]
+        merged_to_constituents[tuple(M)] = constituents
+
     # 5. LOGICĂ DECIZIONALĂ (AI) - Doar dacă avem 1 singur cluster
     filtered: list[list[int]] = []
 
@@ -1669,50 +1970,43 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
         filtered = merged
 
 
-    # 6. FILTRARE FINALĂ DIMENSIUNI
+    # 6. FILTRARE FINALĂ DIMENSIUNI (referință: al doilea cel mai mare cluster)
+    img_area = orig.shape[0] * orig.shape[1]
     if filtered:
         print("\n--- [FINAL] Filtrare relativă dimensiuni ---")
-        
-        areas_map = [] 
+        areas_map = []
         for i, box in enumerate(filtered):
             a = (box[2] - box[0]) * (box[3] - box[1])
             areas_map.append((i, float(a)))
-        
         areas_map.sort(key=lambda x: x[1], reverse=True)
-        
-        if len(areas_map) > 1:
-            reference_area = areas_map[1][1]
-            print(f" -> [LOGIC] Referință Finală: AL DOILEA cel mai mare: {int(reference_area)} px")
-        else:
-            reference_area = areas_map[0][1]
-            print(f" -> [LOGIC] Referință Finală: Singurul element: {int(reference_area)} px")
-
-        img_area = float(orig.shape[0] * orig.shape[1])
-
+        reference_area = areas_map[1][1] if len(areas_map) > 1 else areas_map[0][1]
+        img_area_f = float(img_area)
         MIN_REL = 0.10
         MIN_ABS = 0.0005
-        min_allowed = max(MIN_REL * reference_area, MIN_ABS * img_area)
-        
-        print(f" -> Min Allowed Final: {int(min_allowed)} px")
-        
+        min_allowed = max(MIN_REL * reference_area, MIN_ABS * img_area_f)
+        print(f" -> Referință: al doilea cel mai mare = {int(reference_area)} px, min_allowed = {int(min_allowed)} px")
         final_list = []
         for idx, area in areas_map:
             if area >= min_allowed:
                 final_list.append(filtered[idx])
             else:
                 print(f"    [DROP Final] Cluster {idx} area={int(area)} < {int(min_allowed)}")
-        
         final_list.sort(key=lambda b: (b[1], b[0]))
-        
-        # Recalculăm areas_map pentru final_list (după sortare)
-        final_areas_map = []
-        for i, box in enumerate(final_list):
-            a = (box[2] - box[0]) * (box[3] - box[1])
-            final_areas_map.append((i, float(a)))
-        final_areas_map.sort(key=lambda x: x[1], reverse=True)
-        
         filtered = final_list
-        
+        final_areas_map = [(i, (b[2]-b[0])*(b[3]-b[1])) for i, b in enumerate(filtered)]
+        final_areas_map.sort(key=lambda x: x[1], reverse=True)
+
+    # 6b. Dacă avem >10 clustere, verificăm dacă sunt grupate în ≥2 zone; dacă da, le unim pe zone
+    if filtered and len(filtered) > 10:
+        zones = _merge_clusters_into_zones(filtered, (orig.shape[0], orig.shape[1]))
+        if zones and len(zones) >= 2:
+            print(f"\n--- [ZONE] {len(filtered)} clustere grupate în {len(zones)} zone – înlocuiesc cu zonele ---")
+            filtered = zones
+            final_areas_map = [(i, (b[2]-b[0])*(b[3]-b[1])) for i, b in enumerate(filtered)]
+            final_areas_map.sort(key=lambda x: x[1], reverse=True)
+
+    if filtered:
+        final_list = filtered
         # ✅ VERIFICARE FRAME: Dacă cel mai mare cluster ocupă >95% din imagine
         if len(final_list) > 0 and len(final_areas_map) > 0:
             largest_cluster_area = final_areas_map[0][1]  # Cel mai mare cluster
@@ -1829,102 +2123,124 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
             else:
                 print(f"   ℹ️  Cel mai mare cluster ocupă {largest_cluster_ratio*100:.1f}% (<95%). Nu verific frame.")
 
-    # ✅ 7. VALIDARE FINALĂ AI - Verificăm fiecare cluster pentru clădiri multiple
+    # ✅ 7. VALIDARE FINALĂ AI - Desfacem clustere mari în funcție de constituenți, apoi procesăm fiecare la rând
     print("\n========================================================")
-    print("[FINAL VALIDATION] Verificare AI pentru clădiri multiple")
+    print("[FINAL VALIDATION] Verificare AI – desfacem după constituenți, apoi procesăm fiecare cluster")
     print("========================================================")
     
-    final_validated_boxes = []
-    
-    for i, (x1, y1, x2, y2) in enumerate(filtered, 1):
-        print(f"\n🔍 Cluster {i}/{len(filtered)}...")
-        
+    final_validated_boxes: list[list[int]] = []
+    # Coadă: fiecare cluster este procesat; dacă AI zice 2+ etaje/clădiri, îl desfacem în N și punem cele N în coadă
+    to_process: list[list[int]] = [list(b) for b in filtered]
+    max_rounds = 100  # limită ca să nu avem buclă infinită
+    round_num = 0
+
+    while to_process and round_num < max_rounds:
+        round_num += 1
+        x1, y1, x2, y2 = to_process.pop(0)
         crop = orig[y1:y2, x1:x2]
+        key = (x1, y1, x2, y2)
+        constituents_raw = merged_to_constituents.get(key, [])
+        parent_area = (x2 - x1) * (y2 - y1)
+        min_area = max(0.02 * parent_area, 500)
+        significant = [c for c in constituents_raw if (c[2] - c[0]) * (c[3] - c[1]) >= min_area]
+        unique_const: list[list[int]] = []
+        for c in sorted(significant, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True):
+            if any(_is_overlapping(c, u, 0.70) for u in unique_const):
+                continue
+            unique_const.append(c)
+
         buildings_count = _ask_ai_how_many_buildings_in_cluster(crop)
-        
         if buildings_count > 1:
-            print(f"   ⚠️  AI: {buildings_count} clădiri separate!")
-            print(f"   🔧 Activez sub-împărțire...")
-            
-            sub_boxes = _split_cluster_by_buildings(crop, x1, y1, buildings_count)
-            
-            if len(sub_boxes) > 1:
-                print(f"   ✅ Împărțit în {len(sub_boxes)} sub-clustere.")
-                final_validated_boxes.extend(sub_boxes)
-            else:
-                print(f"   ⚠️  Nu pot împărți geometric. Păstrez original.")
-                final_validated_boxes.append([x1, y1, x2, y2])
-        else:
-            print(f"   ✅ AI confirmă: 1 clădire. Verific dacă conține blueprint + sideview...")
-            
-            # Verificăm dacă cluster-ul conține atât blueprint cât și sideview
-            has_blueprint_and_sideview = _check_blueprint_and_sideview_in_cluster(crop)
-            
-            if has_blueprint_and_sideview:
-                print(f"   ⚠️  Detectat blueprint + sideview în același cluster!")
-                print(f"   📐 Cluster original: [{x1}, {y1}, {x2}, {y2}] (dimensiuni: {x2-x1}x{y2-y1})")
-                print(f"   🗑️  Elimin cluster-ul mare original și generează sub-clustere...")
-                print(f"   🔧 Încerc să detectez sub-clustere în imagine...")
-                
-                # Folosim algoritmul inteligent de detectare a sub-clusterelor
-                sub_clusters = _detect_sub_clusters_in_image(crop)
-                
-                if len(sub_clusters) >= 2:
-                    print(f"   ✅ Detectat {len(sub_clusters)} sub-clustere în imagine")
-                    # Adăugăm offset-ul cluster-ului original și eliminăm cluster-ul mare
-                    for idx, (sub_x1, sub_y1, sub_x2, sub_y2) in enumerate(sub_clusters, 1):
-                        adjusted_box = [
-                            x1 + sub_x1,
-                            y1 + sub_y1,
-                            x1 + sub_x2,
-                            y1 + sub_y2
-                        ]
-                        print(f"      📦 Sub-cluster {idx}: local=[{sub_x1}, {sub_y1}, {sub_x2}, {sub_y2}] → global={adjusted_box} (dimensiuni: {adjusted_box[2]-adjusted_box[0]}x{adjusted_box[3]-adjusted_box[1]})")
-                        final_validated_boxes.append(adjusted_box)
-                    print(f"   ✅ Cluster mare eliminat. Înlocuit cu {len(sub_clusters)} sub-clustere folosind detectare geometrică.")
-                else:
-                    print(f"   ⚠️ Nu am găsit suficiente sub-clustere ({len(sub_clusters)} < 2). Folosesc split geometric cu _split_cluster_by_buildings...")
-                    # Fallback: folosim _split_cluster_by_buildings cu expected_count=2
-                    split_boxes = _split_cluster_by_buildings(crop, x1, y1, expected_count=2)
-                    
-                    if len(split_boxes) >= 2:
-                        print(f"   ✅ _split_cluster_by_buildings a găsit {len(split_boxes)} clustere")
-                        for idx, split_box in enumerate(split_boxes, 1):
-                            print(f"      📦 Sub-cluster {idx}: {split_box} (dimensiuni: {split_box[2]-split_box[0]}x{split_box[3]-split_box[1]})")
-                        print(f"   ✅ Cluster mare eliminat. Înlocuit cu {len(split_boxes)} sub-clustere.")
-                        final_validated_boxes.extend(split_boxes)
-                    else:
-                        print(f"   ⚠️ _split_cluster_by_buildings nu a găsit clustere. Folosesc split simplu pe jumătate ca ultim fallback...")
-                        # Ultim fallback: split simplu pe jumătate
-                        h_crop, w_crop = crop.shape[:2]
-                        if w_crop > h_crop:
-                            # Cluster lat - împărțim vertical (pe jumătate)
-                            mid_x = x1 + w_crop // 2
-                            box1 = [x1, y1, mid_x, y2]
-                            box2 = [mid_x, y1, x2, y2]
-                            print(f"      📦 Sub-cluster 1: {box1} (dimensiuni: {box1[2]-box1[0]}x{box1[3]-box1[1]})")
-                            print(f"      📦 Sub-cluster 2: {box2} (dimensiuni: {box2[2]-box2[0]}x{box2[3]-box2[1]})")
-                            final_validated_boxes.append(box1)
-                            final_validated_boxes.append(box2)
-                            print(f"   ✅ Cluster mare eliminat. Împărțit vertical în 2 clustere (fallback simplu).")
-                        else:
-                            # Cluster înalt - împărțim orizontal (pe jumătate)
-                            mid_y = y1 + h_crop // 2
-                            box1 = [x1, y1, x2, mid_y]
-                            box2 = [x1, mid_y, x2, y2]
-                            print(f"      📦 Sub-cluster 1: {box1} (dimensiuni: {box1[2]-box1[0]}x{box1[3]-box1[1]})")
-                            print(f"      📦 Sub-cluster 2: {box2} (dimensiuni: {box2[2]-box2[0]}x{box2[3]-box2[1]})")
-                            final_validated_boxes.append(box1)
-                            final_validated_boxes.append(box2)
-                            print(f"   ✅ Cluster mare eliminat. Împărțit orizontal în 2 clustere (fallback simplu).")
-                # NU adăugăm cluster-ul original - l-am eliminat și l-am înlocuit cu sub-clustere
-            else:
-                print(f"   ✅ Cluster OK (nu conține blueprint + sideview).")
-                final_validated_boxes.append([x1, y1, x2, y2])
-    
+            print(f"   ⚠️  AI: {buildings_count} clădiri! Desfac în {buildings_count} clustere după constituenți (orizontal).")
+            if len(unique_const) >= 2:
+                sub_boxes = _split_constituents_into_n_groups(unique_const, buildings_count, by_vertical=False)
+                if sub_boxes:
+                    for box in sub_boxes:
+                        to_process.append(box)
+                    print(f"   ✅ Adăugat {len(sub_boxes)} clustere în coadă pentru procesare.")
+                    continue
+            fallback = _split_cluster_by_largest_components(crop, x1, y1, buildings_count)
+            if len(fallback) >= 2:
+                for box in fallback:
+                    to_process.append(box)
+                print(f"   ✅ Fallback: {len(fallback)} clustere (cele mai mari componente) în coadă.")
+                continue
+            final_validated_boxes.append([x1, y1, x2, y2])
+            continue
+
+        floors_count = _ask_ai_how_many_floors_in_cluster(crop)
+        if floors_count >= 2:
+            print(f"   ⚠️  AI: {floors_count} etaje! Desfac în {floors_count} clustere după constituenți (vertical).")
+            if len(unique_const) >= 2:
+                sub_boxes = _split_constituents_into_n_groups(unique_const, floors_count, by_vertical=True)
+                if sub_boxes:
+                    for box in sub_boxes:
+                        to_process.append(box)
+                    print(f"   ✅ Adăugat {len(sub_boxes)} clustere în coadă pentru procesare.")
+                    continue
+            fallback = _split_cluster_by_largest_components(crop, x1, y1, floors_count)
+            if len(fallback) >= 2:
+                for box in fallback:
+                    to_process.append(box)
+                print(f"   ✅ Fallback: {len(fallback)} clustere (cele mai mari componente) în coadă.")
+                continue
+            final_validated_boxes.append([x1, y1, x2, y2])
+            continue
+
+        # 1 clădire, 1 etaj (sau AI nu a zis 2+)
+        has_blueprint_and_sideview = _check_blueprint_and_sideview_in_cluster(crop)
+        if has_blueprint_and_sideview:
+            print(f"   ⚠️  Blueprint + sideview în același cluster. Desfac în 2 după constituenți.")
+            if len(unique_const) >= 2:
+                sub_boxes = _split_constituents_into_n_groups(unique_const, 2, by_vertical=False)
+                if sub_boxes:
+                    for box in sub_boxes:
+                        to_process.append(box)
+                    print(f"   ✅ Adăugat 2 clustere în coadă.")
+                    continue
+            sub_clusters = _detect_sub_clusters_in_image(crop)
+            if len(sub_clusters) >= 2:
+                for sub_x1, sub_y1, sub_x2, sub_y2 in sub_clusters:
+                    to_process.append([x1 + sub_x1, y1 + sub_y1, x1 + sub_x2, y1 + sub_y2])
+                print(f"   ✅ Adăugat {len(sub_clusters)} sub-clustere în coadă.")
+                continue
+            fallback_boxes = _split_cluster_by_largest_components(crop, x1, y1, expected_count=2)
+            if len(fallback_boxes) >= 2:
+                for box in fallback_boxes:
+                    to_process.append(box)
+                continue
+        final_validated_boxes.append([x1, y1, x2, y2])
+
+    if to_process:
+        print(f"   ⚠️  Limită {max_rounds} runde atinsă. {len(to_process)} clustere rămase le adăugăm direct.")
+        final_validated_boxes.extend(to_process)
+
     final_validated_boxes.sort(key=lambda b: (b[1], b[0]))
-    
     print(f"\n📊 Rezultat: {len(filtered)} → {len(final_validated_boxes)} clustere finale")
+
+    # 7.4. Elimină clustere „prea puțin”: dacă un box e conținut în altul, păstrăm doar cel exterior
+    # (evită livrarea atât a „interior only” cât și a „interior+terasă” – livrăm doar full)
+    def _drop_nested_boxes(boxes: list[list[int]]) -> list[list[int]]:
+        if len(boxes) < 2:
+            return boxes
+        to_remove = set()
+        for i, inner in enumerate(boxes):
+            for j, outer in enumerate(boxes):
+                if i == j:
+                    continue
+                if _box_inside(inner, outer, tolerance=5):
+                    area_inner = (inner[2] - inner[0]) * (inner[3] - inner[1])
+                    area_outer = (outer[2] - outer[0]) * (outer[3] - outer[1])
+                    if area_outer > area_inner:
+                        to_remove.add(i)
+                        print(f"   🧹 [Nested] Scot clusterul interior (prea puțin): {inner} – păstrez exteriorul {outer}")
+                        break
+        if to_remove:
+            boxes = [b for k, b in enumerate(boxes) if k not in to_remove]
+            print(f"   ✅ După eliminare nested: {len(boxes)} clustere")
+        return boxes
+
+    final_validated_boxes = _drop_nested_boxes(final_validated_boxes)
 
     # 7.5. Fill background pentru imagini mici incluse în imagini mari
     def _fill_small_clusters_in_large(orig_img: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, list[list[int]]]:
@@ -2012,18 +2328,51 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
 
     print(f"\n💾 Salvare {len(final_validated_boxes)} clustere validate...")
 
+    prefix = crop_name_prefix or ""
+    # Culori distincte BGR pentru fiecare cluster (ciclu dacă sunt multe)
+    palette = [
+        (255, 100, 100), (100, 255, 100), (100, 100, 255),
+        (255, 255, 100), (255, 100, 255), (100, 255, 255),
+        (180, 100, 255), (255, 180, 100), (100, 255, 180),
+        (200, 50, 150), (50, 200, 150), (150, 50, 200),
+    ]
+    overlay = result.copy()
+
     for i, (x1, y1, x2, y2) in enumerate(final_validated_boxes, 1):
-        cv2.rectangle(result, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(result, str(i), (x1 + 5, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        color = palette[(i - 1) % len(palette)]
+        # Interior cluster: culoare cu transparență 50%
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
 
         crop = orig[y1:y2, x1:x2]
         crop = resize_bgr_max_side(crop)
 
-        crop_path = crops_dir / f"cluster_{i}.jpg"
+        crop_path = crops_dir / f"{prefix}cluster_{i}.jpg"
         cv2.imwrite(str(crop_path), crop)
         crop_paths.append(str(crop_path))
 
-    save_debug(result, STEP_DIRS["clusters"]["final"], "final_clusters_validated.jpg")
+    # Blend overlay 50% peste original
+    result = cv2.addWeighted(overlay, 0.5, result, 0.5, 0)
+    # Constituenții care nu au fost luați în seamă: contur gri peste blend, per cluster
+    for i, (x1, y1, x2, y2) in enumerate(final_validated_boxes, 1):
+        key = (x1, y1, x2, y2)
+        constituents_inside = merged_to_constituents.get(key, [])
+        if not constituents_inside:
+            constituents_inside = [r for r in refined if _box_inside(r, [x1, y1, x2, y2])]
+        for cx1, cy1, cx2, cy2 in constituents_inside:
+            if (cx1, cy1, cx2, cy2) == (x1, y1, x2, y2):
+                continue
+            cv2.rectangle(result, (cx1, cy1), (cx2, cy2), (100, 100, 100), 1)
+            cv2.putText(result, "nu luat", (cx1 + 2, cy1 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+    # Contururi și etichete clustere finale
+    for i, (x1, y1, x2, y2) in enumerate(final_validated_boxes, 1):
+        color = palette[(i - 1) % len(palette)]
+        cv2.rectangle(result, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(result, str(i), (x1 + 5, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2.putText(result, str(i), (x1 + 5, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 1)
+
+    # Preview: per pagină când e PDF multi-pagină (altfel se suprascrie și vezi doar ultima pagină)
+    preview_name = f"final_clusters_validated_{prefix.rstrip('_')}.jpg" if prefix else "final_clusters_validated.jpg"
+    save_debug(result, STEP_DIRS["clusters"]["final"], preview_name)
     print(f"✅ [DONE] {len(final_validated_boxes)} clustere validate returnate")
 
     if return_boxes:
@@ -2031,7 +2380,7 @@ def detect_clusters(mask: np.ndarray, orig: np.ndarray, return_boxes: bool = Fal
     return crop_paths
 
 
-def detect_wall_zones(orig: np.ndarray, thick_mask: np.ndarray) -> list[str]:
+def detect_wall_zones(orig: np.ndarray, thick_mask: np.ndarray, crop_name_prefix: str = "") -> list[str]:
     print("\n[STEP 6] Detectare zone pereți...")
     gray = (thick_mask / 255).astype(np.float32)
     dens = cv2.GaussianBlur(gray, (51, 51), 0)
@@ -2044,5 +2393,5 @@ def detect_wall_zones(orig: np.ndarray, thick_mask: np.ndarray) -> list[str]:
     walls = cv2.bitwise_not(filled)
 
     save_debug(walls, STEP_DIRS["walls"], "filled_unified.jpg")
-    crop_paths = detect_clusters(walls, orig)
+    crop_paths = detect_clusters(walls, orig, crop_name_prefix=crop_name_prefix)
     return crop_paths
