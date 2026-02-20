@@ -107,7 +107,7 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
             "Content-Type": "application/json"
         }
         
-        max_attempts = 3
+        max_attempts = 6
         response = None
         for attempt in range(max_attempts):
             try:
@@ -674,15 +674,6 @@ def brute_force_alignment(
 ) -> Optional[Dict[str, Any]]:
     """
     Algoritm brute-force pentru alinierea măștilor de pereți API și original.
-    
-    Args:
-        api_walls_mask: Masca de pereți de la API (grayscale)
-        orig_walls: Masca de pereți originală (grayscale)
-        raster_dir: Directorul raster
-        steps_dir: Directorul pentru steps
-    
-    Returns:
-        Dict cu configurația cea mai bună sau None dacă a eșuat
     """
     try:
         print(f"\n      🔥 BRUTE FORCE: Căutare transformare între API walls și original walls...")
@@ -694,12 +685,53 @@ def brute_force_alignment(
         _, binary_api = cv2.threshold(api_walls_mask, 127, 255, cv2.THRESH_BINARY_INV)
         _, binary_orig = cv2.threshold(orig_walls, 127, 255, cv2.THRESH_BINARY_INV)
         
-        # PARAMETRI BRUTE FORCE (FĂRĂ ROTAȚII)
-        scales = np.arange(0.3, 3.5, 0.05)
+        # Dimensiune maximă pentru toate overlay-urile salvate (același sizing între planuri)
+        MAX_OVERLAY_OUTPUT_SIDE = 1200
         
-        print(f"      📊 Scale-uri: {len(scales)} ({scales[0]:.2f} - {scales[-1]:.2f})")
-        print(f"      📊 Rotații: 1 (0° - fără rotație)")
-        print(f"      📊 Total teste: {len(scales) * 2} (API→Orig + Orig→API)")
+        def _maybe_resize_to_standard(img: np.ndarray) -> np.ndarray:
+            """Redimensionează imaginea dacă depășește MAX_OVERLAY_OUTPUT_SIDE, păstrând aspect ratio."""
+            h, w = img.shape[:2]
+            if max(h, w) <= MAX_OVERLAY_OUTPUT_SIDE:
+                return img
+            scale = MAX_OVERLAY_OUTPUT_SIDE / max(h, w)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Folder pentru pașii brute force (vizualizare)
+        brute_steps_dir = raster_dir / "brute_steps"
+        brute_steps_dir.mkdir(parents=True, exist_ok=True)
+        
+        def _save_step_overlay(base_binary, template_binary, config, path: Path):
+            """Salvează overlay: roșu = base, verde/albastru = template scalat la position. Dimensiune normalizată."""
+            try:
+                tw, th = config['template_size']
+                template_scaled = cv2.resize(template_binary, (tw, th))
+                x_pos, y_pos = config['position']
+                h, w = base_binary.shape[:2]
+                overlay = np.zeros((h, w, 3), dtype=np.uint8)
+                overlay[:, :, 2] = base_binary
+                y_end = min(y_pos + th, h)
+                x_end = min(x_pos + tw, w)
+                dy, dx = y_end - y_pos, x_end - x_pos
+                overlay[y_pos:y_end, x_pos:x_end, 0] = template_scaled[:dy, :dx]
+                overlay[y_pos:y_end, x_pos:x_end, 1] = template_scaled[:dy, :dx]
+                overlay = _maybe_resize_to_standard(overlay)
+                if not cv2.imwrite(str(path), overlay):
+                    print(f"      ⚠️ Nu s-a putut salva {path.name} (posibil disc plin)")
+            except OSError as e:
+                if e.errno == 28:  # No space left on device
+                    print(f"      ⚠️ Disc plin: nu s-a salvat {path.name}")
+                else:
+                    raise
+        
+        # Interval scale 10%–1000% (0.1–10.0): template poate fi de la 1/10 la 10× față de cealaltă imagine
+        # Pas fin (0.01) = multe iterații pentru suprapuneri cât mai exacte
+        SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.1, 10.0, 0.01
+        scales = np.arange(SCALE_MIN, SCALE_MAX + SCALE_STEP / 2, SCALE_STEP)
+        
+        print(f"      📊 Scale: {SCALE_MIN*100:.0f}% – {SCALE_MAX*100:.0f}% (pas {SCALE_STEP}), {len(scales)} valori")
+        print(f"      📊 Rotații: 1 (0°) | Total teste: 2× (API→Orig + Orig→API), skip când template > imagine")
         
         top_results = []
         
@@ -709,6 +741,10 @@ def brute_force_alignment(
             if len(top_results) > max_results:
                 top_results.pop()
         
+        # Indici pentru salvarea pașilor (10 scale reprezentative, uniform distribuite)
+        n_scale = len(scales)
+        step_indices = list(np.linspace(0, max(0, n_scale - 1), min(10, n_scale), dtype=int))
+        
         # Testare API -> Original
         print(f"      🚀 Testare API walls → Original walls...")
         total = len(scales)
@@ -717,27 +753,22 @@ def brute_force_alignment(
         for idx, scale in enumerate(scales):
             tested += 1
             
-            if idx % 10 == 0 or tested == 1:
+            log_every = max(50, total // 20)
+            if idx % log_every == 0 or tested == 1:
                 print(f"         ⏳ Test {tested}/{total}: scale={scale:.2f}x...")
             
             api_rot = binary_api.copy()
             
-            # Scalăm
             new_w = int(api_rot.shape[1] * scale)
             new_h = int(api_rot.shape[0] * scale)
             
             if new_w > binary_orig.shape[1] or new_h > binary_orig.shape[0]:
-                if idx % 10 == 0:
-                    print(f"            ⚠️ Skip (prea mare: {new_w}x{new_h})")
                 continue
             if new_w < 30 or new_h < 30:
-                if idx % 10 == 0:
-                    print(f"            ⚠️ Skip (prea mic: {new_w}x{new_h})")
                 continue
             
             api_scaled = cv2.resize(api_rot, (new_w, new_h))
             
-            # Template matching
             result_match = cv2.matchTemplate(binary_orig, api_scaled, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
             
@@ -751,8 +782,11 @@ def brute_force_alignment(
             }
             add_to_top_results(config)
             
-            if idx % 10 == 0:
-                print(f"            ✅ Score: {max_val:.4f} (Best so far: {top_results[0]['score']:.4f})")
+            if idx in step_indices:
+                _save_step_overlay(binary_orig, binary_api, config, brute_steps_dir / f"step_api2orig_scale_{scale:.2f}_score_{max_val:.3f}.png")
+            
+            if idx % log_every == 0 and top_results:
+                print(f"            ✅ Score: {max_val:.4f} (Best: {top_results[0]['score']:.4f})")
         
         if top_results:
             print(f"      ✅ Finalizat API→Orig: {tested}/{total} teste, best score: {top_results[0]['score']:.4f}")
@@ -766,27 +800,21 @@ def brute_force_alignment(
         for idx, scale in enumerate(scales):
             tested += 1
             
-            if idx % 10 == 0 or tested == 1:
+            if idx % log_every == 0 or tested == 1:
                 print(f"         ⏳ Test {tested}/{total}: scale={scale:.2f}x...")
             
             orig_rot = binary_orig.copy()
             
-            # Scalăm
             new_w = int(orig_rot.shape[1] * scale)
             new_h = int(orig_rot.shape[0] * scale)
             
             if new_w > binary_api.shape[1] or new_h > binary_api.shape[0]:
-                if idx % 10 == 0:
-                    print(f"            ⚠️ Skip (prea mare: {new_w}x{new_h})")
                 continue
             if new_w < 30 or new_h < 30:
-                if idx % 10 == 0:
-                    print(f"            ⚠️ Skip (prea mic: {new_w}x{new_h})")
                 continue
             
             orig_scaled = cv2.resize(orig_rot, (new_w, new_h))
             
-            # Template matching
             result_match = cv2.matchTemplate(binary_api, orig_scaled, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
             
@@ -800,8 +828,11 @@ def brute_force_alignment(
             }
             add_to_top_results(config)
             
-            if idx % 10 == 0:
-                print(f"            ✅ Score: {max_val:.4f} (Best so far: {top_results[0]['score']:.4f})")
+            if idx in step_indices:
+                _save_step_overlay(binary_api, binary_orig, config, brute_steps_dir / f"step_orig2api_scale_{scale:.2f}_score_{max_val:.3f}.png")
+            
+            if idx % log_every == 0 and top_results:
+                print(f"            ✅ Score: {max_val:.4f} (Best: {top_results[0]['score']:.4f})")
         
         if not top_results:
             print(f"      ⚠️ Nu s-au găsit rezultate valide pentru brute force")
@@ -809,11 +840,55 @@ def brute_force_alignment(
         
         print(f"      ✅ Finalizat Orig→API: {tested}/{total} teste, best score: {top_results[0]['score']:.4f}")
         
-        # Găsim cel mai bun rezultat
+        # Salvare top 5 candidați în brute_steps
+        for i, cfg in enumerate(top_results[:5]):
+            if cfg['direction'] == 'api_to_orig':
+                _save_step_overlay(binary_orig, binary_api, cfg, brute_steps_dir / f"best_{i+1}_score_{cfg['score']:.3f}_api2orig.png")
+            else:
+                _save_step_overlay(binary_api, binary_orig, cfg, brute_steps_dir / f"best_{i+1}_score_{cfg['score']:.3f}_orig2api.png")
+        print(f"      📁 Pași salvați în: {brute_steps_dir.name}/ (10 scale steps + top 5, sizing max {MAX_OVERLAY_OUTPUT_SIDE}px)")
+        
         best = top_results[0]
-        # Dimensiunile mastii API (spațiul în care brute-force a aliniat) – necesare pentru transformarea coordonatelor JSON (request space → mask space → original)
+        
+        # Rafinare: scale mai fin în jurul scalei alese (±0.1, pas 0.01)
+        ref_scale = best['scale']
+        ref_direction = best['direction']
+        refine_scales = np.clip(np.arange(ref_scale - 0.10, ref_scale + 0.105, 0.005), SCALE_MIN, SCALE_MAX)
+        print(f"      🔧 Rafinare scale: {len(refine_scales)} valori în [{refine_scales[0]:.2f}, {refine_scales[-1]:.2f}] (pas 0.005)")
+        for scale in refine_scales:
+            if ref_direction == 'api_to_orig':
+                new_w = int(binary_api.shape[1] * scale)
+                new_h = int(binary_api.shape[0] * scale)
+                if new_w > binary_orig.shape[1] or new_h > binary_orig.shape[0] or new_w < 30 or new_h < 30:
+                    continue
+                api_scaled = cv2.resize(binary_api, (new_w, new_h))
+                result_match = cv2.matchTemplate(binary_orig, api_scaled, cv2.TM_CCOEFF_NORMED)
+            else:
+                new_w = int(binary_orig.shape[1] * scale)
+                new_h = int(binary_orig.shape[0] * scale)
+                if new_w > binary_api.shape[1] or new_h > binary_api.shape[0] or new_w < 30 or new_h < 30:
+                    continue
+                orig_scaled = cv2.resize(binary_orig, (new_w, new_h))
+                result_match = cv2.matchTemplate(binary_api, orig_scaled, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result_match)
+            if max_val > best['score']:
+                best = {
+                    'direction': ref_direction,
+                    'scale': float(scale),
+                    'rotation': 0,
+                    'position': (int(max_loc[0]), int(max_loc[1])),
+                    'score': float(max_val),
+                    'template_size': (int(new_w), int(new_h))
+                }
+        if best['scale'] != ref_scale:
+            print(f"      ✅ Rafinare: scale actualizat {ref_scale:.3f} → {best['scale']:.3f}, score {best['score']:.4f}")
+        
         best['mask_w'] = int(api_walls_mask.shape[1])
         best['mask_h'] = int(api_walls_mask.shape[0])
+        
+        if best['score'] < 0.35:
+            print(f"      ⚠️ Score scăzut ({best['score']:.4f} < 0.35). Alinierea poate fi incorectă; verifică brute_force_best_overlay.png.")
+        
         print(f"\n      🏆 CEL MAI BUN REZULTAT:")
         print(f"         Score: {best['score']:.4f}")
         print(f"         Direcție: {best['direction']}")
@@ -824,9 +899,14 @@ def brute_force_alignment(
         
         # Salvăm configurația
         config_path = raster_dir / "brute_force_best_config.json"
-        with open(config_path, 'w') as f:
-            json.dump(best, f, indent=2)
-        print(f"      📄 Salvat: {config_path.name}")
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(best, f, indent=2)
+            print(f"      📄 Salvat: {config_path.name}")
+        except OSError as e:
+            if e.errno == 28:
+                print(f"      ⚠️ Disc plin: nu s-a putut salva {config_path.name}")
+            raise
         
         # Generăm vizualizare pentru cel mai bun rezultat
         if best['direction'] == 'api_to_orig':
@@ -853,8 +933,17 @@ def brute_force_alignment(
         overlay_binary[y_pos:y_pos+th, x_pos:x_pos+tw, 0] = template_scaled  # Blue
         
         best_overlay_path = raster_dir / "brute_force_best_overlay.png"
-        cv2.imwrite(str(best_overlay_path), overlay_binary)
-        print(f"      📄 Salvat: {best_overlay_path.name}")
+        overlay_to_save = _maybe_resize_to_standard(overlay_binary)
+        try:
+            if not cv2.imwrite(str(best_overlay_path), overlay_to_save):
+                print(f"      ⚠️ Nu s-a putut salva {best_overlay_path.name} (posibil disc plin)")
+        except OSError as e:
+            if e.errno == 28:
+                print(f"      ⚠️ Disc plin: nu s-a salvat {best_overlay_path.name}")
+            else:
+                raise
+        else:
+            print(f"      📄 Salvat: {best_overlay_path.name} (sizing max {MAX_OVERLAY_OUTPUT_SIDE}px)")
         
         # walls_brute.png: același overlay + punct albastru la fiecare capăt de perete din Raster
         # Coordonatele din JSON sunt în REQUEST space (imaginea trimisă la API); trebuie request→mask→overlay

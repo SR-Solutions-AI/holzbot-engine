@@ -2389,6 +2389,17 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
     # Salvăm scale-urile
     # ✅ IMPORTANT: Salvăm room_scales.json chiar dacă room_scales este gol sau dacă au fost erori
     # Acest fișier este necesar pentru workflow-ul ulterior
+    # Când nu avem nici o cameră (0 rooms), folosim o scară estimată ca fallback ca pipeline-ul să nu crape
+    estimated_scale = False
+    if total_area_m2 <= 0 or total_area_px <= 0:
+        img_area_px = h_orig * w_orig
+        if img_area_px > 0:
+            DEFAULT_PLAN_AREA_M2 = 70.0
+            total_area_m2 = float(DEFAULT_PLAN_AREA_M2)
+            total_area_px = int(img_area_px)
+            m_px = np.sqrt(total_area_m2 / total_area_px)
+            estimated_scale = True
+            print(f"      ⚠️ 0 camere detectate: folosesc scară estimată {m_px:.6f} m/px (presupunere {DEFAULT_PLAN_AREA_M2} m² pentru întreg planul)")
     try:
         scale_data = {
             'rooms': room_scales if room_scales else {},
@@ -2396,7 +2407,8 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             'total_area_px': int(total_area_px) if total_area_px > 0 else 0,
             'm_px': float(m_px) if m_px is not None and m_px > 0 else None,
             'weighted_average_m_px': float(m_px) if m_px is not None and m_px > 0 else None,
-            'room_scales': room_scales if room_scales else {}  # Format compatibil cu scale/jobs.py
+            'room_scales': room_scales if room_scales else {},
+            'estimated_scale': estimated_scale,
         }
         with open(output_dir / "room_scales.json", 'w', encoding='utf-8') as f:
             json.dump(scale_data, f, indent=2, ensure_ascii=False)

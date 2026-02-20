@@ -2297,7 +2297,7 @@ def run_cubicasa_detection(
                             "x-api-key": raster_api_key,
                             "Content-Type": "application/json"
                         }
-                        max_attempts = 3
+                        max_attempts = 6
                         raster_valid = False
                         for attempt in range(max_attempts):
                             if attempt > 0:
