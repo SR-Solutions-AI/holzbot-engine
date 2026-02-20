@@ -32,7 +32,6 @@ from .raster_api import (
     call_raster_api,
     generate_raster_images,
     generate_api_walls_mask,
-    validate_api_walls_mask,
     brute_force_alignment,
     apply_alignment_and_generate_overlay,
     generate_crop_from_raster,
@@ -2773,20 +2772,8 @@ def run_cubicasa_detection(
                                     print(f"      ⚠️ Eroare brute force: {e}")
                                     traceback.print_exc()
                             
-                                # Validare mască: camere nu trebuie „inundate” de pixeli pereți
-                                if api_walls_mask is not None and data.get('rooms'):
-                                    raster_valid, msg = validate_api_walls_mask(
-                                        api_walls_mask, data.get('rooms', [])
-                                    )
-                                    if raster_valid:
-                                        break
-                                    if attempt < max_attempts - 1:
-                                        print(f"      ⚠️ Raster mască invalidă ({msg}). Reîncerc...")
-                                    else:
-                                        raise RuntimeError(
-                                            f"RasterScan a returnat mască invalidă de {max_attempts} ori: {msg}"
-                                        )
-                                else:
+                                # Mască acceptată (fără validare room ratio)
+                                if api_walls_mask is not None:
                                     break
                             else:
                                 print(f"      ⚠️ RasterScan API eroare: {response.status_code} - {response.text[:200]}")
