@@ -1,0 +1,7 @@
+{
+  "image_path": "/Users/paulb/Documents/holzbot-dynamic/holzbot-engine/output/24631fc7-1a41-4949-b82b-a51666e42f08/scale/plan_01_cluster_1/cubicasa_steps/raster_processing/walls_from_coords/plan_for_gemini_zones.png",
+  "http_status": 200,
+  "raw_text": "{\n  \"detections\": [\n    {\n      \"label\": \"garage\",\n      \"x_center_pct\": 66.5,\n      \"y_center_pct\": 31.5\n    },\n    {\n      \"label\": \"intrare_acoperita\",\n      \"x_center_pct\": 49.5,\n      \"y_center_pct\": 43.0\n    }\n  ]\n}",
+  "raw_text_length": 221,
+  "error": null
+}

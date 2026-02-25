@@ -29,6 +29,8 @@ PROMPT_BOXES = """You are an expert in visual analysis for architectural drawing
 1) FLOOR PLANS (Blueprints): Top-down plans of individual floors — e.g. GRUNDRISS KG, GRUNDRISS EG, GRUNDRISS OG, or any "Grundriss" / floor plan. For each one, return the exact label (e.g. "GRUNDRISS KG", "GRUNDRISS EG") and its bounding box.
 2) SIDE VIEWS & SECTIONS: Elevations (Ansicht Ost, Ansicht Süd, Ansicht West, Ansicht Nord) and sections (Schnitt A-A, etc.). For each such view, return its label and bounding box.
 
+CRITICAL FOR FLOOR PLANS: For each floor plan (blueprint), the bounding box must include the ENTIRE drawn floor plan: the building/house AND all attached areas (garage, terrace, balcony, covered entrance / Eingang überdacht, loggia, patio). Do NOT cut off garages, terraces, balconies or covered entrances. You may trim large empty margins and unrelated context (e.g. distant pools, separate gardens, legend text), but the box must show the full outline of the house including garage and any attached outdoor spaces so that room detection and scale work correctly.
+
 IGNORE: the general site/lot plan (if the whole page is one big site map, still extract any smaller floor-plan or elevation boxes inside it). Exclude 3D color renderings and project data tables in corners. Focus on technical drawings only.
 
 COORDINATE SYSTEM: Use bounding boxes in format [ymin, xmin, ymax, xmax] normalized on a scale of 0 to 1000. So the image width and height each map to 0–1000. Example: left half of image ≈ xmin 0, xmax 500; top 10% ≈ ymin 0, ymax 100.
@@ -41,6 +43,107 @@ Example format:
 [{"box_2d": [30, 15, 550, 485], "label": "GRUNDRISS KG"}, {"box_2d": [30, 510, 340, 970], "label": "Ansicht Süd"}, {"box_2d": [670, 15, 980, 550], "label": "Schnitt A-A"}]
 
 Output ONLY the raw JSON array. Start with [ and end with ]."""
+
+
+# Aliniere două măști de pereți: Gemini returnează procente (scara 0–1000), ca la box_2d
+PROMPT_WALL_ALIGNMENT = """You are an expert in aligning floor plan wall masks. You see TWO images:
+
+- IMAGE 1 = REFERENCE (original walls). This is the ground truth.
+- IMAGE 2 = TEMPLATE (detected walls, e.g. from API). It must be SCALED and SHIFTED to overlay exactly on IMAGE 1.
+
+Both show the SAME floor plan. No rotation: only scale and translation. Origin is top-left; x right, y down.
+
+Return a single JSON object with these keys. Use scale 0–1000 for percentages (like our coordinate standard):
+
+- "scale_1000": number 200–2000. Meaning: scale factor for IMAGE 2 so it matches IMAGE 1 size. 1000 = 1.0 (same size), 600 = 0.6 (shrink to 60%), 1200 = 1.2 (enlarge to 120%).
+- "offset_x_1000": number -500 to 500. Horizontal shift of the CENTER of (scaled) IMAGE 2 relative to the CENTER of IMAGE 1, in tenths of percent of IMAGE 1 width. 0 = centered; -500 = template center 50% of width to the left; 500 = 50% to the right.
+- "offset_y_1000": number -500 to 500. Same for vertical. 0 = centered; negative = up, positive = down.
+- "direction": "api_to_orig" (scale and place IMAGE 2 onto IMAGE 1) or "orig_to_api" (place IMAGE 1 onto IMAGE 2).
+- "confidence_1000": number 0–1000. How sure you are (0 = guess, 1000 = very confident).
+
+Reply with ONLY the JSON object. No markdown, no text before or after."""
+
+
+def get_gemini_wall_alignment(
+    reference_image_path: str | Path,
+    template_image_path: str | Path,
+) -> dict[str, Any] | None:
+    """
+    Trimite cele două măști (referință + template) la Gemini; returnează cum suprapune template peste referință.
+    Folosește același client și pattern ca get_gemini_boxes_for_page: procente în scară 0–1000.
+
+    Returns:
+        dict cu: scale (float 0.2–2.0), offset_x_pct, offset_y_pct (fracțiuni -0.5..0.5),
+        direction ("api_to_orig" | "orig_to_api"), confidence (0–1). Sau None la eroare.
+    """
+    client = setup_gemini_client()
+    if not client:
+        return None
+
+    ref_path = Path(reference_image_path)
+    tpl_path = Path(template_image_path)
+    if not ref_path.is_file() or not tpl_path.is_file():
+        return None
+
+    try:
+        img_ref = Image.open(ref_path).convert("RGB")
+        img_tpl = Image.open(tpl_path).convert("RGB")
+    except Exception:
+        return None
+
+    try:
+        response = client.generate_content(
+            [PROMPT_WALL_ALIGNMENT, img_ref, img_tpl],
+            generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 512,
+            },
+            safety_settings=_GEMINI_SAFETY,
+        )
+    except Exception as e:
+        print(f"      ⚠️ Gemini wall alignment: {e}")
+        return None
+
+    raw = _get_response_text(response)
+    if not raw or not raw.strip():
+        return None
+
+    raw = raw.strip()
+    start, end = raw.find("{"), raw.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        out = json.loads(raw[start:end])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(out, dict):
+        return None
+
+    # Normalize din 0–1000 la valorile folosite de raster_api
+    scale_1000 = out.get("scale_1000")
+    if scale_1000 is not None:
+        scale = float(scale_1000) / 1000.0
+        scale = max(0.2, min(2.0, scale))
+    else:
+        scale = 1.0
+    ox = out.get("offset_x_1000")
+    oy = out.get("offset_y_1000")
+    offset_x_pct = (float(ox) / 1000.0) if ox is not None else 0.0  # -0.5 .. 0.5
+    offset_y_pct = (float(oy) / 1000.0) if oy is not None else 0.0
+    offset_x_pct = max(-0.5, min(0.5, offset_x_pct))
+    offset_y_pct = max(-0.5, min(0.5, offset_y_pct))
+    conf = out.get("confidence_1000")
+    confidence = (float(conf) / 1000.0) if conf is not None else 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    direction = "api_to_orig" if str(out.get("direction", "api_to_orig")).strip().lower() != "orig_to_api" else "orig_to_api"
+
+    return {
+        "scale": scale,
+        "offset_x_pct": offset_x_pct,
+        "offset_y_pct": offset_y_pct,
+        "direction": direction,
+        "confidence": confidence,
+    }
 
 
 def _get_response_text(response: Any) -> str:
@@ -214,8 +317,24 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         print(f"   {preview!r}")
         print("   [Gemini Crop] Încerc reparare cu ChatGPT...")
         items = _repair_json_with_chatgpt(raw)
-        if not items:
-            return []
+    if not items:
+        print("   [Gemini Crop] Retry: re-apel Gemini pentru aceeași pagină...")
+        try:
+            response = client.generate_content(
+                [PROMPT_BOXES, img],
+                generation_config={"temperature": 0.0, "max_output_tokens": 4096},
+                safety_settings=_GEMINI_SAFETY,
+            )
+            raw2 = _get_response_text(response)
+            if raw2:
+                raw2 = raw2.strip()
+                items = _extract_json_array(raw2)
+                if not items:
+                    items = _repair_json_with_chatgpt(raw2)
+        except Exception as e:
+            print(f"   [Gemini Crop] Retry Gemini eroare: {e}")
+    if not items:
+        return []
 
     # Debug: ce a returnat Gemini (înainte de validare)
     for i, it in enumerate(items):
@@ -224,60 +343,87 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         print(f"   [Gemini Crop] Brut {i+1}: label={lbl!r} box_2d={box}")
     print(f"   [Gemini Crop] Total brut de la Gemini: {len(items)} zone")
 
-    valid = []
-    n_floor, n_side = 0, 0
-    for i, item in enumerate(items):
-        if not isinstance(item, dict):
-            print(f"   [Gemini Crop] Item {i}: skip (nu e dict)")
-            continue
-        box = item.get("box_2d")
-        raw_label = (item.get("label") or "").strip()
-        label_lower = raw_label.lower()
-        # Normalize ß → ss so "geschoss" matches "geschoß"
-        label_norm = label_lower.replace("\u00df", "ss")
-        # Map to "floor" (blueprint) or "side_view" (elevation/section)
-        if label_lower in ("floor", "side_view"):
-            label = label_lower
-        elif any(k in label_norm for k in (
-            "grundriss", "etaj", "floor", "plan", " eg ", " eg.", " og ", " og.", ".og", "blueprint",
-            "parter", "level", "nivel",
-            "erdgeschoss", "obergeschoss", "geschoss",
-            "keller", "kellergeschoss",
-            "dach", "dachgeschoss",
-        )) or " kg " in label_norm or " kg." in label_norm or label_norm.startswith("kg "):
-            label = "floor"
-        else:
-            label = "side_view"  # Ansicht, Schnitt, section, elevation, etc.
-        if not isinstance(box, (list, tuple)) or len(box) != 4:
-            print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box invalid sau len != 4)")
-            continue
+    def _validate_items(item_list: list) -> list[dict[str, Any]]:
+        out = []
+        for i, item in enumerate(item_list):
+            if not isinstance(item, dict):
+                print(f"   [Gemini Crop] Item {i}: skip (nu e dict)")
+                continue
+            box = item.get("box_2d")
+            raw_label = (item.get("label") or "").strip()
+            label_lower = raw_label.lower()
+            label_norm = label_lower.replace("\u00df", "ss")
+            if label_lower in ("floor", "side_view"):
+                label = label_lower
+            elif any(k in label_norm for k in (
+                "grundriss", "etaj", "floor", "plan", " eg ", " eg.", " og ", " og.", ".og", "blueprint",
+                "parter", "level", "nivel",
+                "erdgeschoss", "obergeschoss", "geschoss",
+                "keller", "kellergeschoss",
+                "dach", "dachgeschoss",
+            )) or " kg " in label_norm or " kg." in label_norm or label_norm.startswith("kg "):
+                label = "floor"
+            else:
+                label = "side_view"
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box invalid sau len != 4)")
+                continue
+            try:
+                ymin, xmin, ymax, xmax = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            except (TypeError, ValueError):
+                print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box nu sunt numere)")
+                continue
+            mx = max(ymin, xmin, ymax, xmax)
+            if mx > 1.0 and mx <= 100.0:
+                ymin, xmin, ymax, xmax = ymin / 100.0, xmin / 100.0, ymax / 100.0, xmax / 100.0
+            elif mx > 100.0 and mx <= 1000.0:
+                ymin, xmin, ymax, xmax = ymin / 1000.0, xmin / 1000.0, ymax / 1000.0, xmax / 1000.0
+            elif mx > 1000.0:
+                print(f"   [Gemini Crop] Item {i} label={raw_label!r} box={box}: skip (coordonate >1000)")
+                continue
+            ymin = max(0.0, min(1.0, ymin))
+            xmin = max(0.0, min(1.0, xmin))
+            ymax = max(0.0, min(1.0, ymax))
+            xmax = max(0.0, min(1.0, xmax))
+            if ymax <= ymin or xmax <= xmin:
+                print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box invalid: ymax<=ymin sau xmax<=xmin)")
+                continue
+            out.append({"box_2d": [ymin, xmin, ymax, xmax], "label": label})
+        return out
+
+    valid = _validate_items(items)
+    # Dacă Gemini a returnat zone dar toate au box invalid: retry Gemini o dată, apoi eventual reparare ChatGPT
+    if len(items) > 0 and len(valid) == 0:
+        print("   [Gemini Crop] Toate zonele au box invalid → retry Gemini pentru aceeași pagină...")
         try:
-            ymin, xmin, ymax, xmax = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-        except (TypeError, ValueError):
-            print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box nu sunt numere)")
-            continue
-        # Normalize to 0-1: accept 0-1000 (Gemini standard), 0-100 (%), or 0-1 (fractions)
-        mx = max(ymin, xmin, ymax, xmax)
-        if mx > 1.0 and mx <= 100.0:
-            ymin, xmin, ymax, xmax = ymin / 100.0, xmin / 100.0, ymax / 100.0, xmax / 100.0
-        elif mx > 100.0 and mx <= 1000.0:
-            ymin, xmin, ymax, xmax = ymin / 1000.0, xmin / 1000.0, ymax / 1000.0, xmax / 1000.0
-        elif mx > 1000.0:
-            print(f"   [Gemini Crop] Item {i} label={raw_label!r} box={box}: skip (coordonate >1000, probabil pixeli)")
-            continue  # likely pixels; skip
-        ymin = max(0.0, min(1.0, ymin))
-        xmin = max(0.0, min(1.0, xmin))
-        ymax = max(0.0, min(1.0, ymax))
-        xmax = max(0.0, min(1.0, xmax))
-        if ymax <= ymin or xmax <= xmin:
-            print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box invalid: ymax<=ymin sau xmax<=xmin)")
-            continue
-        valid.append({"box_2d": [ymin, xmin, ymax, xmax], "label": label})
-        if label == "floor":
-            n_floor += 1
-        else:
-            n_side += 1
+            response = client.generate_content(
+                [PROMPT_BOXES, img],
+                generation_config={"temperature": 0.0, "max_output_tokens": 4096},
+                safety_settings=_GEMINI_SAFETY,
+            )
+            raw_retry = _get_response_text(response)
+            if raw_retry:
+                raw_retry = raw_retry.strip()
+                items = _extract_json_array(raw_retry)
+                if not items:
+                    items = _repair_json_with_chatgpt(raw_retry)
+                if items:
+                    valid = _validate_items(items)
+                    if valid:
+                        print(f"   [Gemini Crop] După retry: {len(valid)} zone valide.")
+        except Exception as e:
+            print(f"   [Gemini Crop] Retry Gemini (box invalid) eroare: {e}")
+        if len(valid) == 0 and len(items) > 0:
+            print("   [Gemini Crop] Încerc reparare cu ChatGPT (text → JSON)...")
+            items_repaired = _repair_json_with_chatgpt(raw)
+            if items_repaired:
+                items = items_repaired
+                valid = _validate_items(items)
+                if valid:
+                    print(f"   [Gemini Crop] După reparare ChatGPT: {len(valid)} zone valide.")
     if items:
+        n_floor = sum(1 for v in valid if v["label"] == "floor")
+        n_side = len(valid) - n_floor
         print(f"   [Gemini Crop] Parsat: {len(items)} zone → {n_floor} floor, {n_side} side_view (valid total: {len(valid)})")
     return valid
 

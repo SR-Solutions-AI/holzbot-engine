@@ -76,10 +76,9 @@ def calculate_pricing_for_plan(
         if key in mat_finisaj:
             print(f"   {key} = {mat_finisaj[key]}")
     
-    # Normalize user-provided strings (sursă: tag system_type sau câmp tipSistem)
+    # Wall structure: prefer per-floor Wandaufbau (Außenwände/Innenwände); fallback to legacy system_type/tipSistem if no Wandaufbau
+    wandaufbau_data = frontend_input.get("wandaufbau", {})
     raw_system = str(_fv("system_type") or sist_constr.get("tipSistem", "HOLZRAHMEN") or "HOLZRAHMEN").strip()
-
-    # SYSTEM normalization to match coeff keys
     sys_u = raw_system.upper()
     if "HOLZRAHMEN" in sys_u:
         system_constructie = "HOLZRAHMEN"
@@ -131,10 +130,17 @@ def calculate_pricing_for_plan(
             mat_finisaj.get("finisajInteriorBeci") or mat_finisaj.get("finisajInterior", "Tencuială"),
             "Tencuială"
         )
-        cost_walls_b = calculate_walls_details(
-            system_coeffs, w_int_net_structure, 0.0,
-            system=system_constructie
-        )
+        _wb_coeffs = pricing_coeffs.get("wandaufbau", {})
+        _wb_beci_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
+        if _wb_coeffs and _wb_beci_innen:
+            _p_beci = float(_wb_coeffs.get("innen", {}).get(_wb_beci_innen, 280))
+            _cost_b_int = w_int_net_structure * _p_beci
+            cost_walls_b = {"total_cost": round(_cost_b_int, 2), "detailed_items": [{"category": "walls_structure_int", "name": f"Pereți Beci ({_wb_beci_innen})", "area_m2": round(w_int_net_structure, 2), "unit_price": round(_p_beci, 2), "cost": round(_cost_b_int, 2)}]}
+        else:
+            cost_walls_b = calculate_walls_details(
+                system_coeffs, w_int_net_structure, 0.0,
+                system=system_constructie
+            )
         cost_finishes_b = calculate_finishes_details(
             finish_coeffs, w_int_net_finish, 0.0,
             type_int=finish_int_beci, type_ext="Tencuială",
@@ -302,12 +308,36 @@ def calculate_pricing_for_plan(
         if has_semineu_old:
             tip_semineu = "Klassischer Holzofen"  # Default pentru vechiul câmp boolean
     
-    # 4. CALCULE COMPONENTE (NESCHIMBAT - DOAR INPUTURILE SUNT NOI)
-    
-    cost_walls = calculate_walls_details(
-        system_coeffs, w_int_net_structure, w_ext_net,
-        system=system_constructie
-    )
+    # 4. CALCULE COMPONENTE – pereți: Wandaufbau per etaj dacă există, altfel system_constructie (legacy)
+    wandaufbau_coeffs = pricing_coeffs.get("wandaufbau", {})
+    _wau = (finish_ext_key or "").replace("fatada_", "außenwande_").replace("fatadaMansarda", "außenwandeMansarda")
+    _win = (finish_int_key or "").replace("finisajInterior_", "innenwande_").replace("finisajInteriorMansarda", "innenwandeMansarda").replace("finisajInteriorBeci", "innenwandeBeci")
+    sel_aussen = (wandaufbau_data.get(_wau) or "").strip() if _wau else ""
+    sel_innen = (wandaufbau_data.get(_win) or "").strip() if _win else ""
+    use_wandaufbau = wandaufbau_coeffs and (sel_aussen or sel_innen or wandaufbau_data.get("außenwande_ground") or wandaufbau_data.get("innenwande_ground"))
+    if use_wandaufbau:
+        aussen_map = wandaufbau_coeffs.get("aussen", {})
+        innen_map = wandaufbau_coeffs.get("innen", {})
+        if not sel_aussen:
+            sel_aussen = wandaufbau_data.get("außenwande_ground") or wandaufbau_data.get("außenwandeMansarda") or ""
+        if not sel_innen:
+            sel_innen = wandaufbau_data.get("innenwande_ground") or wandaufbau_data.get("innenwandeMansarda") or ""
+        price_aussen = float(aussen_map.get(sel_aussen, 280))
+        price_innen = float(innen_map.get(sel_innen, 280))
+        cost_int = w_int_net_structure * price_innen
+        cost_ext = w_ext_net * price_aussen
+        cost_walls = {
+            "total_cost": round(cost_int + cost_ext, 2),
+            "detailed_items": [
+                {"category": "walls_structure_int", "name": f"Pereți Interiori ({sel_innen or 'Wandaufbau'})", "material": sel_innen or "Wandaufbau", "construction_mode": "Wandaufbau", "area_m2": round(w_int_net_structure, 2), "unit_price": round(price_innen, 2), "cost": round(cost_int, 2)},
+                {"category": "walls_structure_ext", "name": f"Pereți Exteriori ({sel_aussen or 'Wandaufbau'})", "material": sel_aussen or "Wandaufbau", "construction_mode": "Wandaufbau", "area_m2": round(w_ext_net, 2), "unit_price": round(price_aussen, 2), "cost": round(cost_ext, 2)},
+            ]
+        }
+    else:
+        cost_walls = calculate_walls_details(
+            system_coeffs, w_int_net_structure, w_ext_net,
+            system=system_constructie
+        )
     
     cost_finishes = calculate_finishes_details(
         finish_coeffs, w_int_net_finish, w_ext_net,
@@ -324,10 +354,63 @@ def calculate_pricing_for_plan(
         openings_coeffs, openings_data,
         frontend_data=frontend_input
     )
-    
-    cost_floors_ceilings = calculate_floors_details(
-        area_coeffs, floor_area, ceiling_area
-    )
+
+    # Podea / tavan: dacă există alegere Bodenaufbau, Deckenaufbau, Bodenbelag per etaj, folosim prețurile din aceste opțiuni
+    bdb_data = frontend_input.get("bodenDeckeBelag", {})
+    bdb_coeffs = pricing_coeffs.get("boden_decke_belag", {})
+    use_boden_decke_belag = bool(bdb_coeffs and (bdb_data.get("bodenaufbau_ground") or bdb_data.get("deckenaufbau_ground") or bdb_data.get("bodenbelagBeci") or bdb_data.get("deckenaufbauBeci")))
+    if use_boden_decke_belag:
+        bodenaufbau_map = bdb_coeffs.get("bodenaufbau", {})
+        deckenaufbau_map = bdb_coeffs.get("deckenaufbau", {})
+        bodenbelag_map = bdb_coeffs.get("bodenbelag", {})
+        cost_floor_str, cost_ceil_str, cost_belag = 0.0, 0.0, 0.0
+        items: list = []
+        if is_basement_plan:
+            opt_belag = (bdb_data.get("bodenbelagBeci") or "").strip()
+            if opt_belag:
+                price_b = float(bodenbelag_map.get(opt_belag, 0))
+                cost_belag = floor_area * price_b
+                items.append({"category": "bodenbelag", "name": f"Bodenbelag Keller ({opt_belag})", "area_m2": round(floor_area, 2), "unit_price": round(price_b, 2), "cost": round(cost_belag, 2)})
+            opt_decken_beci = (bdb_data.get("deckenaufbauBeci") or "").strip()
+            if opt_decken_beci:
+                price_d_beci = float(deckenaufbau_map.get(opt_decken_beci, 0))
+                cost_ceil_str = ceiling_area * price_d_beci
+                items.append({"category": "deckenaufbau", "name": f"Deckenaufbau Keller ({opt_decken_beci})", "area_m2": round(ceiling_area, 2), "unit_price": round(price_d_beci, 2), "cost": round(cost_ceil_str, 2)})
+        else:
+            if is_ground_floor:
+                suffix = "ground"
+            elif is_mansarda:
+                suffix = "Mansarda"
+            else:
+                suffix = f"floor_{intermediate_floor_index + 1}"
+            # Fără beci: la parter nu cerem/calculăm structura podei (Bodenaufbau), doar pardoseală și tavan
+            has_basement = tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
+            skip_bodenaufbau = (suffix == "ground" and not has_basement)
+            bodenaufbau_key = "bodenaufbauMansarda" if suffix == "Mansarda" else f"bodenaufbau_{suffix}"
+            bodenbelag_key = "bodenbelagMansarda" if suffix == "Mansarda" else f"bodenbelag_{suffix}"
+            if not skip_bodenaufbau:
+                opt_boden = (bdb_data.get(bodenaufbau_key) or "").strip()
+                if opt_boden:
+                    price_b = float(bodenaufbau_map.get(opt_boden, 0))
+                    cost_floor_str = floor_area * price_b
+                    items.append({"category": "bodenaufbau", "name": f"Bodenaufbau ({opt_boden})", "area_m2": round(floor_area, 2), "unit_price": round(price_b, 2), "cost": round(cost_floor_str, 2)})
+            opt_belag_sel = (bdb_data.get(bodenbelag_key) or "").strip()
+            if opt_belag_sel:
+                price_bl = float(bodenbelag_map.get(opt_belag_sel, 0))
+                cost_belag = floor_area * price_bl
+                items.append({"category": "bodenbelag", "name": f"Bodenbelag ({opt_belag_sel})", "area_m2": round(floor_area, 2), "unit_price": round(price_bl, 2), "cost": round(cost_belag, 2)})
+            decken_key = "deckenaufbauMansarda" if suffix == "Mansarda" else f"deckenaufbau_{suffix}"
+            opt_decken = (bdb_data.get(decken_key) or "").strip()
+            if opt_decken:
+                price_d = float(deckenaufbau_map.get(opt_decken, 0))
+                cost_ceil_str = ceiling_area * price_d
+                items.append({"category": "deckenaufbau", "name": f"Deckenaufbau ({opt_decken})", "area_m2": round(ceiling_area, 2), "unit_price": round(price_d, 2), "cost": round(cost_ceil_str, 2)})
+        total_bdb = cost_floor_str + cost_ceil_str + cost_belag
+        cost_floors_ceilings = {"total_cost": round(total_bdb, 2), "detailed_items": items} if items else calculate_floors_details(area_coeffs, floor_area, ceiling_area)
+    else:
+        cost_floors_ceilings = calculate_floors_details(
+            area_coeffs, floor_area, ceiling_area
+        )
 
     if roof_data:
         # Aici e un mic truc: roof_data are nevoie de coeficienți integrați
@@ -452,11 +535,25 @@ def calculate_pricing_for_plan(
         print(f"      - Pereți finisaje: {w_int_net_finish:.2f} m² × {coeff_walls:.0%} = {w_int_net_finish_basement:.2f} m²")
         print(f"      - Podele: {floor_area:.2f} m² × {coeff_floors:.0%} = {floor_area_basement:.2f} m²")
         
-        # Pereți interiori pentru basement (folosim ariile calculate cu coeficienții)
-        cost_walls_basement = calculate_walls_details(
-            system_coeffs, w_int_net_structure_basement, 0.0,
-            system=system_constructie
-        )
+        # Pereți interiori pentru basement: Wandaufbau (Keller) dacă există, altfel system_constructie
+        if use_wandaufbau and (wandaufbau_data.get("innenwandeBeci") or wandaufbau_data.get("außenwandeBeci")):
+            _wb_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
+            _wb_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
+            _p_innen = float(wandaufbau_coeffs.get("innen", {}).get(_wb_innen, 280))
+            _p_aussen = float(wandaufbau_coeffs.get("aussen", {}).get(_wb_aussen, 280))
+            _c_int_b = w_int_net_structure_basement * _p_innen
+            _c_ext_b = 0.0
+            cost_walls_basement = {
+                "total_cost": round(_c_int_b + _c_ext_b, 2),
+                "detailed_items": [
+                    {"category": "walls_structure_int", "name": f"Pereți Beci ({_wb_innen or 'Wandaufbau'})", "area_m2": round(w_int_net_structure_basement, 2), "unit_price": round(_p_innen, 2), "cost": round(_c_int_b, 2)},
+                ]
+            }
+        else:
+            cost_walls_basement = calculate_walls_details(
+                system_coeffs, w_int_net_structure_basement, 0.0,
+                system=system_constructie
+            )
         
         # Finisaje interioare pentru basement (folosim ariile calculate cu coeficienții)
         cost_finishes_basement = calculate_finishes_details(
@@ -546,6 +643,67 @@ def calculate_pricing_for_plan(
         basement_type = "locuibil" if has_basement_livable else "nelocuibil"
         print(f"✅ [PRICING] Basement calculat ({basement_type}): {cost_basement['total_cost']:,.0f} EUR")
 
+    # Wintergärten & Balkone: din măsurători (boundary_m + area_m2) când există, altfel pauschal
+    cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
+    if is_ground_floor:
+        struct_clad = frontend_input.get("structuraCladirii", {})
+        wg_balkone = frontend_input.get("wintergaertenBalkone", {})
+        wb_coeffs = pricing_coeffs.get("wintergaerten_balkone", {}) or {}
+        bw_measurements = area_data.get("balcon_wintergarden") or []
+        items = []
+
+        if bw_measurements:
+            # Cost din lungime perimetru (EUR/m) + suprafață (EUR/m²) pentru podea/tavan
+            for entry in bw_measurements:
+                t = (entry.get("type") or "balcon").strip().lower()
+                boundary_m = float(entry.get("boundary_m") or 0)
+                area_m2 = float(entry.get("area_m2") or 0)
+                idx = entry.get("index", 0)
+                if t == "balcon" and struct_clad.get("hasBalkone"):
+                    typ = (wg_balkone.get("balkonTyp") or "").strip() or "default"
+                    coeffs = (wb_coeffs.get("balkon") or {})
+                    raw = coeffs.get(typ) if isinstance(coeffs, dict) else None
+                    if isinstance(raw, (int, float)):
+                        eur_m, eur_m2 = float(raw), 0.0
+                    elif isinstance(raw, dict):
+                        eur_m = float(raw.get("perimeter_eur_m") or raw.get("eur_m", 0))
+                        eur_m2 = float(raw.get("area_eur_m2", 0))
+                    else:
+                        eur_m = float(coeffs.get("perimeter_eur_m", 0) or coeffs.get("eur_m", 0)) if isinstance(coeffs, dict) else 0.0
+                        eur_m2 = float(coeffs.get("area_eur_m2", 0)) if isinstance(coeffs, dict) else 0.0
+                    cost = boundary_m * eur_m + area_m2 * eur_m2
+                    name = f"Balkon {idx + 1}" if len(bw_measurements) > 1 else "Balkone"
+                    items.append({"category": "balkon", "name": name, "cost": round(cost, 2), "total_cost": round(cost, 2), "boundary_m": boundary_m, "area_m2": area_m2})
+                elif t == "wintergarden" and struct_clad.get("hasWintergarden"):
+                    typ = (wg_balkone.get("wintergartenTyp") or "").strip() or "default"
+                    coeffs = (wb_coeffs.get("wintergarten") or {})
+                    raw = coeffs.get(typ) if isinstance(coeffs, dict) else None
+                    if isinstance(raw, (int, float)):
+                        eur_m, eur_m2 = float(raw), 0.0
+                    elif isinstance(raw, dict):
+                        eur_m = float(raw.get("perimeter_eur_m") or raw.get("eur_m", 0))
+                        eur_m2 = float(raw.get("area_eur_m2", 0))
+                    else:
+                        eur_m = float(coeffs.get("perimeter_eur_m", 0) or coeffs.get("eur_m", 0)) if isinstance(coeffs, dict) else 0.0
+                        eur_m2 = float(coeffs.get("area_eur_m2", 0)) if isinstance(coeffs, dict) else 0.0
+                    cost = boundary_m * eur_m + area_m2 * eur_m2
+                    name = f"Wintergarten {idx + 1}" if len(bw_measurements) > 1 else "Wintergärten"
+                    items.append({"category": "wintergarten", "name": name, "cost": round(cost, 2), "total_cost": round(cost, 2), "boundary_m": boundary_m, "area_m2": area_m2})
+        if not items and (struct_clad.get("hasWintergarden") or struct_clad.get("hasBalkone")):
+            # Fallback pauschal (preț fix per tip)
+            if struct_clad.get("hasWintergarden") and wg_balkone.get("wintergartenTyp"):
+                typ = (wg_balkone.get("wintergartenTyp") or "").strip()
+                price = float(wb_coeffs.get("wintergarten", {}).get(typ, 0) if isinstance(wb_coeffs.get("wintergarten"), dict) else 0)
+                items.append({"category": "wintergarten", "name": f"Wintergärten ({typ})", "cost": round(price, 2), "total_cost": round(price, 2)})
+            if struct_clad.get("hasBalkone") and wg_balkone.get("balkonTyp"):
+                typ = (wg_balkone.get("balkonTyp") or "").strip()
+                price = float(wb_coeffs.get("balkon", {}).get(typ, 0) if isinstance(wb_coeffs.get("balkon"), dict) else 0)
+                items.append({"category": "balkon", "name": f"Balkone ({typ})", "cost": round(price, 2), "total_cost": round(price, 2)})
+        if items:
+            cost_wintergaerten_balkone = {"total_cost": round(sum(i.get("cost", 0) for i in items), 2), "detailed_items": items}
+            total_plan_cost += cost_wintergaerten_balkone["total_cost"]
+            print(f"✅ [PRICING] Wintergärten & Balkone: {cost_wintergaerten_balkone['total_cost']:,.0f} EUR")
+
     # Breakdown: componente excluse prin nivel ofertă apar cu cost 0; structura e afișată cu factorii acces × teren aplicați
     def _zero_if_excluded(cost_dict: dict, include: bool) -> dict:
         if include:
@@ -580,6 +738,7 @@ def calculate_pricing_for_plan(
             "utilities": _zero_if_excluded(cost_utilities, include_utilities),
             "stairs": _zero_if_excluded(cost_stairs, include_stairs),
             "fireplace": _zero_if_excluded(cost_fireplace, include_fireplace),
-            "basement": cost_basement
+            "basement": cost_basement,
+            "wintergaerten_balkone": cost_wintergaerten_balkone
         }
     }

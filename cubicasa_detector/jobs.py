@@ -163,3 +163,34 @@ def run_cubicasa_phase2(
         run_phase=2,
         raster_timings=raster_timings,
     )
+
+
+def run_cubicasa_phase2_brute_only(
+    output_dir: Path,
+    gemini_api_key: str | None = None,
+    raster_timings: list | None = None,
+    no_cache: bool = False,
+) -> dict:
+    """
+    Rulează doar brute force + overlay (fără crop, walls_from_coords, garaj, interior/exterior etc.).
+    Presupune că phase1 a rulat deja (există 02_ai_walls_closed.png și raster/).
+    Pentru script minimal: doar Raster API + pașii brute force.
+    no_cache: dacă True, nu folosește brute_force_best_config.json; recalculează mereu.
+    """
+    if not gemini_api_key:
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY lipsește!")
+    weights_file, device = _get_weights_and_device()
+    print(f"🤖 CubiCasa Phase 2 (brute only): {output_dir}")
+    return run_cubicasa_detection(
+        image_path="",
+        model_weights_path=str(weights_file),
+        output_dir=str(output_dir),
+        gemini_api_key=gemini_api_key,
+        device=device,
+        save_debug_steps=True,
+        run_phase=3,  # doar brute force + overlay
+        raster_timings=raster_timings,
+        brute_force_no_cache=no_cache,
+    )

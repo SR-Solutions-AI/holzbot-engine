@@ -38,9 +38,11 @@ def find_missing_wall(
     step_interval: int = 2000,
     wall_threshold: int = 20,
     max_iterations: int = 500000,
+    wall_mask: np.ndarray | None = None,
 ):
     """
     Detectează peretele lipsă dintr-o cameră cu BFS din punctul marker.
+    Bariera: orice pixel de perete blochează flood-ul; prin găuri reale flood-ul poate ieși.
 
     Args:
         img: Imagine BGR (plan cu pereți albi, fundal negru; opțional bulina roșie).
@@ -48,8 +50,10 @@ def find_missing_wall(
         stable_min_px: Pixeli consecutivi cu aceeași dimensiune pentru Faza 2.
         steps_dir: Dacă setat, salvează frame-uri în acest folder.
         step_interval: La câte iterații salvează un frame (dacă steps_dir).
-        wall_threshold: Valoare minimă gri considerată perete.
+        wall_threshold: Valoare minimă gri considerată perete (folosit doar dacă wall_mask nu e dat).
         max_iterations: Limită BFS.
+        wall_mask: Mască binară (h,w) – pixel > 0 = perete. Dacă dată, se folosește ca barieră exactă
+            (flood-ul nu trece niciodată prin pereți; poate ieși doar prin zone cu 0). Ignoră wall_threshold.
 
     Returns:
         dict cu type, x, y1, y2 (vertical) sau type, y, x1, x2 (orizontal), sau None.
@@ -62,8 +66,11 @@ def find_missing_wall(
         img_bgr = img.copy()
 
     h, w = img.shape[:2]
-    wall = (gray > wall_threshold).astype(np.uint8)
     mask_red = _mask_red_dot(img_bgr)
+    if wall_mask is not None and wall_mask.shape[:2] == (h, w):
+        wall = (np.asarray(wall_mask) > 0).astype(np.uint8)
+    else:
+        wall = (gray > wall_threshold).astype(np.uint8)
     wall[mask_red > 0] = 0
 
     if start_x is None or start_y is None:
@@ -125,9 +132,15 @@ def _bfs_detect(
     stable_count = 0
     iteration = 0
 
+    touches_image_edge = False
+
     while queue and iteration < max_iterations:
         x, y = queue.popleft()
         iteration += 1
+        if x == 0 or x == w - 1 or y == 0 or y == h - 1:
+            touches_image_edge = True
+            # Opresc instant: flood-ul a atins marginea înainte de al 4-lea perete → anulăm
+            return None
 
         old = dict(cur)
         if x > cur["right"]:
@@ -156,37 +169,47 @@ def _bfs_detect(
             if stable_axis == "height":
                 escaped = cur["bottom"] > old["bottom"] or cur["top"] < old["top"]
                 if escaped:
+                    if touches_image_edge:
+                        return None  # Zona atinge marginea planului → nu poate fi închisă
                     result = {
                         "type": "vertical",
                         "x": x,
                         "y1": old["top"],
                         "y2": old["bottom"],
                     }
-                    if steps_dir is not None:
-                        _save_step(
-                            steps_dir, iteration, img_bgr, visited, cur, mask_red, result
-                        )
-                        _save_step(
-                            steps_dir, -1, img_bgr, visited, cur, mask_red, result
-                        )  # step_final.png
-                    return result
+                    result = _clip_segment_at_perpendicular_wall(result, wall, w, h)
+                    if result is not None:
+                        if steps_dir is not None:
+                            _save_step(
+                                steps_dir, iteration, img_bgr, visited, cur, mask_red, result
+                            )
+                            _save_step(
+                                steps_dir, -1, img_bgr, visited, cur, mask_red, result
+                            )  # step_final.png
+                        return result
+                    return None
             else:
                 escaped = cur["right"] > old["right"] or cur["left"] < old["left"]
                 if escaped:
+                    if touches_image_edge:
+                        return None  # Zona atinge marginea planului → nu poate fi închisă
                     result = {
                         "type": "horizontal",
                         "y": y,
                         "x1": old["left"],
                         "x2": old["right"],
                     }
-                    if steps_dir is not None:
-                        _save_step(
-                            steps_dir, iteration, img_bgr, visited, cur, mask_red, result
-                        )
-                        _save_step(
-                            steps_dir, -1, img_bgr, visited, cur, mask_red, result
-                        )  # step_final.png
-                    return result
+                    result = _clip_segment_at_perpendicular_wall(result, wall, w, h)
+                    if result is not None:
+                        if steps_dir is not None:
+                            _save_step(
+                                steps_dir, iteration, img_bgr, visited, cur, mask_red, result
+                            )
+                            _save_step(
+                                steps_dir, -1, img_bgr, visited, cur, mask_red, result
+                            )  # step_final.png
+                        return result
+                    return None
 
         if steps_dir is not None and iteration % step_interval == 0:
             _save_step(steps_dir, iteration, img_bgr, visited, cur, mask_red, None)
@@ -203,6 +226,55 @@ def _bfs_detect(
                 queue.append((nx, ny))
 
     return None
+
+
+def _clip_segment_at_perpendicular_wall(
+    result: dict,
+    wall: np.ndarray,
+    w: int,
+    h: int,
+) -> dict | None:
+    """
+    Taie segmentul astfel încât să nu treacă prin pereți perpendiculari.
+    - Segment vertical (x, y1..y2): taie la rândurile unde există perete orizontal (wall la (x±1, y)).
+    - Segment orizontal (x1..x2, y): taie la coloanele unde există perete vertical (wall la (x, y±1)).
+    """
+    if result["type"] == "vertical":
+        x = result["x"]
+        y1, y2 = result["y1"], result["y2"]
+        if y2 < y1:
+            y1, y2 = y2, y1
+        # Perete perpendicular = orizontal care traversează coloana x
+        y1_new, y2_new = y1, y2
+        for yy in range(y1, y2 + 1):
+            if 0 <= yy < h and ((x - 1 >= 0 and wall[yy, x - 1]) or (x + 1 < w and wall[yy, x + 1])):
+                y2_new = yy - 1  # Taie de la primul perete în jos
+                break
+        for yy in range(y2, y1 - 1, -1):
+            if 0 <= yy < h and ((x - 1 >= 0 and wall[yy, x - 1]) or (x + 1 < w and wall[yy, x + 1])):
+                y1_new = yy + 1  # Taie de la primul perete în sus
+                break
+        if y1_new > y2_new:
+            return None
+        return {"type": "vertical", "x": x, "y1": y1_new, "y2": y2_new}
+    else:
+        y = result["y"]
+        x1, x2 = result["x1"], result["x2"]
+        if x2 < x1:
+            x1, x2 = x2, x1
+        # Perete perpendicular = vertical care traversează rândul y
+        x1_new, x2_new = x1, x2
+        for xx in range(x1, x2 + 1):
+            if 0 <= xx < w and ((y - 1 >= 0 and wall[y - 1, xx]) or (y + 1 < h and wall[y + 1, xx])):
+                x2_new = xx - 1
+                break
+        for xx in range(x2, x1 - 1, -1):
+            if 0 <= xx < w and ((y - 1 >= 0 and wall[y - 1, xx]) or (y + 1 < h and wall[y + 1, xx])):
+                x1_new = xx + 1
+                break
+        if x1_new > x2_new:
+            return None
+        return {"type": "horizontal", "y": y, "x1": x1_new, "x2": x2_new}
 
 
 def _save_step(
@@ -260,11 +332,13 @@ def draw_plan_closed(
     mask_red: np.ndarray | None = None,
     color: tuple = (255, 255, 255),
     thickness: int = 1,
-    extension_px: int = 6,
+    extension_px: int = 0,
 ) -> np.ndarray:
     """
     Imagine finală: plan fără bulina roșie, segment perete lipsă desenat alb 1px.
-    extension_px prelungește segmentul ca să se lipească de pereții existenți.
+    Segmentul este desenat exact ca în step_final (segmentul albastru): fără prelungire,
+    astfel încât să nu treacă de pereții perpendiculari (același result clipat).
+    extension_px=0 implicit; dacă se pasează >0, se prelungește (poate traversa pereți).
     """
     out = img.copy()
     if mask_red is not None:
@@ -287,18 +361,23 @@ def check_garage_flood_touches_edge(
     start_x: int,
     start_y: int,
     wall_threshold: int = 20,
+    wall_mask: np.ndarray | None = None,
 ) -> tuple[bool, np.ndarray]:
     """
     Flood fill complet din (start_x, start_y). Returnează (touches_edge, visited).
     Dacă flood-ul atinge cel puțin o margine (x=0, x=w-1, y=0, y=h-1) → touches_edge=True.
+    Bariera: orice pixel de perete blochează; dacă e dat wall_mask, se folosește ca barieră exactă.
     """
     if len(img.shape) == 2:
         gray = img.copy()
     else:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
-    wall = (gray > wall_threshold).astype(np.uint8)
     mask_red = _mask_red_dot(img) if len(img.shape) == 3 else np.zeros((h, w), dtype=np.uint8)
+    if wall_mask is not None and wall_mask.shape[:2] == (h, w):
+        wall = (np.asarray(wall_mask) > 0).astype(np.uint8)
+    else:
+        wall = (gray > wall_threshold).astype(np.uint8)
     wall[mask_red > 0] = 0
 
     visited = np.zeros((h, w), dtype=np.uint8)
@@ -317,6 +396,67 @@ def check_garage_flood_touches_edge(
                 queue.append((nx, ny))
 
     return touches_edge, visited
+
+
+def compute_zone_boundary_length_and_area(
+    wall_mask: np.ndarray,
+    zone_center_x: int,
+    zone_center_y: int,
+    h: int,
+    w: int,
+) -> tuple[int, int]:
+    """
+    Pentru o zonă închisă (balcon/wintergarden): flood din colțuri = exterior,
+    flood din centrul zonei = interior. Pereții care au vecin exterior și vecin interior
+    = pereți exteriori ai zonei. Returnează (boundary_length_px, area_px).
+    """
+    wall = (np.asarray(wall_mask) > 0).astype(np.uint8)
+    flood_base = np.where(wall > 0, 0, 255).astype(np.uint8)
+
+    # Flood din colțuri + margini = exterior (128); modifică imaginea direct
+    img = flood_base.copy()
+    seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    step = max(1, min(50, w // 10, h // 10))
+    for px in range(0, w, step):
+        seeds.append((px, 0))
+        seeds.append((px, h - 1))
+    for py in range(0, h, step):
+        seeds.append((0, py))
+        seeds.append((w - 1, py))
+    for sx, sy in seeds:
+        if sy >= h or sx >= w or img[sy, sx] != 255:
+            continue
+        cv2.floodFill(img, None, (sx, sy), 128, None, None, 4)
+
+    # Flood din centrul zonei = interior (64)
+    cx = max(0, min(w - 1, zone_center_x))
+    cy = max(0, min(h - 1, zone_center_y))
+    if img[cy, cx] != 255:
+        return 0, 0
+    cv2.floodFill(img, None, (cx, cy), 64, None, None, 4)
+    exterior = (img == 128)
+    interior = (img == 64)
+    area_px = int(np.sum(interior))
+
+    # Graniță = pixeli perete cu vecin exterior și vecin interior
+    boundary_length_px = 0
+    for y in range(h):
+        for x in range(w):
+            if wall[y, x] == 0:
+                continue
+            has_ext = False
+            has_int = False
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    if exterior[ny, nx]:
+                        has_ext = True
+                    if interior[ny, nx]:
+                        has_int = True
+            if has_ext and has_int:
+                boundary_length_px += 1
+
+    return boundary_length_px, area_px
 
 
 def save_check_garage_image(

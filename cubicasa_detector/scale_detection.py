@@ -9,10 +9,13 @@ from __future__ import annotations
 import json
 import math
 import base64
+import os
+import re
 import requests
 import cv2
 import numpy as np
 from pathlib import Path
+from typing import Callable
 
 from .config import GEMINI_MODEL
 
@@ -87,6 +90,349 @@ Returnează JSON cu formatul:
 Dacă nu găsești suma totală, returnează null.
 """
 
+# Prompt pentru detectarea zonelor: garaj, terasă, balcon, intrare acoperită (coordonate în procente)
+GEMINI_PROMPT_ZONE_LABELS = """
+You are analyzing an architectural floor plan image. Your task is to READ THE TEXT WRITTEN ON THE PLAN (room labels, zone names, annotations) and locate the following zone types. For each one you find, return the CENTER of that written label in percentage coordinates: x_center_pct = (center_x / image_width) * 100, y_center_pct = (center_y / image_height) * 100, both in range 0–100.
+
+Search the plan for these zone labels. Look for the exact words or common abbreviations as written on the drawing (German, English, Romanian, etc.):
+
+1. **garage** – Look for: Garage, Garaj, Gar., Carport, Parking, Stellplatz, Stellpl., Garáž, Garaž, Parkplatz, etc. Return the center of that text.
+
+2. **terasa** – Look for: Terrasse, Terr., Terrace, Terasa, Terasă, Patio, Garten (when it is a terrace/patio area), etc. Return the center of that text.
+
+3. **balcon** – Look for: Balkon, Balk., Balcon, Balcony, Loggia, etc. Return the center of that text.
+
+4. **wintergarden** – Look for: Wintergarten, Wintergarden, Winter garden, Glasanbau, etc. Return the center of that text.
+
+5. **intrare_acoperita** – Look ONLY for: "Eingang überdacht", "überdachter Eingang", "Eing. überdacht", or equivalent "covered entrance". Do NOT match: Foyer, Flur, Diele, Hall, Eingang alone, Entrance, Corridor. We need specifically the covered entrance zone.
+
+Rules:
+- Scan the whole image for these words/abbreviations. Return the geometric center of the text bounding box for each label found.
+- If a zone is not present on the plan, omit it from the array.
+- Output ONLY valid JSON. Use exactly these label strings: "garage", "terasa", "balcon", "wintergarden", "intrare_acoperita".
+
+Return ONLY a JSON object (no markdown, no explanation):
+{
+  "detections": [
+    { "label": "garage", "x_center_pct": 25.5, "y_center_pct": 62.0 },
+    { "label": "terasa", "x_center_pct": 70.0, "y_center_pct": 15.0 }
+  ]
+}
+"""
+
+
+# Prompt pentru ChatGPT: primește raw return de la Gemini, returnează JSON valid (structură detections).
+# Acoladele literale sunt escapate {{ }} ca să nu fie interpretate la .format(raw_text=...).
+PROMPT_REPAIR_ZONE_LABELS = """You receive the raw text returned by another AI (Gemini). It was supposed to be a JSON object with a "detections" array. The response may be truncated or invalid JSON.
+
+Your task: output ONLY a valid JSON object with this exact structure (no markdown, no explanation, no code fence):
+
+{{"detections": [
+  {{"label": "garage", "x_center_pct": 25.5, "y_center_pct": 62.0}},
+  {{"label": "terasa", "x_center_pct": 70.0, "y_center_pct": 15.0}}
+]}}
+
+Rules:
+- "detections" must be an array. Each item: "label" (string), "x_center_pct" (number 0–100), "y_center_pct" (number 0–100).
+- Allowed labels only: "garage", "terasa", "balcon", "wintergarden", "intrare_acoperita".
+- From the raw text below, extract every zone you can identify (even from truncated content) and put them in the array.
+- If nothing usable: return {{"detections": []}}.
+- Output ONLY the JSON object. Start with {{ and end with }}.
+
+Raw response from the other AI:
+---
+{raw_text}
+---"""
+
+
+def _extract_json_object_from_text(text: str) -> str | None:
+    """Extrage primul obiect JSON complet din text (primul { până la } potrivit)."""
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _parse_zone_labels_object(json_str: str) -> dict | None:
+    """
+    Parsează un string JSON care ar trebui să fie un obiect cu cheia detections (array).
+    Returnează un dict cu cheia "detections" (listă) sau None. Nu folosește niciodată data["detections"].
+    """
+    if not json_str or not json_str.strip():
+        return None
+    json_str = json_str.strip()
+    # Fix trailing comma în array/object (ca la segmentare)
+    json_str = re.sub(r",\s*]", "]", json_str)
+    json_str = re.sub(r",\s*}", "}", json_str)
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    detections = None
+    for k, v in data.items():
+        if k and "detections" in (k.strip().lower()) and isinstance(v, list):
+            detections = v
+            break
+    if detections is None:
+        detections = []
+    out = {"detections": []}
+    for item in detections:
+        if not isinstance(item, dict):
+            continue
+        label = (item.get("label") or "").strip().lower()
+        if label not in ("garage", "terasa", "balcon", "wintergarden", "intrare_acoperita"):
+            continue
+        try:
+            x_pct = float(item.get("x_center_pct"))
+            y_pct = float(item.get("y_center_pct"))
+        except (TypeError, ValueError):
+            continue
+        out["detections"].append({"label": label, "x_center_pct": x_pct, "y_center_pct": y_pct})
+    return out
+
+
+def _try_parse_truncated_zone_labels(raw_text: str) -> dict | None:
+    """Încearcă reparare locală: răspuns trunchiat Gemini – închide ] și } lipsă, apoi parsează (ca la segmentare)."""
+    raw = (raw_text or "").strip()
+    if not raw or "detections" not in raw.lower():
+        return None
+    start = raw.find("{")
+    if start < 0:
+        return None
+    s = raw[start:]
+    open_br, open_sq = 0, 0
+    for c in s:
+        if c == "{":
+            open_br += 1
+        elif c == "}":
+            open_br -= 1
+        elif c == "[":
+            open_sq += 1
+        elif c == "]":
+            open_sq -= 1
+    s = s + "]" * max(0, open_sq) + "}" * max(0, open_br)
+    return _parse_zone_labels_object(s)
+
+
+def _repair_zone_labels_json_with_chatgpt(raw_text: str) -> dict | None:
+    """
+    Același pattern ca la segmentare (Gemini Crop): trimitem raw la ChatGPT, extragem obiect JSON din răspuns,
+    parsează fără acces direct la chei. Nu propagăm nicio excepție.
+    """
+    try:
+        # 1) Întâi încercăm reparare locală (trunchiere), ca la segmentare când _extract_json_array e gol
+        parsed = _try_parse_truncated_zone_labels(raw_text or "")
+        if parsed is not None:
+            print("   [Gemini zone labels] JSON trunchiat reparat local (paranteze închise).")
+            return parsed
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("   [Gemini zone labels] OPENAI_API_KEY lipsește – nu pot repara cu ChatGPT.")
+            return None
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+        except Exception:
+            return None
+
+        prompt = PROMPT_REPAIR_ZONE_LABELS.format(raw_text=(raw_text or "")[:8000])
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You output only valid JSON. No markdown, no explanation, no extra text."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+
+        content = ""
+        if response and getattr(response, "choices", None) and len(response.choices) > 0:
+            msg = getattr(response.choices[0], "message", None)
+            if msg is not None:
+                content = (getattr(msg, "content", None) or "").strip()
+
+        if not content:
+            return None
+
+        # Elimină markdown code block (ca la segmentare: regex pentru ```json ... ```)
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content)
+        if m:
+            content = m.group(1).strip()
+        if "```" in content:
+            for part in content.split("```"):
+                part = part.strip()
+                if part.startswith("{"):
+                    content = part
+                    break
+
+        json_str = _extract_json_object_from_text(content)
+        if not json_str:
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                json_str = content[start:end]
+        if not json_str:
+            return None
+
+        parsed = _parse_zone_labels_object(json_str)
+        if parsed is not None:
+            n = len(parsed.get("detections") or [])
+            if n > 0:
+                print(f"   [Gemini zone labels] ChatGPT a construit JSON valid din răspunsul Gemini ({n} zone).")
+            else:
+                print("   [Gemini zone labels] ChatGPT a returnat JSON valid dar fără zone (detections gol) → se va folosi OCR.")
+            return parsed
+        return None
+    except Exception as e:
+        print(f"   [Gemini zone labels] Eroare la reparare: {e}")
+        return None
+
+
+def call_gemini_zone_labels(
+    image_path: str | Path,
+    api_key: str,
+    image_w: int,
+    image_h: int,
+) -> dict[str, list[tuple[int, int]]]:
+    """
+    Apelează Gemini pentru detectarea etichetelor de zone (garage, terasa, balcon, intrare_acoperita).
+    Returnează un dict: label -> listă de (cx_px, cy_px) centre în pixeli (pot exista mai multe terase, garaje etc.).
+    Salvează JSON-ul primit (detections cu procente) în același director cu imaginea.
+    """
+    out: dict[str, list[tuple[int, int]]] = {}
+    try:
+        result = call_gemini(
+            str(image_path),
+            GEMINI_PROMPT_ZONE_LABELS,
+            api_key,
+            max_retries=1,
+            repair_callback=_repair_zone_labels_json_with_chatgpt,
+            max_output_tokens=2048,
+        )
+        if not result or "detections" not in result:
+            return out
+        # Salvează JSON-ul (detections cu procente) pentru inspecție
+        try:
+            save_dir = Path(image_path).parent
+            json_path = save_dir / "gemini_zone_labels.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"   [Gemini zone labels] Salvat: {json_path.name}")
+        except Exception as e:
+            print(f"   [Gemini zone labels] Nu s-a putut salva JSON: {e}")
+        for d in result.get("detections") or []:
+            label = (d.get("label") or "").strip().lower()
+            if label not in ("garage", "terasa", "balcon", "wintergarden", "intrare_acoperita"):
+                continue
+            x_pct = d.get("x_center_pct")
+            y_pct = d.get("y_center_pct")
+            if x_pct is None or y_pct is None:
+                continue
+            try:
+                x_pct = float(x_pct)
+                y_pct = float(y_pct)
+            except (TypeError, ValueError):
+                continue
+            cx = int(round(x_pct / 100.0 * max(1, image_w)))
+            cy = int(round(y_pct / 100.0 * max(1, image_h)))
+            cx = max(0, min(image_w - 1, cx))
+            cy = max(0, min(image_h - 1, cy))
+            if label not in out:
+                out[label] = []
+            out[label].append((cx, cy))
+    except Exception as e:
+        print(f"   [Gemini zone labels] Eroare: {e}")
+    return out
+
+
+def _build_blacklist_prompt(terms: list[str]) -> str:
+    """Construiește promptul Gemini pentru detectarea cuvintelor blacklist pe plan."""
+    terms_str = ", ".join(repr(t) for t in (terms[:25] if len(terms) > 25 else terms))
+    return f"""You are analyzing an architectural floor plan image. Find any of these BLACKLIST words/labels written on the plan (e.g. pool, piscina, Schwimmbad):
+
+Terms to search for (any language): {terms_str}
+
+For each occurrence found, return the CENTER of that text in percentage coordinates:
+- x_center_pct = (center_x / image_width) * 100
+- y_center_pct = (center_y / image_height) * 100
+(both 0–100). Use "label" as the word found (e.g. "pool", "Pool", "piscina").
+
+Return ONLY a valid JSON object (no markdown):
+{{"detections": [{{ "label": "pool", "x_center_pct": 50.0, "y_center_pct": 30.0 }}]}}
+If none of these words appear, return {{"detections": []}}."""
+
+
+def call_gemini_blacklist(
+    image_path: str | Path,
+    api_key: str,
+    image_w: int,
+    image_h: int,
+    blacklist_terms: list[str],
+) -> list[tuple[int, int, str]]:
+    """
+    Apelează Gemini pentru detectarea cuvintelor blacklist pe plan.
+    Returnează lista de (cx_px, cy_px, label) pentru fiecare detecție, sau listă goală.
+    """
+    if not blacklist_terms:
+        return []
+    out: list[tuple[int, int, str]] = []
+    try:
+        prompt = _build_blacklist_prompt(blacklist_terms)
+        result = call_gemini(
+            str(image_path),
+            prompt,
+            api_key,
+            max_retries=1,
+            repair_callback=None,
+            max_output_tokens=2048,
+        )
+        if not result or "detections" not in result:
+            return out
+        try:
+            save_dir = Path(image_path).parent
+            json_path = save_dir / "gemini_blacklist.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"   [Gemini blacklist] Salvat: {json_path.name}")
+        except Exception as e:
+            print(f"   [Gemini blacklist] Nu s-a putut salva JSON: {e}")
+        for d in result.get("detections") or []:
+            label = (d.get("label") or "").strip()
+            if not label:
+                continue
+            x_pct = d.get("x_center_pct")
+            y_pct = d.get("y_center_pct")
+            if x_pct is None or y_pct is None:
+                continue
+            try:
+                x_pct = float(x_pct)
+                y_pct = float(y_pct)
+            except (TypeError, ValueError):
+                continue
+            cx = int(round(x_pct / 100.0 * max(1, image_w)))
+            cy = int(round(y_pct / 100.0 * max(1, image_h)))
+            cx = max(0, min(image_w - 1, cx))
+            cy = max(0, min(image_h - 1, cy))
+            out.append((cx, cy, label))
+    except Exception as e:
+        print(f"   [Gemini blacklist] Eroare: {e}")
+    return out
+
 
 def _repair_scale_json_with_gpt(raw_text: str, prompt: str):
     """Fallback: GPT construiește JSON valid din răspunsul raw Gemini."""
@@ -104,8 +450,8 @@ def _repair_scale_json_with_gpt(raw_text: str, prompt: str):
         return None
 
 
-def call_gemini(image_path, prompt, api_key, max_retries=2):
-    """API REST Direct (v1beta) pentru Gemini. Retry la non-JSON."""
+def call_gemini(image_path, prompt, api_key, max_retries=2, repair_callback: Callable[[str], dict | None] | None = None, max_output_tokens: int = 1000):
+    """API REST Direct (v1beta) pentru Gemini. Retry la non-JSON. repair_callback: dacă e dat, la JSON invalid se folosește pentru reparare (ex. zone labels). max_output_tokens: limită tokeni (default 1000; pentru zone labels se recomandă 2048)."""
     try:
         for attempt in range(max_retries + 1):
             with open(image_path, 'rb') as f:
@@ -117,7 +463,7 @@ def call_gemini(image_path, prompt, api_key, max_retries=2):
 
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
 
-            gen_config = {"temperature": 0.0, "maxOutputTokens": 1000, "responseMimeType": "application/json"}
+            gen_config = {"temperature": 0.0, "maxOutputTokens": max_output_tokens, "responseMimeType": "application/json"}
             payload = {
                 "contents": [{
                     "parts": [
@@ -162,7 +508,14 @@ def call_gemini(image_path, prompt, api_key, max_retries=2):
             except json.JSONDecodeError:
                 preview = " ".join(text.split())[:160]
                 print(f"⚠️  Gemini returned non-JSON: {preview!r}, încerc GPT repair...")
-                repaired = _repair_scale_json_with_gpt(text, prompt)
+                repaired = None
+                try:
+                    if repair_callback is not None:
+                        repaired = repair_callback(text)
+                    else:
+                        repaired = _repair_scale_json_with_gpt(text, prompt)
+                except Exception as repair_err:
+                    print(f"   [repair] Callback eșuat: {repair_err}")
                 if repaired is not None:
                     return repaired
                 if attempt < max_retries:
@@ -171,6 +524,121 @@ def call_gemini(image_path, prompt, api_key, max_retries=2):
         return None
     except Exception as e:
         print(f"⚠️  Gemini error: {e}")
+        return None
+
+
+# Prompt pentru alinierea a două măști de pereți (referință + template)
+GEMINI_PROMPT_WALL_ALIGNMENT = """
+You are given TWO images of floor plan wall masks (binary or grayscale: white/light = walls, black = background).
+
+- IMAGE 1 (first image): REFERENCE mask = "original" walls. This is the ground truth we want to align to.
+- IMAGE 2 (second image): TEMPLATE mask = "detected" walls (e.g. from an API). This image must be scaled and positioned to overlay exactly on IMAGE 1.
+
+Your task: determine the exact scale and position so that when IMAGE 2 is scaled and placed over IMAGE 1, the walls match as much as possible.
+
+Assume:
+- Both images show the SAME floor plan; they may differ in resolution, scale, and position.
+- No rotation: only scaling and translation (horizontal/vertical shift) are needed.
+- Coordinates: origin (0,0) is top-left; x increases right, y increases down.
+
+Return a JSON object with these exact keys:
+
+{
+  "scale": <float between 0.2 and 2.0>,
+  "offset_x_pct": <float between -0.5 and 0.5>,
+  "offset_y_pct": <float between -0.5 and 0.5>,
+  "direction": "api_to_orig",
+  "confidence": <float between 0 and 1>
+}
+
+Meaning:
+- scale: factor to apply to IMAGE 2 width and height so its size matches IMAGE 1. Example: 1.0 = same size; 0.6 = scale IMAGE 2 to 60% so it fits inside IMAGE 1.
+- offset_x_pct: horizontal shift of the CENTER of (scaled) IMAGE 2 relative to the CENTER of IMAGE 1, as a fraction of IMAGE 1 width. Positive = move IMAGE 2 right; negative = left.
+- offset_y_pct: vertical shift of the CENTER of (scaled) IMAGE 2 relative to the CENTER of IMAGE 1, as a fraction of IMAGE 1 height. Positive = move IMAGE 2 down; negative = up.
+- direction: use "api_to_orig" if IMAGE 2 (template) is scaled and placed ONTO IMAGE 1 (reference). Use "orig_to_api" if instead IMAGE 1 is scaled and placed onto IMAGE 2.
+- confidence: how sure you are (0 = guess, 1 = very confident). Use 0.5–0.7 for typical alignment, 0.8+ only if the match is obvious.
+
+Reply with ONLY the JSON object, no other text.
+"""
+
+
+def call_gemini_wall_alignment(
+    reference_image_path: str | Path,
+    template_image_path: str | Path,
+    api_key: str,
+    max_retries: int = 1,
+    timeout: int = 45,
+):
+    """
+    Trimite cele două măști (referință + template) la Gemini și primește scale + offset pentru aliniere.
+    Rulează în paralel cu căutarea brută; rezultatul poate fi folosit ca hint pentru refinare.
+
+    Returns:
+        dict cu scale, offset_x_pct, offset_y_pct, direction, confidence; sau None la eroare.
+    """
+    try:
+        ref_path = Path(reference_image_path)
+        tpl_path = Path(template_image_path)
+        if not ref_path.is_file() or not tpl_path.is_file():
+            return None
+        with open(ref_path, "rb") as f:
+            ref_b64 = base64.b64encode(f.read()).decode("utf-8")
+        with open(tpl_path, "rb") as f:
+            tpl_b64 = base64.b64encode(f.read()).decode("utf-8")
+        ext = ref_path.suffix.lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+        mime = mime_map.get(ext, "image/png")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+        gen_config = {"temperature": 0.1, "maxOutputTokens": 512, "responseMimeType": "application/json"}
+        prompt_text = (
+            "IMAGE 1 (first image) = REFERENCE = original walls mask. "
+            "IMAGE 2 (second image) = TEMPLATE = detected walls to align onto IMAGE 1.\n\n"
+            + GEMINI_PROMPT_WALL_ALIGNMENT
+            + "\n\nReply with ONLY the JSON object, no markdown."
+        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime, "data": ref_b64}},
+                    {"inline_data": {"mime_type": mime, "data": tpl_b64}},
+                    {"text": prompt_text}
+                ]
+            }],
+            "generationConfig": gen_config
+        }
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if response.status_code != 200:
+            return None
+        result = response.json()
+        if not result.get("candidates"):
+            return None
+        text = (result["candidates"][0].get("content", {}).get("parts") or [{}])[0].get("text", "").strip()
+        if not text:
+            return None
+        start, end = text.find("{"), text.rfind("}") + 1
+        if start == -1 or end <= start:
+            return None
+        out = json.loads(text[start:end])
+        if not isinstance(out, dict):
+            return None
+        # Normalize
+        scale = out.get("scale")
+        if scale is not None:
+            scale = float(scale)
+            scale = max(0.2, min(2.0, scale))
+        out["scale"] = scale
+        for k in ("offset_x_pct", "offset_y_pct", "confidence"):
+            if out.get(k) is not None:
+                out[k] = float(out[k])
+        out["offset_x_pct"] = max(-0.5, min(0.5, out.get("offset_x_pct", 0) or 0))
+        out["offset_y_pct"] = max(-0.5, min(0.5, out.get("offset_y_pct", 0) or 0))
+        out["confidence"] = max(0.0, min(1.0, out.get("confidence", 0) or 0))
+        out.setdefault("direction", "api_to_orig")
+        return out
+    except Exception as e:
+        print(f"      ⚠️ Gemini wall alignment: {e}")
         return None
 
 

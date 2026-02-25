@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 import shutil as _shutil
 
-from pdf2image import pdfinfo_from_path
 from PIL import Image, ImageFilter
 
 from .common import (
@@ -148,6 +147,8 @@ def convert_pdf_to_png(pdf_path: str | Path, output_dir: str | Path) -> list[Pat
     Convertește PDF-ul în PNG-uri de pagină și le pune în output_dir.
     Returnează lista de path-uri PNG (în ordine).
     """
+    from pdf2image import pdfinfo_from_path
+
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

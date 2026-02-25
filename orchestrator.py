@@ -14,7 +14,6 @@ import json
 import shutil
 import argparse
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo, get_run_dir
 from config.frontend_loader import load_frontend_data_for_run
@@ -306,19 +305,36 @@ def run_segmentation_and_classification_for_document(
     has_basement_form = basement or (
         tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
     )
-    if floors_number is not None:
-        user_expected = int(floors_number) + (1 if has_basement_form else 0)
+    lista_etaje = structura.get("listaEtaje")
+    # Mansardă locuibilă (Wohnfläche): Dachgeschoss ohne Kniestock sau mit Kniestock = etaj suplimentar. Pod nu e etaj.
+    if isinstance(lista_etaje, list):
+        has_mansarda_wohnflaeche = "mansarda_mit" in lista_etaje or "mansarda_ohne" in lista_etaje
     else:
-        # listaEtaje poate conține "intermediar", "mansarda", "pod" – doar "intermediar" = etaj cu plan separat; mansardă/acoperiș nu e etaj suplimentar
-        lista_etaje = structura.get("listaEtaje")
+        has_mansarda_wohnflaeche = False
+
+    if floors_number is not None:
+        user_expected = (
+            int(floors_number)
+            + (1 if has_basement_form else 0)
+            + (1 if has_mansarda_wohnflaeche else 0)
+        )
+    else:
+        # listaEtaje: "intermediar" = etaj cu plan separat; mansardă (ohne/mit Kniestock, Wohnfläche) = etaj.
         if isinstance(lista_etaje, list):
             etaje_intermediare = sum(1 for e in lista_etaje if e == "intermediar")
-            user_expected = 1 + etaje_intermediare + (1 if has_basement_form else 0)
+            user_expected = (
+                1 + etaje_intermediare
+                + (1 if has_basement_form else 0)
+                + (1 if has_mansarda_wohnflaeche else 0)
+            )
         elif isinstance(lista_etaje, dict):
             user_expected = 1 + (1 if has_basement_form else 0)
         else:
             user_expected = 1 + (1 if has_basement_form else 0)
-    print(f"   📋 Formular: etaje așteptate (cu beci) = {user_expected}  |  Planuri blueprint = {our_floors}")
+    _extra_suffix = ""
+    if isinstance(lista_etaje, list) and has_mansarda_wohnflaeche:
+        _extra_suffix += ", Dachgeschoss (Wohnfläche)"
+    print(f"   📋 Formular: etaje așteptate (cu beci{_extra_suffix}) = {user_expected}  |  Planuri blueprint = {our_floors}")
     if our_floors != user_expected:
         print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
         print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
@@ -386,22 +402,19 @@ def run_segmentation_and_classification_for_document(
                     traceback.print_exc()
                     raster_scan_failed = True
             if not raster_scan_failed:
-                # Phase 2 în paralel pentru toate planurile (brute force + room_scales.json)
+                # Phase 2 secvențial (un plan după altul): brute force + room_scales.json, ca să nu se blocheze
                 def do_phase2(plan):
                     print(f"[RasterScan] Phase 2 {plan.plan_id} → brute force + room_scales.json", flush=True)
                     run_cubicasa_phase2(output_dir=plan.stage_work_dir, raster_timings=raster_timings)
                     print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes", flush=True)
-                with ThreadPoolExecutor(max_workers=len(plans) or 1) as executor:
-                    futs = {executor.submit(do_phase2, plan): plan for plan in plans}
-                    for fut in as_completed(futs):
-                        plan = futs[fut]
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
-                            import traceback
-                            traceback.print_exc()
-                            raster_scan_failed = True
+                for plan in plans:
+                    try:
+                        do_phase2(plan)
+                    except Exception as e:
+                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        raster_scan_failed = True
                 # Trimite toate imaginile Cubicasa (pereți, camere, fill, openings, etc.) la admin Details
                 if not raster_scan_failed:
                     for plan in plans:

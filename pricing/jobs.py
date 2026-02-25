@@ -88,6 +88,7 @@ def _run_for_single_plan(
     raster_room_scales = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
     raster_openings = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "openings_measurements.json"
     raster_walls_measurements = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
+    raster_balcon_wintergarden = scale_dir / "cubicasa_steps" / "raster_processing" / "terasa_balcon_strip" / "balcon_wintergarden_measurements.json"
     
     area_data = None
     openings_data_from_raster = []  # Inițializăm înainte de blocul if
@@ -199,7 +200,29 @@ def _run_for_single_plan(
                     is_top_floor=is_top_floor_plan,
                     floor_height_m_by_option=pricing_coeffs.get("area", {}).get("floor_height_m"),
                 )
-                
+                # Balcon / wintergarden: convert px -> m pentru pricing (perimetru + suprafață podea/tavan)
+                if raster_balcon_wintergarden.exists():
+                    try:
+                        with open(raster_balcon_wintergarden, "r", encoding="utf-8") as f:
+                            bw_list = json.load(f)
+                        total_area_px = room_scales_data.get("total_area_px") or 0
+                        if total_area_px > 0 and total_area_m2 > 0 and bw_list:
+                            m_px = (total_area_m2 / total_area_px) ** 0.5
+                            converted = []
+                            for item in bw_list:
+                                boundary_px = item.get("boundary_length_px") or 0
+                                area_px = item.get("area_px") or 0
+                                converted.append({
+                                    "type": item.get("type", "balcon"),
+                                    "index": item.get("index", 0),
+                                    "boundary_m": round(boundary_px * m_px, 4),
+                                    "area_m2": round(area_px * (m_px ** 2), 4),
+                                })
+                            area_data["balcon_wintergarden"] = converted
+                            print(f"       ✅ Balcon/wintergarden: {len(converted)} zone (boundary_m + area_m2) pentru pricing")
+                    except Exception as e:
+                        print(f"       ⚠️ Eroare la citirea balcon_wintergarden_measurements.json: {e}")
+
                 use_raster_data = True
                 print(f"       ✅ Folosesc datele din raster_processing pentru pricing: {total_area_m2:.2f} m² (floor_type: {floor_type})")
         except Exception as e:

@@ -32,7 +32,12 @@ from .raster_api import (
     call_raster_api,
     generate_raster_images,
     generate_api_walls_mask,
+    get_api_walls_mask_for_alignment,
     brute_force_alignment,
+    brute_force_translation_only,
+    build_api_walls_mask_from_json,
+    build_aligned_api_walls_1px_original,
+    run_extra_alignment_methods,
     apply_alignment_and_generate_overlay,
     generate_crop_from_raster,
 )
@@ -2152,23 +2157,27 @@ def run_cubicasa_detection(
     reused_model=None,
     reused_device=None,
     raster_timings: list | None = None,
+    brute_force_no_cache: bool = False,
+    use_translation_only_raster: bool = True,
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
     ACUM cu Adaptive Strategy: Resize Inteligent pentru imagini mici, Tiling pentru imagini mari.
 
     run_phase: 0 = tot pipeline-ul; 1 = doar faza 1 (Raster API + AI walls → 02_ai_walls_closed);
-               2 = doar faza 2 (brute force + crop + walls from coords). Pentru tandem: rulezi
-               faza 1 pentru toate planurile, apoi faza 2 pentru toate.
+              2 = doar faza 2 (brute force + crop + walls from coords); 3 = doar brute force + overlay
+              (fără crop, walls_from_coords, garaj etc.). Pentru tandem: rulezi faza 1, apoi faza 2 sau 3.
     reused_model / reused_device: când run_phase=1, poți pasa model/device reîntors de un plan
                                   anterior ca să nu reîncarci modelul.
     """
     output_dir = Path(output_dir)
     steps_dir = output_dir / "cubicasa_steps"
     walls_result_from_coords = None
+    raster_aligned_walls_1px = None  # când translation-only: mască 1px aliniată la original
 
-    if run_phase == 2:
-        # Faza 2: nu încărcăm model sau imagine; folosim doar ce e deja pe disc în steps_dir
+    if run_phase in (2, 3):
+        # Faza 2 sau 3: nu încărcăm model sau imagine; folosim doar ce e deja pe disc în steps_dir
+        # run_phase=3 = doar Raster API + brute force (fără crop, walls_from_coords, garaj, etc.)
         ensure_dir(steps_dir)
         raster_dir = Path(steps_dir) / "raster"
         ac_path = steps_dir / "02_ai_walls_closed.png"
@@ -2824,8 +2833,8 @@ def run_cubicasa_detection(
                 interpolation=cv2.INTER_NEAREST
             )
     
-    if run_phase != 2:
-        # 3. EXTRACT WALLS & FILTER THIN LINES (doar phase 0/1; phase 2 are deja ai_walls_closed pe disc)
+    if run_phase not in (2, 3):
+        # 3. EXTRACT WALLS & FILTER THIN LINES (doar phase 0/1; phase 2/3 au deja ai_walls_closed pe disc)
         ai_walls_raw = (pred_mask == 2).astype('uint8') * 255
         save_step("01_ai_walls_raw", ai_walls_raw, str(steps_dir))
         
@@ -2908,35 +2917,84 @@ def run_cubicasa_detection(
     if steps_dir:
         raster_dir = Path(steps_dir) / "raster"
         if raster_dir.exists():
-            # Verificăm dacă există deja configurația salvată (cache)
+            # Verificăm dacă există deja configurația salvată (cache), dacă nu e dezactivat
             config_path = raster_dir / "brute_force_best_config.json"
             _rt_bf = time.time() if raster_timings is not None else None
-            if config_path.exists():
+            if not brute_force_no_cache and config_path.exists():
                 try:
                     with open(config_path, 'r') as f:
                         best_config = json.load(f)
                     print(f"\n      ✅ Folosesc configurația brute force din cache")
+                    # Rulează totuși cei 3 algoritmi (Log-Polar, ECC, Pyramid) și salvează rezultatele
+                    api_walls_path = raster_dir / "api_walls_mask.png"
+                    orig_walls_path = Path(steps_dir) / "02_ai_walls_closed.png"
+                    if api_walls_path.exists() and orig_walls_path.exists():
+                        _api = cv2.imread(str(api_walls_path), cv2.IMREAD_GRAYSCALE)
+                        _orig = cv2.imread(str(orig_walls_path), cv2.IMREAD_GRAYSCALE)
+                        if _api is not None and _orig is not None:
+                            _, binary_api = cv2.threshold(_api, 127, 255, cv2.THRESH_BINARY)
+                            _, binary_orig = cv2.threshold(_orig, 127, 255, cv2.THRESH_BINARY)
+                            run_extra_alignment_methods(raster_dir, binary_orig, binary_api)
                 except Exception as e:
                     print(f"      ⚠️ Eroare la citirea cache-ului: {e}")
                     best_config = None
             
-            # Dacă nu există cache, rulăm brute force pentru api_walls_mask
-            if best_config is None:
+            # Dacă nu există cache (sau e dezactivat), rulăm brute force
+            translation_only_config = None
+            if best_config is None and use_translation_only_raster:
                 try:
-                    api_walls_path = raster_dir / "api_walls_mask.png"
+                    request_info_path = raster_dir / "raster_request_info.json"
                     orig_walls_path = Path(steps_dir) / "02_ai_walls_closed.png"
-                    
-                    if api_walls_path.exists() and orig_walls_path.exists():
-                        api_walls_mask = cv2.imread(str(api_walls_path), cv2.IMREAD_GRAYSCALE)
+                    if request_info_path.exists() and orig_walls_path.exists():
+                        with open(request_info_path, "r") as f:
+                            ri = json.load(f)
+                        req_w = int(ri.get("request_w", 0))
+                        req_h = int(ri.get("request_h", 0))
                         orig_walls = cv2.imread(str(orig_walls_path), cv2.IMREAD_GRAYSCALE)
-                        
-                        if api_walls_mask is not None and orig_walls is not None:
+                        if orig_walls is not None and req_w > 0 and req_h > 0:
+                            ref_request = cv2.resize(orig_walls, (req_w, req_h), interpolation=cv2.INTER_NEAREST)
+                            _, ref_bin = cv2.threshold(ref_request, 127, 255, cv2.THRESH_BINARY)
+                            api_request = build_api_walls_mask_from_json(raster_dir, req_w, req_h)
+                            if api_request is not None:
+                                _, api_bin = cv2.threshold(api_request, 127, 255, cv2.THRESH_BINARY)
+                                if ref_bin.shape == api_bin.shape:
+                                    translation_only_config = brute_force_translation_only(ref_bin, api_bin)
+                                    if translation_only_config is not None:
+                                        brute_steps_dir = raster_dir / "brute_steps"
+                                        brute_steps_dir.mkdir(parents=True, exist_ok=True)
+                                        with open(brute_steps_dir / "translation_only_config.json", "w") as f:
+                                            json.dump(translation_only_config, f, indent=2)
+                                        tx, ty = translation_only_config["position"]
+                                        overlay_req = np.zeros((*ref_bin.shape[:2], 3), dtype=np.uint8)
+                                        overlay_req[:, :, 2] = ref_bin
+                                        x_dst, y_dst = max(0, tx), max(0, ty)
+                                        x_src, y_src = max(0, -tx), max(0, -ty)
+                                        w_c = min(ref_bin.shape[1] - x_dst, api_bin.shape[1] - x_src)
+                                        h_c = min(ref_bin.shape[0] - y_dst, api_bin.shape[0] - y_src)
+                                        if w_c > 0 and h_c > 0:
+                                            overlay_req[y_dst:y_dst+h_c, x_dst:x_dst+w_c, 0] = api_bin[y_src:y_src+h_c, x_src:x_src+w_c]
+                                            overlay_req[y_dst:y_dst+h_c, x_dst:x_dst+w_c, 1] = api_bin[y_src:y_src+h_c, x_src:x_src+w_c]
+                                        cv2.imwrite(str(brute_steps_dir / "translation_only_overlay.png"), overlay_req)
+                                        print(f"      📐 Brute force doar translații: (tx, ty) = ({tx}, {ty}), score = {translation_only_config['score']:.2%}")
+                except Exception as e:
+                    import traceback
+                    print(f"      ⚠️ Eroare brute force translation-only: {e}")
+                    traceback.print_exc()
+            if best_config is None and translation_only_config is None:
+                try:
+                    orig_walls_path = Path(steps_dir) / "02_ai_walls_closed.png"
+                    if orig_walls_path.exists():
+                        orig_walls = cv2.imread(str(orig_walls_path), cv2.IMREAD_GRAYSCALE)
+                        if orig_walls is not None:
+                            oh, ow = orig_walls.shape[:2]
+                            api_walls_mask = get_api_walls_mask_for_alignment(raster_dir, oh, ow)
+                            if api_walls_mask is not None:
                                 best_config = brute_force_alignment(
-                                api_walls_mask,
-                                orig_walls,
-                                raster_dir,
-                                str(steps_dir)
-                            )
+                                    api_walls_mask,
+                                    orig_walls,
+                                    raster_dir,
+                                    str(steps_dir)
+                                )
                 except Exception as e:
                     import traceback
                     print(f"      ⚠️ Eroare brute force pentru api_walls_mask: {e}")
@@ -2944,7 +3002,42 @@ def run_cubicasa_detection(
             if _rt_bf is not None and raster_timings is not None:
                 raster_timings.append(("Raster P2: Brute force", time.time() - _rt_bf))
             
-            # Dacă avem configurația, aplicăm transformarea și generăm crop-ul
+            # Cale translation-only: mască 1px aliniată → garage + interior/exterior, fără construire segmente
+            if translation_only_config is not None:
+                try:
+                    original_path = Path(steps_dir) / "00_original.png"
+                    if original_path.exists():
+                        original_img = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+                        if original_img is not None:
+                            oh, ow = original_img.shape[:2]
+                            tx, ty = translation_only_config["position"]
+                            aligned_1px = build_aligned_api_walls_1px_original(raster_dir, tx, ty, ow, oh)
+                            if aligned_1px is not None:
+                                cv2.imwrite(str(raster_dir / "api_walls_mask.png"), aligned_1px)
+                                raster_aligned_walls_1px = aligned_1px
+                                from .raster_processing import generate_walls_from_room_coordinates
+                                _rt_wfc = time.time() if raster_timings is not None else None
+                                walls_result = generate_walls_from_room_coordinates(
+                                    original_img,
+                                    None,
+                                    raster_dir,
+                                    str(steps_dir),
+                                    gemini_api_key,
+                                    initial_walls_mask_1px=aligned_1px,
+                                )
+                                if _rt_wfc is not None and raster_timings is not None:
+                                    raster_timings.append(("Raster P2: Garage + interior/exterior (1px)", time.time() - _rt_wfc))
+                                if walls_result:
+                                    print(f"      ✅ Garaj + interior/exterior din mască 1px aliniată")
+                                    walls_result_from_coords = walls_result
+                                if run_phase == 3:
+                                    return {}
+                except Exception as e:
+                    import traceback
+                    print(f"      ⚠️ Eroare cale translation-only: {e}")
+                    traceback.print_exc()
+            
+            # Cale clasică: aplicăm transformarea și generăm crop + walls from coords
             if best_config is not None:
                 try:
                     # Aplicăm transformarea și generăm overlay-ul pe original
@@ -2968,7 +3061,11 @@ def run_cubicasa_detection(
                                     original_img,
                                     str(steps_dir)
                                 )
-                                
+                                if run_phase == 3:
+                                    # Doar Raster + brute force: stop aici (fără crop, walls_from_coords, garaj etc.)
+                                    if raster_timings is not None:
+                                        raster_timings.append(("Raster P2: Overlay", time.time() - _rt_ov))
+                                    return {}
                                 # Generăm crop-ul
                                 generate_crop_from_raster(
                                     best_config,
@@ -3019,6 +3116,10 @@ def run_cubicasa_detection(
                     import traceback
                     print(f"      ⚠️ Eroare aplicare transformare: {e}")
                     traceback.print_exc()
+
+        if run_phase == 3:
+            # Doar Raster + brute force: nu rulăm restul pipeline-ului (scări, garaj, walls_from_coords etc.)
+            return {}
     
     # 4b. WORKFLOW REORGANIZAT:
     # 1. Detectare scări + completare pereți scări
@@ -3091,7 +3192,15 @@ def run_cubicasa_detection(
     crop_info = None
     api_walls_mask_crop = None
     
-    if crop_path and crop_path.exists() and crop_info_path and crop_info_path.exists():
+    # Translation-only: folosim masca 1px aliniată pe planul full (fără crop)
+    if raster_aligned_walls_1px is not None:
+        use_crop = True
+        crop_img = img.copy()
+        api_walls_mask_crop = raster_aligned_walls_1px.copy()
+        ai_walls_final = api_walls_mask_crop.copy()
+        h_orig, w_orig = crop_img.shape[:2]
+        print(f"   ✅ Folosesc mască Raster 1px aliniată (translation-only, {w_orig}x{h_orig}px)")
+    elif crop_path and crop_path.exists() and crop_info_path and crop_info_path.exists():
         try:
             crop_img = cv2.imread(str(crop_path), cv2.IMREAD_COLOR)
             if crop_img is not None:

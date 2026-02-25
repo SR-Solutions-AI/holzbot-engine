@@ -3,6 +3,8 @@ import json
 import io
 import os
 import re
+import tempfile
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 import random
@@ -543,6 +545,34 @@ def _asset_path(filename: str | None) -> Path | None:
     p = PROJECT_ROOT / filename
     return p if p.exists() else None
 
+
+def _logo_path_from_assets(assets: dict | None) -> Path | None:
+    """Return a local path for the tenant logo: from assets.logo_url (download) or assets.identity_image / offer_logos_image (file)."""
+    if not assets:
+        return None
+    logo_url = (assets.get("logo_url") or "").strip()
+    if logo_url and logo_url.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(logo_url, timeout=10) as resp:
+                data = resp.read()
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+            ext = ".png"
+            if "image/jpeg" in ctype or logo_url.lower().endswith((".jpg", ".jpeg")):
+                ext = ".jpg"
+            fd, path = tempfile.mkstemp(suffix=ext, prefix="tenant_logo_")
+            os.close(fd)
+            Path(path).write_bytes(data)
+            return Path(path)
+        except Exception as e:
+            print(f"⚠️ [PDF] Failed to download tenant logo from URL: {e}", flush=True)
+            return None
+    identity_file = assets.get("identity_image")
+    if identity_file:
+        p = _asset_path(identity_file)
+        if p and p.exists():
+            return p
+    return None
+
 def _clean_multiline_text(v: object, *, max_lines: int = 6, max_line_len: int = 72) -> str:
     """
     Clean text coming from DB config for footer/header blocks.
@@ -798,7 +828,7 @@ def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None):
         show_logos = a.get("show_offer_logos", True)
         logos_file = a.get("offer_logos_image")
 
-        identity_path = _asset_path(identity_file) if identity_file else IMG_IDENTITY
+        identity_path = _logo_path_from_assets(a) or (_asset_path(identity_file) if identity_file else IMG_IDENTITY)
         if identity_path and identity_path.exists():
             canv.drawImage(str(identity_path), A4[0]-18*mm-85*mm, A4[1]-53*mm, 85*mm, 22*mm, preserveAspectRatio=True, mask='auto')
 
@@ -819,7 +849,7 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     tbl = Table([[P("<br/>".join(left_lines), "Small"), P("", "Small")]], colWidths=[95*mm, A4[0]-36*mm-95*mm])
     tbl.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP")]))
     
-    # Verifică dacă există iconițe (identity_image sau offer_logos)
+    # Verifică dacă există iconițe (logo_url, identity_image sau offer_logos)
     a = assets or {}
     identity_file = a.get("identity_image")
     show_logos = a.get("show_offer_logos", True)
@@ -828,7 +858,10 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     has_identity = False
     has_logos = False
     
-    if identity_file:
+    logo_path = _logo_path_from_assets(a)
+    if logo_path and logo_path.exists():
+        has_identity = True
+    elif identity_file:
         identity_path = _asset_path(identity_file)
         has_identity = identity_path.exists() if identity_path else False
     else:

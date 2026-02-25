@@ -186,7 +186,62 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Einbaukamin": data_map.get("tip_semineu_einbaukamin_price", 7200),
                 "Kachel-/wassergeführter Kamin": data_map.get("tip_semineu_kachel_price", 9500),
             }
-        }
+        },
+        "wandaufbau": {
+            "aussen": {
+                "CLT 35cm": data_map.get("wandaufbau_aussen_clt_35", 400),
+                "CLT 32cm": data_map.get("wandaufbau_aussen_clt_32", 380),
+                "CLT 30cm": data_map.get("wandaufbau_aussen_clt_30", 360),
+                "Holzriegel 35cm": data_map.get("wandaufbau_aussen_holzriegel_35", 300),
+                "Holzriegel 32cm": data_map.get("wandaufbau_aussen_holzriegel_32", 280),
+                "Holzriegel 30cm": data_map.get("wandaufbau_aussen_holzriegel_30", 260),
+                "Beton 35cm": data_map.get("wandaufbau_aussen_beton_35", 200),
+                "Beton 32cm": data_map.get("wandaufbau_aussen_beton_32", 180),
+                "Beton 30cm": data_map.get("wandaufbau_aussen_beton_30", 160),
+            },
+            "innen": {
+                "CLT 35cm": data_map.get("wandaufbau_innen_clt_35", 400),
+                "CLT 32cm": data_map.get("wandaufbau_innen_clt_32", 380),
+                "CLT 30cm": data_map.get("wandaufbau_innen_clt_30", 360),
+                "Holzriegel 35cm": data_map.get("wandaufbau_innen_holzriegel_35", 300),
+                "Holzriegel 32cm": data_map.get("wandaufbau_innen_holzriegel_32", 280),
+                "Holzriegel 30cm": data_map.get("wandaufbau_innen_holzriegel_30", 260),
+                "Beton 35cm": data_map.get("wandaufbau_innen_beton_35", 200),
+                "Beton 32cm": data_map.get("wandaufbau_innen_beton_32", 180),
+                "Beton 30cm": data_map.get("wandaufbau_innen_beton_30", 160),
+            },
+        },
+        "wintergaerten_balkone": {
+            "wintergarten": {
+                "Glaswand": data_map.get("wintergarten_glaswand_price", 560),
+                "Plexiglaswand": data_map.get("wintergarten_plexiglaswand_price", 150),
+            },
+            "balkon": {
+                "Holzgeländer": data_map.get("balkon_holzgelander_price", 560),
+                "Stahlgeländer": data_map.get("balkon_stahlgelander_price", 150),
+                "Glasgeländer": data_map.get("balkon_glasgelander_price", 700),
+            },
+        },
+        "boden_decke_belag": {
+            "bodenaufbau": {
+                "Geschossdecke Holz Standard": data_map.get("bodenaufbau_holz_standard_price", 560),
+                "Holzbalkendecke": data_map.get("bodenaufbau_holz_balken_price", 280),
+                "Massivdecke Stahlbeton": data_map.get("bodenaufbau_beton_price", 320),
+                "Bodenplatte Beton": data_map.get("bodenaufbau_bodenplatte_price", 150),
+            },
+            "deckenaufbau": {
+                "Gipskarton Standard": data_map.get("deckenaufbau_gipskarton_price", 45),
+                "Gipskarton Akustik": data_map.get("deckenaufbau_gipskarton_akustik_price", 55),
+                "Sichtschalung Holz": data_map.get("deckenaufbau_sichtschalung_price", 65),
+                "Unterdecke abgehängt": data_map.get("deckenaufbau_abgehaengt_price", 75),
+            },
+            "bodenbelag": {
+                "Estrich + Fliesen": data_map.get("bodenbelag_estrich_fliesen_price", 35),
+                "Parkett Eiche": data_map.get("bodenbelag_parkett_price", 42),
+                "Laminat": data_map.get("bodenbelag_laminat_price", 38),
+                "Teppichboden": data_map.get("bodenbelag_teppich_price", 28),
+            },
+        },
     }
 
     # Opțiuni custom (din Preisdatenbank): același tag, apar în formular și aici în pricing
