@@ -2048,6 +2048,14 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
     branding = _apply_branding(tenant_slug)
     assets = (branding.get("assets") or {}) if isinstance(branding, dict) else {}
     company_overrides = (branding.get("company") or {}) if isinstance(branding, dict) else {}
+    # Prefer logo and company from job (Preisdatenbank) – signed logo URL and company data sent by API
+    if isinstance(frontend_data, dict):
+        job_pdf_assets = frontend_data.get("pdf_assets")
+        if isinstance(job_pdf_assets, dict) and job_pdf_assets:
+            assets = {**assets, **job_pdf_assets}
+        job_pdf_company = frontend_data.get("pdf_company")
+        if isinstance(job_pdf_company, dict) and job_pdf_company:
+            company_overrides = {**company_overrides, **job_pdf_company}
     offer_prefix = (branding.get("offer_prefix") or "CHH") if isinstance(branding, dict) else "CHH"
     handler = (branding.get("handler_name") or "Florian Siemer") if isinstance(branding, dict) else "Florian Siemer"
     offer_title = branding.get("offer_title") if isinstance(branding, dict) else None
