@@ -39,6 +39,8 @@ Return ONLY a JSON array. No markdown, no code block, no text before or after. E
 - "box_2d": [ymin, xmin, ymax, xmax] — integers or numbers in 0–1000 range.
 - "label": string — the exact label you see (e.g. "GRUNDRISS EG", "Ansicht Süd", "Schnitt A-A").
 
+You MUST include EVERY floor plan and every side view/section on the page. Do not omit any. Keep the response concise: only the JSON array, no explanations.
+
 Example format:
 [{"box_2d": [30, 15, 550, 485], "label": "GRUNDRISS KG"}, {"box_2d": [30, 510, 340, 970], "label": "Ansicht Süd"}, {"box_2d": [670, 15, 980, 550], "label": "Schnitt A-A"}]
 
@@ -256,7 +258,7 @@ def _repair_json_with_chatgpt(raw_gemini_text: str) -> list[dict[str, Any]]:
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=4096,
         )
         text = (response.choices[0].message.content or "").strip()
     except Exception as e:
@@ -291,7 +293,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             [PROMPT_BOXES, img],
             generation_config={
                 "temperature": 0.0,
-                "max_output_tokens": 4096,
+                "max_output_tokens": 8192,
             },
             safety_settings=_GEMINI_SAFETY,
         )
@@ -322,7 +324,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         try:
             response = client.generate_content(
                 [PROMPT_BOXES, img],
-                generation_config={"temperature": 0.0, "max_output_tokens": 4096},
+                generation_config={"temperature": 0.0, "max_output_tokens": 8192},
                 safety_settings=_GEMINI_SAFETY,
             )
             raw2 = _get_response_text(response)
@@ -398,7 +400,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         try:
             response = client.generate_content(
                 [PROMPT_BOXES, img],
-                generation_config={"temperature": 0.0, "max_output_tokens": 4096},
+                generation_config={"temperature": 0.0, "max_output_tokens": 8192},
                 safety_settings=_GEMINI_SAFETY,
             )
             raw_retry = _get_response_text(response)
