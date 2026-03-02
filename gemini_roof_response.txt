@@ -1,0 +1,26 @@
+Side views găsite: 2
+  - cluster_1.jpg
+  - cluster_2.jpg
+Num floors (roof): 2
+Apel Gemini (același prompt ca în pipeline, cu etichete imagini)...
+  finish_reason: <FinishReason.STOP: 1>
+
+Răspuns complet salvat în: /Users/paulb/Documents/holzbot-dynamic/holzbot-engine/gemini_roof_response_raw.txt (129 caractere)
+--- RĂSPUNS GEMINI (raw) ---
+```json
+{
+  "parter": {
+    "type": "0_w",
+    "angle_deg": 0
+  },
+  "etaj_1": {
+    "type": "2_w",
+    "angle_deg": 40
+  }
+}
+```
+--- SFÂRȘIT RAW ---
+
+=== REZULTAT SIMULARE ===
+  types:  {0: '0_w', 1: '2_w'}
+  angles: {0: 0, 1: 40.0}

@@ -64,6 +64,8 @@ def get_plan_image_path(plan_id: str, base_dir: Path) -> Path | None:
         base_dir / "classified" / "blueprints" / f"{plan_id}.jpg",
         base_dir / "segmentation" / "classified" / "blueprints" / f"{plan_id}.jpg",
         base_dir / "detections" / f"{plan_id}" / "plan.jpg",
+        # Raster/scale output (planuri procesate de pipeline)
+        base_dir / "scale" / plan_id / "cubicasa_steps" / "raster" / "input_resized.jpg",
     ]
     
     # Caută și în subfolderele de tip plan_X_cluster_Y
@@ -71,9 +73,34 @@ def get_plan_image_path(plan_id: str, base_dir: Path) -> Path | None:
         for item in base_dir.rglob("plan.jpg"):
             if plan_id.lower() in str(item.parent).lower():
                 return item
+        for item in base_dir.rglob("input_resized.jpg"):
+            if plan_id.lower() in str(item).lower():
+                return item
     
     for c in candidates:
         if c.exists():
             return c
     
+    return None
+
+
+def resolve_plan_image_for_pdf(plan_image: Path, plan_id: str, output_root: Path, job_root: Path | None) -> Path | None:
+    """
+    Returnează path-ul imaginii planului pentru PDF. Folosește imaginea din output-ul
+    pipeline-ului (scale/raster) ca sursă principală, astfel încât în ofertă apară
+    întotdeauna planul procesat. Dacă nu există, încearcă plan_image și job_root.
+    """
+    # Sursă principală: imaginea din scale/raster (output pipeline) – astfel apare în PDF
+    scale_path = output_root / "scale" / plan_id / "cubicasa_steps" / "raster" / "input_resized.jpg"
+    if scale_path.exists():
+        return scale_path
+    if plan_image and plan_image.exists():
+        return plan_image
+    if job_root:
+        p = get_plan_image_path(plan_id, job_root)
+        if p:
+            return p
+    p = get_plan_image_path(plan_id, output_root)
+    if p:
+        return p
     return None

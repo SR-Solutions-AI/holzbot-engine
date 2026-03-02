@@ -29,6 +29,7 @@ from PIL import Image as PILImage, ImageEnhance, ImageOps
 
 from config.settings import load_plan_infos, PlansListError, RUNNER_ROOT, PROJECT_ROOT, RUNS_ROOT, OUTPUT_ROOT, JOBS_ROOT
 from config.frontend_loader import load_frontend_data_for_run
+from pdf_generator.utils import resolve_plan_image_for_pdf
 from branding.db_loader import fetch_tenant_branding
 
 # ---------- 1. DICTIONAR STATIC EXTINS (CONSTANTE) ----------
@@ -547,13 +548,33 @@ def _asset_path(filename: str | None) -> Path | None:
 
 
 def _logo_path_from_assets(assets: dict | None) -> Path | None:
-    """Return a local path for the tenant logo: from assets.logo_url (download) or assets.identity_image / offer_logos_image (file)."""
+    """
+    Returnează path-ul logo-ului pentru PDF. Dacă userul a încărcat logo (logo_base64 sau logo_url),
+    folosim DOAR acel logo – nu cădem niciodată la identity_image sau fișiere din branding.
+    """
     if not assets:
         return None
+    import base64
+    has_user_logo = bool(assets.get("logo_base64") or (assets.get("logo_url") or "").strip())
+    logo_b64 = assets.get("logo_base64")
+    if logo_b64 and isinstance(logo_b64, str):
+        try:
+            data = base64.b64decode(logo_b64)
+            ext = ".png"
+            mime = (assets.get("logo_mime") or "").lower()
+            if "jpeg" in mime or "jpg" in mime:
+                ext = ".jpg"
+            fd, path = tempfile.mkstemp(suffix=ext, prefix="tenant_logo_")
+            os.close(fd)
+            Path(path).write_bytes(data)
+            return Path(path)
+        except Exception as e:
+            print(f"⚠️ [PDF] Failed to decode tenant logo_base64: {e}", flush=True)
     logo_url = (assets.get("logo_url") or "").strip()
     if logo_url and logo_url.startswith(("http://", "https://")):
         try:
-            with urllib.request.urlopen(logo_url, timeout=10) as resp:
+            req = urllib.request.Request(logo_url, headers={"User-Agent": "Holzbot-PDF-Engine/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
                 ctype = (resp.headers.get("Content-Type") or "").lower()
             ext = ".png"
@@ -566,12 +587,31 @@ def _logo_path_from_assets(assets: dict | None) -> Path | None:
         except Exception as e:
             print(f"⚠️ [PDF] Failed to download tenant logo from URL: {e}", flush=True)
             return None
+    if has_user_logo:
+        return None
     identity_file = assets.get("identity_image")
     if identity_file:
         p = _asset_path(identity_file)
         if p and p.exists():
             return p
     return None
+
+
+def _identity_path_for_pdf(assets: dict | None) -> Path | None:
+    """
+    Logo/identity pentru PDF. Dacă userul a setat logo (logo_base64 sau logo_url în pdf_assets),
+    folosim DOAR logo-ul încărcat de user – nu cădem niciodată la identity_image sau IMG_IDENTITY.
+    """
+    a = assets or {}
+    from_preisdatenbank = a.get("logo_base64") or a.get("logo_url")
+    logo_path = _logo_path_from_assets(a)
+    if logo_path and logo_path.exists():
+        return logo_path
+    if from_preisdatenbank:
+        return None
+    identity_file = a.get("identity_image")
+    return (_asset_path(identity_file) if identity_file else None) or (IMG_IDENTITY if IMG_IDENTITY.exists() else None)
+
 
 def _clean_multiline_text(v: object, *, max_lines: int = 6, max_line_len: int = 72) -> str:
     """
@@ -824,11 +864,10 @@ def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None):
     def _inner(canv: Canvas, doc):
         _draw_ribbon(canv)
         a = assets or {}
-        identity_file = a.get("identity_image")
         show_logos = a.get("show_offer_logos", True)
         logos_file = a.get("offer_logos_image")
 
-        identity_path = _logo_path_from_assets(a) or (_asset_path(identity_file) if identity_file else IMG_IDENTITY)
+        identity_path = _identity_path_for_pdf(a)
         if identity_path and identity_path.exists():
             canv.drawImage(str(identity_path), A4[0]-18*mm-85*mm, A4[1]-53*mm, 85*mm, 22*mm, preserveAspectRatio=True, mask='auto')
 
@@ -845,28 +884,23 @@ def _later_pages_canvas(canv: Canvas, doc):
     _draw_footer(canv)
 
 def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: dict | None = None, tenant_slug: str = None):
-    left_lines = [COMPANY["legal"], *COMPANY["addr_lines"], "", f"Tel. {COMPANY['phone']}", f"Fax {COMPANY['fax']}", "", COMPANY["email"], COMPANY["web"]]
+    # Firmenname (COMPANY["name"]) prima linie; fallback la legal
+    first_line = (COMPANY.get("name") or COMPANY["legal"] or "").strip() or COMPANY["legal"]
+    left_lines = [first_line, *COMPANY["addr_lines"], "", f"Tel. {COMPANY['phone']}", f"Fax {COMPANY['fax']}", "", COMPANY["email"], COMPANY["web"]]
     tbl = Table([[P("<br/>".join(left_lines), "Small"), P("", "Small")]], colWidths=[95*mm, A4[0]-36*mm-95*mm])
     tbl.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP")]))
     
-    # Verifică dacă există iconițe (logo_url, identity_image sau offer_logos)
+    # Verifică dacă există iconițe (logo din Preisdatenbank sau identity_image din branding, offer_logos)
     a = assets or {}
-    identity_file = a.get("identity_image")
     show_logos = a.get("show_offer_logos", True)
     logos_file = a.get("offer_logos_image")
-    
+
     has_identity = False
     has_logos = False
-    
-    logo_path = _logo_path_from_assets(a)
-    if logo_path and logo_path.exists():
-        has_identity = True
-    elif identity_file:
-        identity_path = _asset_path(identity_file)
-        has_identity = identity_path.exists() if identity_path else False
-    else:
-        has_identity = IMG_IDENTITY.exists()
-    
+
+    identity_path = _identity_path_for_pdf(a)
+    has_identity = identity_path is not None and identity_path.exists()
+
     if show_logos:
         if logos_file:
             logos_path = _asset_path(logos_file)
@@ -2021,7 +2055,7 @@ def _legal_disclaimer(story, styles, enforcer: GermanEnforcer):
     ))
 
 # ---------- MAIN GENERATOR ----------
-def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) -> Path:
+def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, job_root: Path | None = None) -> Path:
     print(f"🚀 [PDF] START: {run_id}")
     
     jobs_root_base = PROJECT_ROOT / "jobs"
@@ -2036,13 +2070,20 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
     else:
         print(f"✅ Folosind JOBS_ROOT: {output_root.resolve()}")
 
+    if job_root is None:
+        job_root = JOBS_ROOT / run_id
+        if not job_root.exists():
+            job_root = None
+    if job_root:
+        print(f"🔹 [PDF] Loading frontend_data from job_root: {job_root}")
+
     if output_path is None:
         final_output_root = RUNNER_ROOT / "output" / run_id
         pdf_dir = final_output_root / "offer_pdf"
         pdf_dir.mkdir(parents=True, exist_ok=True)
         output_path = pdf_dir / f"oferta_{run_id}.pdf"
 
-    frontend_data = load_frontend_data_for_run(run_id)
+    frontend_data = load_frontend_data_for_run(run_id, job_root)
     tenant_slug = frontend_data.get("tenant_slug") if isinstance(frontend_data, dict) else None
 
     branding = _apply_branding(tenant_slug)
@@ -2056,8 +2097,12 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
         job_pdf_company = frontend_data.get("pdf_company")
         if isinstance(job_pdf_company, dict) and job_pdf_company:
             company_overrides = {**company_overrides, **job_pdf_company}
+            print(f"🔍 [PDF] pdf_company from job: name={job_pdf_company.get('name')!r}, addr_lines={job_pdf_company.get('addr_lines')!r}, phone={job_pdf_company.get('phone')!r}, email={job_pdf_company.get('email')!r}, keys={list(job_pdf_company.keys())}", flush=True)
     offer_prefix = (branding.get("offer_prefix") or "CHH") if isinstance(branding, dict) else "CHH"
     handler = (branding.get("handler_name") or "Florian Siemer") if isinstance(branding, dict) else "Florian Siemer"
+    # Prefer handler from job (Preisdatenbank "Reprezentant firmă")
+    if isinstance(company_overrides, dict) and company_overrides.get("handler_name"):
+        handler = str(company_overrides.get("handler_name", "")).strip() or handler
     offer_title = branding.get("offer_title") if isinstance(branding, dict) else None
 
     # Apply company overrides (header/footer content)
@@ -2080,8 +2125,17 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
                     COMPANY[k] = str(v).strip()
                 elif k == "addr_lines" and isinstance(v, list):
                     COMPANY[k] = [str(x).strip() for x in v if str(x).strip()][:3]
-                else:
+                elif k == "address" and isinstance(v, str):
+                    # Fallback: single string -> addr_lines (e.g. from Preisdatenbank)
+                    lines = [ln.strip() for ln in v.replace("\r\n", "\n").split("\n") if ln.strip()][:3]
+                    if lines:
+                        COMPANY["addr_lines"] = lines
+                elif k != "handler_name":
                     COMPANY[k] = v
+        # Dacă tenantul a setat doar Firmenname (name), folosim și pentru legal ca să apară în header/footer
+        if "name" in company_overrides and company_overrides.get("name") and "legal" not in company_overrides:
+            COMPANY["legal"] = str(company_overrides["name"]).strip()
+    print(f"🔍 [PDF] COMPANY after overrides: name={COMPANY.get('name')!r}, legal={COMPANY.get('legal')!r}, addr_lines={COMPANY.get('addr_lines')!r}, phone={COMPANY.get('phone')!r}, email={COMPANY.get('email')!r}", flush=True)
     client_data_untranslated = frontend_data.get("client", frontend_data)
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta)
@@ -2399,10 +2453,11 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
             # Nu mai afișăm suprafața la fiecare etaj conform cerințelor
             plan_info_texts.append("<br/>".join(info_text) if info_text else "")
             
-            # Pregătim imaginea
-            if plan.plan_image.exists():
+            # Pregătim imaginea (din output pipeline: scale/raster, astfel apare în ofertă)
+            plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+            if plan_img_path and plan_img_path.exists():
                 try:
-                    im = PILImage.open(plan.plan_image).convert("L")
+                    im = PILImage.open(plan_img_path).convert("L")
                     im = ImageEnhance.Brightness(im).enhance(0.9)
                     im = ImageOps.autocontrast(im)
                     width, height = im.size
@@ -2534,7 +2589,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None) ->
     return output_path
 
 # ---------- ADMIN PDF GENERATOR (STRICT, NO BRANDING) ----------
-def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Path:
+def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_root: Path | None = None) -> Path:
     """
     Generează un PDF strict pentru admin, fără branding fancy, fără "povesti",
     doar date brute și tabele cu prețuri.
@@ -2553,13 +2608,18 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     else:
         print(f"✅ Folosind JOBS_ROOT: {output_root.resolve()}")
 
+    if job_root is None:
+        job_root = JOBS_ROOT / run_id
+        if not job_root.exists():
+            job_root = None
+
     if output_path is None:
         final_output_root = RUNNER_ROOT / "output" / run_id
         pdf_dir = final_output_root / "offer_pdf"
         pdf_dir.mkdir(parents=True, exist_ok=True)
         output_path = pdf_dir / f"oferta_admin_{run_id}.pdf"
 
-    frontend_data = load_frontend_data_for_run(run_id)
+    frontend_data = load_frontend_data_for_run(run_id, job_root)
     tenant_slug = frontend_data.get("tenant_slug") if isinstance(frontend_data, dict) else None
     
     try: 
@@ -2863,9 +2923,10 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
         story.append(Spacer(1, 2*mm))
         
         # ADMIN: Adaugă imaginea planului
-        if plan.plan_image.exists():
+        plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+        if plan_img_path and plan_img_path.exists():
             try:
-                im = PILImage.open(plan.plan_image).convert("L")
+                im = PILImage.open(plan_img_path).convert("L")
                 im = ImageEnhance.Brightness(im).enhance(0.9)
                 im = ImageOps.autocontrast(im)
                 width, height = im.size
@@ -2975,7 +3036,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None) -> Pa
     return output_path
 
 # ---------- ADMIN CALCULATION METHOD PDF GENERATOR (ENGLISH) ----------
-def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None = None) -> Path:
+def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None = None, job_root: Path | None = None) -> Path:
     """
     Generates a detailed calculation method PDF for admin users, explaining
     all formulas, coefficients, and numerical examples in English.
@@ -2994,13 +3055,18 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     else:
         print(f"✅ Folosind JOBS_ROOT: {output_root.resolve()}")
 
+    if job_root is None:
+        job_root = JOBS_ROOT / run_id
+        if not job_root.exists():
+            job_root = None
+
     if output_path is None:
         final_output_root = RUNNER_ROOT / "output" / run_id
         pdf_dir = final_output_root / "offer_pdf"
         pdf_dir.mkdir(parents=True, exist_ok=True)
         output_path = pdf_dir / f"calculation_method_{run_id}.pdf"
 
-    frontend_data = load_frontend_data_for_run(run_id)
+    frontend_data = load_frontend_data_for_run(run_id, job_root)
     tenant_slug = frontend_data.get("tenant_slug") if isinstance(frontend_data, dict) else None
     
     try: 

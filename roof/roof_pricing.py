@@ -2,6 +2,7 @@
 """
 Generează roof_pricing.json cu prețuri pentru acoperiș, bazate pe roof_metrics.json
 și datele din formular (daemmungDachdeckung). Prețuri orientative pentru Germania (EUR).
+Include tinichigerie (streașini, burlane etc.) = 5% din prețul acoperișului (afișat ca sumă).
 """
 from __future__ import annotations
 
@@ -11,6 +12,9 @@ from typing import Any
 
 from config.settings import OUTPUT_ROOT, JOBS_ROOT, RUNNER_ROOT
 
+
+# Procent din prețul acoperișului pentru tinichigerie (streașini, burlane etc.) – nu se afișează în PDF
+TINICHIGERIE_PERCENT = 0.05
 
 # Prețuri orientative Germania 2024 (EUR) – ajustabile per tenant
 PRICES = {
@@ -74,9 +78,18 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
     with open(metrics_path, encoding="utf-8") as f:
         metrics = json.load(f)
 
+    # Suport atât format vechi (total) cât și nou (unfold_roof, total_combined)
     total = metrics.get("total") or {}
+    total_combined = metrics.get("total_combined") or {}
+    unfold_roof = metrics.get("unfold_roof") or {}
+    unfold_overhang = metrics.get("unfold_overhang") or {}
+
     area_m2 = total.get("area_m2")
     contour_m = total.get("contour_m")
+    if area_m2 is None or area_m2 <= 0:
+        area_m2 = total_combined.get("area_m2")
+    if contour_m is None:
+        contour_m = total_combined.get("contour_m")
 
     if area_m2 is None or area_m2 <= 0:
         print(f"⚠️ [ROOF PRICING] area_m2 invalid în roof_metrics: {area_m2}")
@@ -172,6 +185,42 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
         })
         total_cost += cost
 
+    # 6. Tinichigerie (streașini, burlane etc.) = 5% din prețul acoperișului – în PDF apare doar suma
+    subtotal_before_tinichigerie = total_cost
+    tinichigerie_cost = round(subtotal_before_tinichigerie * TINICHIGERIE_PERCENT, 2)
+    if tinichigerie_cost > 0:
+        items.append({
+            "category": "roof_tinichigerie",
+            "name": "Tinichigerie (Streașini, burlane etc.)",
+            "details": "Dachrinnen, Traufbleche, Anschlüsse",
+            "quantity": 1,
+            "unit": "Pauschale",
+            "unit_price": tinichigerie_cost,
+            "cost": tinichigerie_cost,
+        })
+        total_cost += tinichigerie_cost
+
+    # Măsurători acoperiș pentru measurements.json și raportare
+    roof_measurements: dict[str, Any] = {
+        "area_m2": round(area, 4),
+        "contour_m": round(contour, 4),
+    }
+    if unfold_roof and unfold_roof.get("total"):
+        roof_measurements["unfold_roof"] = {
+            "area_m2": unfold_roof["total"].get("area_m2"),
+            "contour_m": unfold_roof["total"].get("contour_m"),
+        }
+    if unfold_overhang and unfold_overhang.get("total"):
+        roof_measurements["unfold_overhang"] = {
+            "area_m2": unfold_overhang["total"].get("area_m2"),
+            "contour_m": unfold_overhang["total"].get("contour_m"),
+        }
+    if total_combined:
+        roof_measurements["total_combined"] = {
+            "area_m2": total_combined.get("area_m2"),
+            "contour_m": total_combined.get("contour_m"),
+        }
+
     result = {
         "form_data": {
             "daemmung": daemmung,
@@ -184,6 +233,7 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
             "area_m2": area,
             "contour_m": contour,
         },
+        "roof_measurements": roof_measurements,
         "items": items,
         "detailed_items": items,
         "total_cost": round(total_cost, 2),

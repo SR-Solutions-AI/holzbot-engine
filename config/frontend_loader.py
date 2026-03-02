@@ -36,25 +36,20 @@ def load_frontend_data_for_run(run_id: str, job_root: Path | None = None) -> Dic
             except Exception as e:
                 print(f"⚠️ Error loading base config {fname}: {e}")
     
-    # 2. Găsește job_root dacă nu e furnizat
+    # 2. Găsește job_root dacă nu e furnizat (preferăm path-ul exact unde API-ul scrie pdf_company/pdf_assets)
     if job_root is None:
-        # Încercăm pattern-uri comune
         possible_paths = [
             JOBS_ROOT / run_id,
             JOBS_ROOT / f"segmentation_job_{run_id}",
         ]
-        
-        # Căutăm în toate job-urile
-        for jdir in JOBS_ROOT.glob("*"):
-            if jdir.is_dir() and run_id in jdir.name:
-                job_root = jdir
+        for path in possible_paths:
+            if path.exists() and path.is_dir():
+                job_root = path
                 break
-        
-        # Verificăm path-urile directe
         if job_root is None:
-            for path in possible_paths:
-                if path.exists():
-                    job_root = path
+            for jdir in JOBS_ROOT.glob("*"):
+                if jdir.is_dir() and run_id in jdir.name:
+                    job_root = jdir
                     break
     
     # 3. Load Job Specific (override) - CRITIC

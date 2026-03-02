@@ -13,7 +13,16 @@ _ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ENGINE))
 os.chdir(_ENGINE)
 
-RUN_ID = "50752e39-5c6f-4a05-8af1-fc2ced52ceb4"
+# Încarcă doar roof_type_classifier fără roof.jobs (care cere cv2)
+import importlib.util
+_rfc_spec = importlib.util.spec_from_file_location(
+    "roof_type_classifier",
+    _ENGINE / "roof" / "roof_type_classifier.py",
+)
+_rfc = importlib.util.module_from_spec(_rfc_spec)
+_rfc_spec.loader.exec_module(_rfc)
+
+RUN_ID = "78842a74-2ef7-4af3-87f2-2fb8b419dbc1"
 
 
 def _collect_side_views(job_root: Path):
@@ -82,12 +91,9 @@ def _setup_gemini():
 
 
 def main():
+    """Simulare: același prompt și etichete ca în roof_type_classifier, apel direct Gemini, afișează răspunsul."""
     from config.settings import JOBS_ROOT, RUNS_ROOT, load_plan_infos
-    from roof.roof_type_classifier import (
-        PROMPT_ROOF_TYPE_PER_FLOOR,
-        _floor_names,
-        _parse_roof_types_response,
-    )
+
     STAGE_NAME = "roof"
 
     job_root = None
@@ -111,7 +117,6 @@ def main():
         print("Nu există side_view-uri. Ieșire.", flush=True)
         sys.exit(0)
 
-    # num_floors_roof (excludem beci)
     try:
         plans = load_plan_infos(RUN_ID, stage_name=STAGE_NAME)
     except Exception as e:
@@ -131,20 +136,23 @@ def main():
 
     gemini = _setup_gemini()
     if not gemini:
-        print("Gemini client nu s-a inițializat (lipsă GEMINI_API_KEY?).", flush=True)
+        print("Gemini client nu s-a inițializat (GEMINI_API_KEY?).", flush=True)
         sys.exit(1)
 
-    floor_keys_list = ["parter"] + [f"etaj_{i}" for i in range(1, num_floors_roof)]
-    prompt = PROMPT_ROOF_TYPE_PER_FLOOR.format(
+    floor_names_text = _rfc._floor_names(num_floors_roof)
+    prompt = _rfc.PROMPT_ROOF_TYPE_PER_FLOOR.format(
         num_floors=num_floors_roof,
-        floor_names=_floor_names(num_floors_roof),
-        floor_keys=", ".join(floor_keys_list),
+        floor_names=floor_names_text,
     )
     parts = [prompt]
+    img_count = 0
     for p in side_views:
         if not p.exists():
             continue
         try:
+            img_count += 1
+            label = f"\n[Image {img_count} of {len(side_views)} side-view/cross-section]\n"
+            parts.append(label)
             parts.append(_prep_for_vlm(p))
         except Exception as e:
             print(f"  Skip {p.name}: {e}", flush=True)
@@ -152,27 +160,53 @@ def main():
         print("Nicio imagine validă.", flush=True)
         sys.exit(1)
 
-    gen_config = {
-        "temperature": 0.0,
-        "max_output_tokens": 512,
-        "response_mime_type": "application/json",
-    }
-    print("Apel Gemini classify_roof_types_per_floor (doar tipuri)...", flush=True)
+    print("Apel Gemini (același prompt ca în pipeline, cu etichete imagini)...", flush=True)
+    gen_config = {"temperature": 0.2, "max_output_tokens": 2048}
     try:
         response = gemini.generate_content(parts, generation_config=gen_config)
-        text = (response.text or "").strip() if response and response.parts else ""
+        # Extrage textul din TOATE părțile (uneori .text e doar prima parte)
+        text = ""
+        if response and response.candidates:
+            c = response.candidates[0]
+            finish_reason = getattr(c, "finish_reason", None)
+            print(f"  finish_reason: {finish_reason!r}", flush=True)
+            if getattr(c, "content", None) and getattr(c.content, "parts", None):
+                for part in c.content.parts:
+                    text += getattr(part, "text", "") or ""
+        if not text and response:
+            text = (response.text or "").strip()
+        text = text.strip()
         if not text:
             print("Răspuns Gemini gol.", flush=True)
             sys.exit(0)
-        types_result = _parse_roof_types_response(text, num_floors_roof)
-        print(f"   [RoofTypeClassifier] Gemini: types={types_result}", flush=True)
-        print(f"Rezultat types: {types_result}", flush=True)
-        if len(types_result) == num_floors_roof:
-            print("OK – apelul Gemini a returnat date complete.", flush=True)
-        else:
-            print("Gemini a returnat date incomplete (fallback va fi folosit în pipeline).", flush=True)
+        # Salvează răspunsul complet (uneori afișarea în terminal taie)
+        raw_path = _ENGINE / "gemini_roof_response_raw.txt"
+        raw_path.write_text(text, encoding="utf-8")
+        print(f"\nRăspuns complet salvat în: {raw_path} ({len(text)} caractere)", flush=True)
+        print("--- RĂSPUNS GEMINI (raw) ---", flush=True)
+        print(text, flush=True)
+        print("--- SFÂRȘIT RAW ---\n", flush=True)
+        types_result = _rfc._parse_roof_types_response(text, num_floors_roof)
+        data = None
+        json_str = _rfc._extract_json_object(text)
+        if json_str:
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        types_out, angles_out = _rfc._dict_to_floor_result(data or {}, num_floors_roof)
+        if not types_out:
+            types_out = types_result
+        if not angles_out and types_out:
+            for i in range(num_floors_roof):
+                angles_out[i] = 0.0 if types_out.get(i) == "0_w" else 30.0
+        print("=== REZULTAT SIMULARE ===", flush=True)
+        print(f"  types:  {types_out}", flush=True)
+        print(f"  angles: {angles_out}", flush=True)
     except Exception as e:
-        print(f"Eroare Gemini: {e}", flush=True)
+        print(f"Eroare: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

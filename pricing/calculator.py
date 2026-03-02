@@ -535,10 +535,10 @@ def calculate_pricing_for_plan(
         print(f"      - Pereți finisaje: {w_int_net_finish:.2f} m² × {coeff_walls:.0%} = {w_int_net_finish_basement:.2f} m²")
         print(f"      - Podele: {floor_area:.2f} m² × {coeff_floors:.0%} = {floor_area_basement:.2f} m²")
         
-        # Pereți interiori pentru basement: Wandaufbau (Keller) dacă există, altfel system_constructie
-        if use_wandaufbau and (wandaufbau_data.get("innenwandeBeci") or wandaufbau_data.get("außenwandeBeci")):
-            _wb_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
-            _wb_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
+        # Pereți interiori/exteriori pentru basement: același Wandaufbau (Keller) indiferent locuibil/nelocuibil
+        _wb_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
+        _wb_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
+        if use_wandaufbau and (_wb_innen or _wb_aussen):
             _p_innen = float(wandaufbau_coeffs.get("innen", {}).get(_wb_innen, 280))
             _p_aussen = float(wandaufbau_coeffs.get("aussen", {}).get(_wb_aussen, 280))
             _c_int_b = w_int_net_structure_basement * _p_innen

@@ -24,7 +24,11 @@ from .ocr_room_filling import (
 from .wall_repair import get_strict_1px_outline
 from .wall_gap_detector import (
     find_missing_wall,
+    find_missing_wall_raycast,
+    find_missing_wall_raycast_3walls,
     draw_plan_closed,
+    draw_plan_closed_raycast,
+    save_raycast_debug,
     get_red_dot_mask,
     check_garage_flood_touches_edge,
     save_check_garage_image,
@@ -1411,34 +1415,62 @@ def generate_walls_from_room_coordinates(
             if touches_edge:
                 print(f"      [GARAGE] Garaj {idx_garage + 1}/{len(garage_centers_list)}: flood atinge marginea → aplic algoritm perete lipsă")
                 detection_steps_dir = garage_dir / ("detection_steps" if len(garage_centers_list) == 1 else f"detection_steps_{idx_garage}")
-                result = find_missing_wall(
-                    plan_for_check,
-                    start_x=cx,
-                    start_y=cy,
-                    steps_dir=detection_steps_dir,
-                    step_interval=2000,
-                    max_iterations=500000,
+                detection_steps_dir.mkdir(parents=True, exist_ok=True)
+                segments = find_missing_wall_raycast(
+                    plan_for_check, start_x=cx, start_y=cy,
                     wall_mask=accepted_wall_segments_mask,
+                    min_gap_px=3,
                 )
-                if result is not None:
-                    draw_segment_on_mask(accepted_wall_segments_mask, result, 255)
-                    draw_segment_on_mask(walls_mask_validated, result, 255)
-                    plan_closed_img = draw_plan_closed(
-                        plan_for_check,
-                        result,
-                        mask_red=mask_red,
-                        color=(255, 255, 255),
-                        thickness=1,
+                if not segments:
+                    segments = find_missing_wall_raycast_3walls(
+                        plan_for_check, start_x=cx, start_y=cy,
+                        wall_mask=accepted_wall_segments_mask,
+                    )
+                if segments:
+                    for seg in segments:
+                        draw_segment_on_mask(accepted_wall_segments_mask, seg, 255)
+                        draw_segment_on_mask(walls_mask_validated, seg, 255)
+                    plan_closed_img = draw_plan_closed_raycast(
+                        plan_for_check, segments, mask_red=mask_red,
+                        color=(255, 255, 255), thickness=1,
                     )
                     name_closed = f"plan_closed_{idx_garage}.png" if len(garage_centers_list) > 1 else "plan_closed.png"
                     cv2.imwrite(str(garage_dir / name_closed), plan_closed_img)
-                    print(f"      [GARAGE] Garaj {idx_garage + 1}: perete lipsă închis → {name_closed}")
+                    save_raycast_debug(
+                        plan_for_check, cx, cy, segments,
+                        detection_steps_dir / "raycast_debug.png",
+                        wall_mask=accepted_wall_segments_mask,
+                    )
+                    print(f"      [GARAGE] Garaj {idx_garage + 1}: perete lipsă închis (ray cast, {len(segments)} segmente) → {name_closed}")
                 else:
-                    plan_closed_img = plan_for_check.copy()
-                    plan_closed_img[mask_red > 0] = (0, 0, 0)
-                    name_closed = f"plan_closed_{idx_garage}.png" if len(garage_centers_list) > 1 else "plan_closed.png"
-                    cv2.imwrite(str(garage_dir / name_closed), plan_closed_img)
-                    print(f"      [GARAGE] Garaj {idx_garage + 1}: algoritm negăsit segment")
+                    result = find_missing_wall(
+                        plan_for_check,
+                        start_x=cx,
+                        start_y=cy,
+                        steps_dir=detection_steps_dir,
+                        step_interval=2000,
+                        max_iterations=500000,
+                        wall_mask=accepted_wall_segments_mask,
+                    )
+                    if result is not None:
+                        draw_segment_on_mask(accepted_wall_segments_mask, result, 255)
+                        draw_segment_on_mask(walls_mask_validated, result, 255)
+                        plan_closed_img = draw_plan_closed(
+                            plan_for_check,
+                            result,
+                            mask_red=mask_red,
+                            color=(255, 255, 255),
+                            thickness=1,
+                        )
+                        name_closed = f"plan_closed_{idx_garage}.png" if len(garage_centers_list) > 1 else "plan_closed.png"
+                        cv2.imwrite(str(garage_dir / name_closed), plan_closed_img)
+                        print(f"      [GARAGE] Garaj {idx_garage + 1}: perete lipsă închis (BFS) → {name_closed}")
+                    else:
+                        plan_closed_img = plan_for_check.copy()
+                        plan_closed_img[mask_red > 0] = (0, 0, 0)
+                        name_closed = f"plan_closed_{idx_garage}.png" if len(garage_centers_list) > 1 else "plan_closed.png"
+                        cv2.imwrite(str(garage_dir / name_closed), plan_closed_img)
+                        print(f"      [GARAGE] Garaj {idx_garage + 1}: algoritm negăsit segment")
             else:
                 print(f"      [GARAGE] Garaj {idx_garage + 1}/{len(garage_centers_list)}: flood nu atinge marginea → garaj închis")
         except Exception as e:
@@ -1507,31 +1539,57 @@ def generate_walls_from_room_coordinates(
             if touches_edge:
                 print(f"      [{zone_name.upper()}] Flood atinge marginea → aplic algoritm perete lipsă")
                 steps_dir_zone = zone_dir / "detection_steps"
-                result = find_missing_wall(
+                steps_dir_zone.mkdir(parents=True, exist_ok=True)
+                # Întâi încercăm ray cast (Alg 1: 4 pereți + gap-uri)
+                segments = find_missing_wall_raycast(
                     plan_img, start_x=cx, start_y=cy,
-                    steps_dir=steps_dir_zone, step_interval=2000, max_iterations=500000,
                     wall_mask=accepted_wall_segments_mask,
+                    min_gap_px=3,
                 )
-                # Retry cu stable_min_px mai mic pentru terasă/balcon ca zona să se închidă mai bine
-                if result is None and zone_name in ("terasa", "balcon", "wintergarden"):
+                if not segments:
+                    # Fallback: ray cast 3 pereți (Alg 2: o latură complet lipsă)
+                    segments = find_missing_wall_raycast_3walls(
+                        plan_img, start_x=cx, start_y=cy,
+                        wall_mask=accepted_wall_segments_mask,
+                    )
+                if segments:
+                    for seg in segments:
+                        draw_segment_on_mask(accepted_wall_segments_mask, seg, 255)
+                        draw_segment_on_mask(walls_mask_validated, seg, 255)
+                    plan_closed = draw_plan_closed_raycast(
+                        plan_img, segments, mask_red=mask_red, color=(255, 255, 255), thickness=1
+                    )
+                    cv2.imwrite(str(zone_dir / f"plan_closed{suffix}.png"), plan_closed)
+                    save_raycast_debug(
+                        plan_img, cx, cy, segments,
+                        steps_dir_zone / "raycast_debug.png",
+                        wall_mask=accepted_wall_segments_mask,
+                    )
+                    print(f"      [{zone_name.upper()}] Perete lipsă închis (ray cast, {len(segments)} segmente) → {zone_name}/plan_closed{suffix}.png")
+                else:
+                    # Fallback: BFS flood-fill cu parametri adaptați la dimensiunea planului
+                    area_px = h_orig * w_orig
+                    stable_min_px = max(80, min(2500, int((area_px ** 0.5) / 40)))
+                    min_area_before_stable = max(400, int(0.002 * area_px))
                     result = find_missing_wall(
                         plan_img, start_x=cx, start_y=cy,
                         steps_dir=steps_dir_zone, step_interval=2000, max_iterations=500000,
                         wall_mask=accepted_wall_segments_mask,
-                        stable_min_px=500,
+                        stable_min_px=stable_min_px,
+                        min_area_before_stable=min_area_before_stable,
                     )
-                if result is not None:
-                    draw_segment_on_mask(accepted_wall_segments_mask, result, 255)
-                    draw_segment_on_mask(walls_mask_validated, result, 255)
-                    plan_closed = draw_plan_closed(plan_img, result, mask_red=mask_red, color=(255, 255, 255), thickness=1)
-                    cv2.imwrite(str(zone_dir / f"plan_closed{suffix}.png"), plan_closed)
-                    print(f"      [{zone_name.upper()}] Perete lipsă închis: {result['type']} → {zone_name}/plan_closed{suffix}.png")
-                else:
-                    plan_closed = plan_img.copy()
-                    plan_closed[mask_red > 0] = (0, 0, 0)
-                    cv2.imwrite(str(zone_dir / f"plan_closed{suffix}.png"), plan_closed)
-                    if zone_name in ("terasa", "balcon", "wintergarden"):
-                        print(f"      [{zone_name.upper()}] Nu s-a găsit segment de închidere → zonă rămâne deschisă")
+                    if result is not None:
+                        draw_segment_on_mask(accepted_wall_segments_mask, result, 255)
+                        draw_segment_on_mask(walls_mask_validated, result, 255)
+                        plan_closed = draw_plan_closed(plan_img, result, mask_red=mask_red, color=(255, 255, 255), thickness=1)
+                        cv2.imwrite(str(zone_dir / f"plan_closed{suffix}.png"), plan_closed)
+                        print(f"      [{zone_name.upper()}] Perete lipsă închis (BFS): {result.get('type', '?')} → {zone_name}/plan_closed{suffix}.png")
+                    else:
+                        plan_closed = plan_img.copy()
+                        plan_closed[mask_red > 0] = (0, 0, 0)
+                        cv2.imwrite(str(zone_dir / f"plan_closed{suffix}.png"), plan_closed)
+                        if zone_name in ("terasa", "balcon", "wintergarden"):
+                            print(f"      [{zone_name.upper()}] Nu s-a găsit segment de închidere → zonă rămâne deschisă")
             else:
                 print(f"      [{zone_name.upper()}] Flood nu atinge marginea → zonă închisă, nu aplic algoritm")
         except Exception as e:
@@ -1663,10 +1721,19 @@ def generate_walls_from_room_coordinates(
         if center_xy is not None:
             intrare_results.append((center_xy, touches))
 
-    # ✅ Mască cu terasă + balcon (pentru generarea dreptunghiurilor acoperiș); restul pipeline-ului folosește masca fără pereții terasei/balconului
-    walls_mask_for_roof = accepted_wall_segments_mask.copy()
+    # ✅ CALCULUL LATURI BALCON: ÎNAINTE de strip (pereții de contact încă există!)
+    balcon_center = None
+    for center_xy, touches_edge, _bp, _ap in balcon_results:
+        if not touches_edge:
+            balcon_center = center_xy
+            break
+    if balcon_center is None and balcon_results:
+        balcon_center = balcon_results[0][0]
 
-    # ✅ Strip doar terasă + balcon. 01_walls_from_coords INCLUDE garajele și intrările acoperite; scoatem doar pereții terasei/balconului.
+    accepted_wall_segments_mask_before_strip = accepted_wall_segments_mask.copy()
+
+    # === strip terasa/balcon (codul existent) ===
+    # ✅ Strip doar terasă + balcon.
     strip_dir = output_dir / "terasa_balcon_strip"
     strip_dir.mkdir(parents=True, exist_ok=True)
     flood_terasa_balcon_combined = np.zeros((h_orig, w_orig), dtype=np.uint8)
@@ -1753,118 +1820,186 @@ def generate_walls_from_room_coordinates(
     plan_raw_img[accepted_wall_segments_mask > 0] = [255, 255, 255]
 
     # ✅ Balcon: mască casă fără balcon, mască doar balcon, regulă pentru includere la acoperiș (folosim primul balcon valid)
-    balcon_center = None
-    for center_xy, touches_edge, _bp, _ap in balcon_results:
-        if not touches_edge:
-            balcon_center = center_xy
-            break
-    if balcon_center is None and balcon_results:
-        balcon_center = balcon_results[0][0]
-    if balcon_center is not None:
-        cx_b, cy_b = balcon_center
-        balcon_dir = output_dir / "balcon_roof_rule"
-        balcon_dir.mkdir(parents=True, exist_ok=True)
-        # 1) Pereți fără balcon (cu terasă): elimin doar pereții care mărginesc balconul
-        plan_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-        plan_full[walls_mask_for_roof > 0] = [255, 255, 255]
-        _, balcony_interior_only = check_garage_flood_touches_edge(
-            plan_full, cx_b, cy_b, wall_mask=walls_mask_for_roof
-        )
-        balcony_only_mask = (balcony_interior_only > 0).astype(np.uint8) * 255
-        walls_without_balcon = walls_mask_for_roof.copy()
-        wall_bin = (walls_mask_for_roof > 0).astype(np.uint8)
-        for y in range(h_orig):
-            for x in range(w_orig):
-                if wall_bin[y, x] == 0:
-                    continue
-                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and balcony_interior_only[ny, nx] > 0:
-                        walls_without_balcon[y, x] = 0
-                        break
-        cv2.imwrite(str(balcon_dir / "walls_without_balcon.png"), walls_without_balcon)
-        cv2.imwrite(str(balcon_dir / "balcony_only_mask.png"), balcony_only_mask)
-        # 2) Flood fill din exterior pe masca fără balcon → forma casei fără balcon = tot ce nu e exterior
-        flood_base_no_balcon = np.where(walls_without_balcon > 0, 0, 255).astype(np.uint8)
-        seeds = [(0, 0), (w_orig - 1, 0), (0, h_orig - 1), (w_orig - 1, h_orig - 1)]
-        step = max(1, min(50, w_orig // 10, h_orig // 10))
-        for px in range(0, w_orig, step):
+    def _flood_fill_remove_supplementary_lines(wall_mask_2d: np.ndarray, h: int, w: int) -> np.ndarray:
+        """Elimină liniile suplimentare: pixeli de perete cu ≥2 vecini flood în părți opuse (N-S sau E-W) și <3 vecini pereți (8-conectivitate)."""
+        work = (wall_mask_2d > 0).astype(np.uint8) * 255
+        flood_base = np.where(work > 0, 0, 255).astype(np.uint8)
+        seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+        step = max(1, min(50, w // 10, h // 10))
+        for px in range(0, w, step):
             seeds.append((px, 0))
-            seeds.append((px, h_orig - 1))
-        for py in range(0, h_orig, step):
+            seeds.append((px, h - 1))
+        for py in range(0, h, step):
             seeds.append((0, py))
-            seeds.append((w_orig - 1, py))
-        exterior_no_balcon = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        for sx, sy in seeds:
-            if sy >= h_orig or sx >= w_orig or flood_base_no_balcon[sy, sx] != 255:
+            seeds.append((w - 1, py))
+        flood_any = np.zeros((h, w), dtype=np.uint8)
+        for cx, cy in seeds:
+            if cy >= h or cx >= w or flood_base[cy, cx] != 255:
                 continue
-            region_m = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
-            img_f = flood_base_no_balcon.copy()
-            cv2.floodFill(img_f, region_m, (sx, sy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
-            exterior_no_balcon[region_m[1:-1, 1:-1] > 0] = 255
-        house_shape_without_balcon = np.where(exterior_no_balcon > 0, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(balcon_dir / "house_shape_without_balcon.png"), house_shape_without_balcon)
-        # 3) Pixels de contact: casă–balcon
-        house_boundary = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        balcony_boundary = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        for y in range(h_orig):
-            for x in range(w_orig):
-                if house_shape_without_balcon[y, x] == 0:
+            region_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            img_f = flood_base.copy()
+            cv2.floodFill(img_f, region_mask, (cx, cy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+            flood_any[region_mask[1:-1, 1:-1] > 0] = 255
+        for _ in range(5000):
+            wall_coords = np.argwhere(work > 0)
+            if wall_coords.size == 0:
+                break
+            to_remove = np.zeros((h, w), dtype=np.uint8)
+            for idx in range(len(wall_coords)):
+                y, x = int(wall_coords[idx, 0]), int(wall_coords[idx, 1])
+                flood_n = 1 if y > 0 and flood_any[y - 1, x] > 0 else 0
+                flood_s = 1 if y < h - 1 and flood_any[y + 1, x] > 0 else 0
+                flood_e = 1 if x < w - 1 and flood_any[y, x + 1] > 0 else 0
+                flood_w = 1 if x > 0 and flood_any[y, x - 1] > 0 else 0
+                if not ((flood_n and flood_s) or (flood_e and flood_w)):
                     continue
-                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and balcony_only_mask[ny, nx] > 0:
-                        house_boundary[y, x] = 255
-                        break
-        for y in range(h_orig):
-            for x in range(w_orig):
-                if balcony_only_mask[y, x] == 0:
+                n_wall = sum(
+                    1 for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                    if (dx or dy) and 0 <= y + dy < h and 0 <= x + dx < w and work[y + dy, x + dx] != 0
+                )
+                if n_wall >= 3:
                     continue
-                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and house_shape_without_balcon[ny, nx] > 0:
-                        balcony_boundary[y, x] = 255
-                        break
-        # 4) Număr de „laturi” = componente conexe ale frontierei casei cu balconul
-        num_labels_h, labels_h = cv2.connectedComponents(house_boundary, connectivity=8)
-        num_sides = max(0, num_labels_h - 1)
-        # 5) Lungimi de contact (extindere pe direcția principală a contactului)
-        pts_house = np.column_stack(np.where(house_boundary > 0))  # (N, 2) y, x
-        pts_balcony = np.column_stack(np.where(balcony_boundary > 0))
-        L_house = 0.0
-        L_balcony = 0.0
-        if len(pts_house) >= 2 and len(pts_balcony) >= 1:
-            pts = np.vstack((pts_house, pts_balcony))
-            mean_pt = pts.mean(axis=0)
-            centered = pts - mean_pt
-            if centered.shape[0] >= 2:
-                cov = np.cov(centered[:, 1], centered[:, 0])
-                try:
-                    eigvals, eigvecs = np.linalg.eig(cov)
-                    idx = np.argmax(np.abs(eigvals))
-                    direction = eigvecs[:, idx]
-                    direction = direction / (np.linalg.norm(direction) + 1e-9)
-                    proj_house = np.dot(pts_house - mean_pt, direction) if len(pts_house) else np.zeros(0)
-                    proj_balcony = np.dot(pts_balcony - mean_pt, direction) if len(pts_balcony) else np.zeros(0)
-                    L_house = float(np.ptp(proj_house)) if len(proj_house) else 0.0
-                    L_balcony = float(np.ptp(proj_balcony)) if len(proj_balcony) else 0.0
-                except Exception:
-                    L_house = float(len(pts_house))
-                    L_balcony = float(len(pts_balcony))
-        if L_house == 0 and len(pts_house):
-            L_house = float(len(pts_house))
-        if L_balcony == 0 and len(pts_balcony):
-            L_balcony = float(len(pts_balcony))
-        # 6) Regulă: 1 latură și latura balconului < latura casei → nu trimitem balconul la acoperiș
-        include_balcon_in_roof = (num_sides >= 2) or (num_sides == 1 and L_balcony >= L_house)
-        if not include_balcon_in_roof:
-            walls_mask_for_roof = walls_without_balcon.copy()
-            print(f"      [BALCON ROOF] 1 latură, latura balcon ({L_balcony:.0f}) < latura casei ({L_house:.0f}) → balcon exclus de la dreptunghiuri acoperiș")
-        else:
-            print(f"      [BALCON ROOF] laturi={num_sides}, L_balcony={L_balcony:.0f}, L_house={L_house:.0f} → balcon inclus la acoperiș")
-        cv2.imwrite(str(balcon_dir / "house_boundary.png"), house_boundary)
-        cv2.imwrite(str(balcon_dir / "balcony_boundary.png"), balcony_boundary)
-        print(f"      💾 Salvat: balcon_roof_rule/ (house_shape_without_balcon, balcony_only, regula aplicată)")
+                to_remove[y, x] = 255
+            if np.sum(to_remove) == 0:
+                break
+            work[to_remove > 0] = 0
+            flood_base = np.where(work > 0, 0, 255).astype(np.uint8)
+            flood_any = np.zeros((h, w), dtype=np.uint8)
+            for cx, cy in seeds:
+                if cy >= h or cx >= w or flood_base[cy, cx] != 255:
+                    continue
+                region_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                img_f = flood_base.copy()
+                cv2.floodFill(img_f, region_mask, (cx, cy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+                flood_any[region_mask[1:-1, 1:-1] > 0] = 255
+        return work
+
+    def _estimate_wall_thickness(walls_mask: np.ndarray) -> int:
+        """Estimează grosimea medie a pereților din mască (în pixeli)."""
+        wm = np.max(walls_mask, axis=-1) if walls_mask.ndim == 3 else walls_mask
+        wall_bin = (wm > 0).astype(np.uint8)
+        h, w = wall_bin.shape
+        thick_samples: list[int] = []
+        for x in range(0, w, 20):
+            col = wall_bin[:, x]
+            wl = np.where(col > 0)[0]
+            if len(wl) < 2:
+                continue
+            segs: list[list[int]] = [[wl[0]]]
+            for i in range(1, len(wl)):
+                if wl[i] - wl[i - 1] <= 2:
+                    segs[-1].append(wl[i])
+                else:
+                    segs.append([wl[i]])
+            for s in segs:
+                if 2 <= len(s) <= 20:
+                    thick_samples.append(len(s))
+        if not thick_samples:
+            return 3
+        return max(2, int(np.median(thick_samples)))
+
+    def _count_balcony_contact_segments(walls_all_mask: np.ndarray, cx_b: int, cy_b: int, h: int, w: int, wall_thickness: int = 3) -> tuple[int, np.ndarray]:
+        """
+        Numără câte laturi distincte ale casei sunt lipite de balcon.
+        Funcționează corect și cu pereți groși (3px+).
+
+        Strategie:
+        1. Flood fill din centrul balconului → interior balcon
+        2. Flood fill din colțuri → exterior general
+        3. Dilată balconul și exteriorul cu kernel bazat pe wall_thickness
+        4. Contact = pixeli de perete în zona balcon dilatat, dar NU în zona exterior dilatat
+        5. Clasifică pixelii de contact ca H sau V după vecini, grupează în segmente
+        """
+        wall_bin = (np.max(walls_all_mask, axis=-1) if walls_all_mask.ndim == 3 else walls_all_mask) > 0
+        walls_all_mask = (wall_bin.astype(np.uint8)) * 255
+        # 1. Flood din centrul balconului
+        fb = np.where(walls_all_mask > 0, 0, 255).astype(np.uint8)
+        fm = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(fb, fm, (cx_b, cy_b), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+        bal_int = fm[1:-1, 1:-1]
+
+        # 2. Flood exterior (din toate marginile)
+        fb_ext = np.where(walls_all_mask > 0, 0, 255).astype(np.uint8)
+        ext = np.zeros((h, w), dtype=np.uint8)
+        step = max(1, min(50, w // 10, h // 10))
+        seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+        for px in range(0, w, step):
+            seeds.append((px, 0))
+            seeds.append((px, h - 1))
+        for py in range(0, h, step):
+            seeds.append((0, py))
+            seeds.append((w - 1, py))
+        for sx, sy in seeds:
+            if sy >= h or sx >= w or fb_ext[sy, sx] != 255:
+                continue
+            rm = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            ife = fb_ext.copy()
+            cv2.floodFill(ife, rm, (sx, sy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+            ext[rm[1:-1, 1:-1] > 0] = 255
+
+        # 3. Dilată balcon și exterior cu kernel proporcional cu grosimea pereților
+        k = wall_thickness * 2 + 1
+        kernel = np.ones((k, k), np.uint8)
+        bal_dil = cv2.dilate((bal_int > 0).astype(np.uint8) * 255, kernel)
+        ext_dil = cv2.dilate(ext, kernel)
+
+        # 4. Contact: perete adiacent cu balcon dilatat, dar NU cu exterior dilatat
+        contact = np.zeros((h, w), dtype=np.uint8)
+        contact[(wall_bin > 0) & (bal_dil > 0) & (ext_dil == 0)] = 255
+
+        if np.sum(contact > 0) < 2:
+            return 0, contact
+
+        pts = np.column_stack(np.where(contact > 0))
+        pts_set = set(map(tuple, pts.tolist()))
+
+        # 5. Clasifică H vs V după vecini de contact
+        h_pixels: set[tuple[int, int]] = set()
+        v_pixels: set[tuple[int, int]] = set()
+        for y, x in pts:
+            n_horiz = sum(1 for dx in [-1, 1] if (y, x + dx) in pts_set)
+            n_vert = sum(1 for dy in [-1, 1] if (y + dy, x) in pts_set)
+            if n_horiz >= n_vert:
+                h_pixels.add((y, x))
+            else:
+                v_pixels.add((y, x))
+
+        tol = wall_thickness + 2
+        min_len = wall_thickness * 2
+
+        def cluster_1d(coords: list[int], gap: int = tol) -> list[list[int]]:
+            coords = sorted(set(coords))
+            if not coords:
+                return []
+            groups = [[coords[0]]]
+            for v in coords[1:]:
+                if v - groups[-1][-1] <= gap:
+                    groups[-1].append(v)
+                else:
+                    groups.append([v])
+            return groups
+
+        segments: list[dict] = []
+
+        if h_pixels:
+            for yg in cluster_1d([y for y, x in h_pixels]):
+                in_band = [(y, x) for y, x in h_pixels if yg[0] <= y <= yg[-1]]
+                if not in_band:
+                    continue
+                xs = [x for _, x in in_band]
+                if max(xs) - min(xs) >= min_len:
+                    segments.append({"type": "h", "y": int(np.mean(yg)), "length": max(xs) - min(xs)})
+
+        if v_pixels:
+            for xg in cluster_1d([x for y, x in v_pixels]):
+                in_band = [(y, x) for y, x in v_pixels if xg[0] <= x <= xg[-1]]
+                if not in_band:
+                    continue
+                ys = [y for y, _ in in_band]
+                if max(ys) - min(ys) >= min_len:
+                    segments.append({"type": "v", "x": int(np.mean(xg)), "length": max(ys) - min(ys)})
+
+        return len(segments), contact
 
     # ✅ Scheletonizare înainte de blacklist: imaginea și masca folosite la blacklist au pereți 1px, astfel eliminarea pereților zonei blacklist șterge tot
     if np.any(accepted_wall_segments_mask > 0):
@@ -2128,14 +2263,66 @@ def generate_walls_from_room_coordinates(
             print(f"      🔗 Skeleton 1px aplicat pentru 01_walls_from_coords.png")
         except Exception as e:
             print(f"      ⚠️ Skeleton 1px pentru 01_walls_from_coords eșuat: {e}")
-    
-    # ✅ Salvăm 01_walls_from_coords.png: pereți 1px DUPĂ curățarea flood fill (exact masca folosită în pipeline).
-    # Conține garajele și intrările acoperite; doar pereții terasei și balconului au fost scoși (terasa_balcon_strip).
+
+    # ✅ Regulă balcon acoperiș: număr laturi lipite de casă pe masca curată; walls_mask_for_roof construit aici
+    # Folosim masca dinainte de strip (accepted_wall_segments_mask_before_strip) ca pereții de contact să existe
+    if balcon_center is not None:
+        cx_b, cy_b = balcon_center
+        walls_2d = (np.max(accepted_wall_segments_mask_before_strip, axis=-1) if accepted_wall_segments_mask_before_strip.ndim == 3 else accepted_wall_segments_mask_before_strip).astype(np.uint8)
+        if np.any(walls_2d > 0):
+            walls_for_count = (walls_2d > 0).astype(np.uint8) * 255
+            wt = _estimate_wall_thickness(accepted_wall_segments_mask_before_strip)
+            n_sides, contact_mask = _count_balcony_contact_segments(
+                walls_for_count, cx_b, cy_b, h_orig, w_orig, wall_thickness=wt
+            )
+        else:
+            n_sides, contact_mask = 0, np.zeros((h_orig, w_orig), dtype=np.uint8)
+        print(f"      [BALCON ROOF] laturi lipite de casă: {n_sides}")
+
+        if n_sides >= 2:
+            # Masca CU balcon (dinainte de strip), ca dreptunghiurile acoperiș să includă balconul
+            walls_mask_for_roof = accepted_wall_segments_mask_before_strip.copy()
+            include_balcon_in_roof = True
+            print(f"      [BALCON ROOF] {n_sides} laturi → balcon INCLUS la acoperiș")
+        else:
+            fb_b = np.where(accepted_wall_segments_mask > 0, 0, 255).astype(np.uint8)
+            fm_b = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
+            cv2.floodFill(fb_b, fm_b, (cx_b, cy_b), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+            bal_int_b = fm_b[1:-1, 1:-1]
+
+            walls_mask_for_roof = accepted_wall_segments_mask.copy()
+            for y in range(h_orig):
+                for x in range(w_orig):
+                    if walls_mask_for_roof[y, x] == 0:
+                        continue
+                    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < h_orig and 0 <= nx < w_orig and bal_int_b[ny, nx] > 0:
+                            walls_mask_for_roof[y, x] = 0
+                            break
+            include_balcon_in_roof = False
+            print(f"      [BALCON ROOF] 1 latură → balcon EXCLUS din acoperiș")
+
+        balcon_dir = output_dir / "balcon_roof_rule"
+        balcon_dir.mkdir(parents=True, exist_ok=True)
+        contact_viz = original_img.copy()
+        if contact_viz.ndim == 2:
+            contact_viz = cv2.cvtColor(contact_viz, cv2.COLOR_GRAY2BGR)
+        contact_viz[contact_mask > 0] = [0, 255, 255]
+        cv2.putText(contact_viz, f"Laturi lipite: {n_sides}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+        cv2.imwrite(str(balcon_dir / "laturi_lipite_viz.png"), contact_viz)
+    else:
+        walls_mask_for_roof = accepted_wall_segments_mask.copy()
+        include_balcon_in_roof = False
+
+    # ✅ Salvăm 01_walls_from_coords.png: pereți 1px DUPĂ curățarea flood fill.
+    # walls_mask_for_roof e construit la final din accepted_wall_segments_mask (clean) → îl folosim direct
     segments_path = output_dir / "01_walls_from_coords.png"
-    segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)  # Fundal negru
-    segments_img[accepted_wall_segments_mask > 0] = [255, 255, 255]  # Pereți albi, 1px, curățați flood fill
+    segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+    roof_mask_1px = walls_mask_for_roof if np.any(walls_mask_for_roof > 0) else accepted_wall_segments_mask
+    segments_img[roof_mask_1px > 0] = [255, 255, 255]
+    print(f"      💾 Salvat: {segments_path.name} (mască {'cu' if include_balcon_in_roof else 'fără'} balcon, 1px)")
     cv2.imwrite(str(segments_path), segments_img)
-    print(f"      💾 Salvat: {segments_path.name} (pereți 1px, curățați cu flood fill din colțuri)")
     
     # ✅ Recalculăm walls_barrier din segmentele acceptate DUPĂ eliminare; dacă inputul e 1px (api_walls_from_json_1px), păstrăm 1px
     if _input_is_1px:

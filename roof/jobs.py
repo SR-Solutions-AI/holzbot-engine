@@ -37,18 +37,27 @@ class RoofJobResult:
     result_data: dict | None = None
 
 
-def _load_floor_metadata(job_root: Path, original_name: str, run_dir: Path | None = None) -> dict | None:
-    """Încarcă metadata pentru a determina floor_type. Încearcă job_root, apoi run_dir (dacă dat)."""
+def _load_floor_metadata(job_root: Path, original_name: str, run_dir: Path | None = None, plan_id: str | None = None) -> dict | None:
+    """Încarcă metadata pentru a determina floor_type. Încearcă job_root, apoi run_dir (dacă dat).
+    Caută mai întâi după plan_id (ex: plan_01_cluster_1), apoi după original_name (stem, ex: cluster_1)."""
+    names_to_try = []
+    if plan_id:
+        names_to_try.append(plan_id)
+    if original_name and original_name not in names_to_try:
+        names_to_try.append(original_name)
+    if not names_to_try:
+        names_to_try = [original_name]
     for base in (job_root, run_dir) if run_dir is not None else (job_root,):
         if base is None:
             continue
-        metadata_file = base / "plan_metadata" / f"{original_name}.json"
-        if metadata_file.exists():
-            try:
-                with open(metadata_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+        for name in names_to_try:
+            metadata_file = base / "plan_metadata" / f"{name}.json"
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
     return None
 
 
@@ -74,7 +83,7 @@ def _wall_mask_area(run_id: str, plan: PlanInfo) -> int:
 def _floor_type_rank(plan: PlanInfo, job_root: Path, run_dir: Path | None = None) -> int:
     """Rang din clasificare: 0 = parter (ground), 1 = intermediar, 2 = top, 3 = unknown."""
     stem = getattr(plan.plan_image, "stem", None) or (plan.plan_id.split("_", 2)[-1] if "_" in plan.plan_id else plan.plan_id)
-    meta = _load_floor_metadata(job_root, stem, run_dir)
+    meta = _load_floor_metadata(job_root, stem, run_dir, plan_id=plan.plan_id)
     if not meta:
         return _FLOOR_ORDER["unknown"]
     ft = (meta.get("floor_classification") or {}).get("floor_type", "unknown").lower()
@@ -116,7 +125,7 @@ def _run_for_single_plan(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     original_name = plan.plan_image.stem
-    metadata = _load_floor_metadata(job_root, original_name)
+    metadata = _load_floor_metadata(job_root, original_name, plan_id=plan.plan_id)
 
     is_top_floor = False
     floor_type = "unknown"
@@ -125,6 +134,12 @@ def _run_for_single_plan(
         floor_class = metadata.get("floor_classification", {})
         floor_type = floor_class.get("floor_type", "unknown").lower()
         is_top_floor = any(keyword in floor_type for keyword in ["top", "roof", "attic", "mansarda"])
+
+    # Fallback: când nu avem metadata (ex: plan_metadata lipsă sau run vechi), ultimul etaj = top floor
+    if not metadata and total_floors > 1 and index == total - 1:
+        print(f"       🔥 FALLBACK ROOF: Fără plan_metadata – consider ultimul etaj ({plan.plan_id}) ca top floor.", flush=True)
+        is_top_floor = True
+        floor_type = "top_floor (fallback)"
 
     if total_floors == 1:
         if not is_top_floor:
@@ -240,9 +255,19 @@ def _run_roof_3d_workflow(
     else:
         tmp = tempfile.mkdtemp(prefix="holzbot_roof_floors_")
         try:
-            for i, src in enumerate(paths):
+            floors_meta = []
+            for i, (src, plan) in enumerate(zip(paths, plans)):
                 dst = Path(tmp) / f"floor_{i:02d}.png"
                 shutil.copy2(src, dst)
+                interior_path = src.parent / "09_interior.png"
+                floors_meta.append({
+                    "floor_path": dst.name,
+                    "plan_id": plan.plan_id,
+                    "interior_mask_path": str(interior_path.resolve()) if interior_path.exists() else None,
+                })
+            (Path(tmp) / "floors_meta.json").write_text(
+                json.dumps(floors_meta, indent=0), encoding="utf-8"
+            )
             wall_input = tmp
         except Exception as e:
             print(f"       ⚠️ [{STAGE_NAME}] Eroare la pregătirea etajelor: {e}", flush=True)
@@ -351,32 +376,40 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
     num_floors_roof = len(plans_roof)
     num_floors_for_gemini = (num_floors_roof - 1) if basement_idx is not None else num_floors_roof
 
-    # Tip acoperiș per etaj: DOAR din Gemini (side_view) pentru etajele vizibile; beciul primește 2_w
+    # Tip acoperiș ȘI unghi per etaj: din Gemini (side_view); beciul primește 2_w și default angle
     floor_roof_types: dict | None = None
+    floor_roof_angles: dict | None = None
     side_views = _collect_side_views(job_root)
     if not side_views or num_floors_for_gemini < 1:
-        print(f"\n>>> PAS ROOF GEMINI: NU RULEAZĂ (side_views={len(side_views) if side_views else 0}, num_floors_for_gemini={num_floors_for_gemini}) – folosesc fallback 2_w <<<\n", flush=True)
+        print(f"\n>>> PAS ROOF GEMINI: NU RULEAZĂ (side_views={len(side_views) if side_views else 0}, num_floors_for_gemini={num_floors_for_gemini}) – folosesc fallback 2_w + default unghi <<<\n", flush=True)
     if side_views and num_floors_for_gemini >= 1:
         print("\n" + "=" * 70, flush=True)
-        print(">>> PAS ROOF: GEMINI – clasificare DOAR TIP ACOPERIȘ (side_view) <<<", flush=True)
-        print(">>> Panta acoperișului se introduce în formular (Dämmung & Dachdeckung) <<<", flush=True)
+        print(">>> PAS ROOF: GEMINI – clasificare TIP ACOPERIȘ ȘI UNGHI/PANTĂ (side_view) <<<", flush=True)
+        print(f">>> Trimitem TOATE cele {len(side_views)} imagini side_view la Gemini. <<<", flush=True)
         print("=" * 70 + "\n", flush=True)
         try:
             from segmenter.classifier import setup_gemini_client
             from roof.roof_type_classifier import classify_roof_types_per_floor
             gemini = setup_gemini_client()
             if gemini:
-                floor_roof_types = classify_roof_types_per_floor(
+                types_result, angles_result = classify_roof_types_per_floor(
                     gemini, side_views, num_floors_for_gemini
                 )
-                if floor_roof_types:
+                if types_result:
+                    floor_roof_types = types_result
                     print(f"   [roof] FOLOSIM tipuri acoperiș de la Gemini: {floor_roof_types}", flush=True)
-                else:
+                if angles_result:
+                    floor_roof_angles = angles_result
+                    print(f"   [roof] FOLOSIM unghiuri acoperiș de la Gemini: {floor_roof_angles}", flush=True)
+                if not floor_roof_types:
                     print(f"   [roof] NU avem tipuri de la Gemini – vom folosi fallback 2_w pentru toate etajele.", flush=True)
+                if not floor_roof_angles:
+                    print(f"   [roof] NU avem unghiuri de la Gemini – folosesc default 30° per etaj.", flush=True)
             else:
-                print(">>> PAS ROOF GEMINI: client Gemini nu s-a inițializat (GEMINI_API_KEY?) – fallback 2_w <<<", flush=True)
+                print(">>> PAS ROOF GEMINI: client Gemini nu s-a inițializat (GEMINI_API_KEY?) – fallback 2_w + 30° <<<", flush=True)
         except Exception as e:
             print(f"       ⚠️ [{STAGE_NAME}] Roof type classifier: {e}", flush=True)
+    DEFAULT_ROOF_ANGLE_DEG = 30.0
     if not floor_roof_types and num_floors_roof >= 1:
         floor_roof_types = {i: "2_w" for i in range(num_floors_roof)}
         print(f"   [roof] Aplicat fallback: floor_roof_types={floor_roof_types}", flush=True)
@@ -393,28 +426,28 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
         floor_roof_types = full_types
         print(f"   [roof] Beci fără acoperiș la index {basement_idx}; floor_roof_types={floor_roof_types}", flush=True)
 
-    # Panta acoperișului: din formular (pasul Dämmung & Dachdeckung), o valoare pentru toate etajele
-    DEFAULT_ROOF_ANGLE_DEG = 30.0
-    angle_deg = DEFAULT_ROOF_ANGLE_DEG
-    dd = frontend_data.get("daemmungDachdeckung") or {}
-    raw = frontend_data.get("pantaAcoperis") or frontend_data.get("dachneigung") or dd.get("pantaAcoperis") or dd.get("dachneigung")
-    print(f"   [roof] Sursă pantă: frontend_data.pantaAcoperis={frontend_data.get('pantaAcoperis')!r}, "
-          f"frontend_data.dachneigung={frontend_data.get('dachneigung')!r}, "
-          f"daemmungDachdeckung.pantaAcoperis={dd.get('pantaAcoperis')!r}, "
-          f"daemmungDachdeckung.dachneigung={dd.get('dachneigung')!r} → raw={raw!r}", flush=True)
-    if raw is not None:
-        try:
-            v = float(raw)
-            if 10 <= v <= 70:
-                angle_deg = v
-                print(f"   [roof] Folosesc panta din formular: {angle_deg}°", flush=True)
+    # Unghiuri: folosim cele de la Gemini; lipsă = default 30° (sau 0 pentru 0_w)
+    if floor_roof_angles is None or not floor_roof_angles:
+        floor_roof_angles = {}
+    for i in range(num_floors_roof):
+        if i not in floor_roof_angles:
+            t = (floor_roof_types or {}).get(i)
+            floor_roof_angles[i] = 0.0 if t == "0_w" else DEFAULT_ROOF_ANGLE_DEG
+    if basement_idx is not None and floor_roof_angles:
+        # Reindexare unghiuri când avem beci: Gemini nu a dat unghi pentru beci
+        ang_from_gemini = dict(floor_roof_angles)
+        floor_roof_angles = {}
+        gemini_idx = 0
+        for i in range(num_floors_roof):
+            if i == basement_idx:
+                floor_roof_angles[i] = 0.0  # nefolosit (fără acoperiș)
             else:
-                print(f"   [roof] Valoare raw={v} în afara [10,70] – folosesc default {DEFAULT_ROOF_ANGLE_DEG}°", flush=True)
-        except (TypeError, ValueError) as e:
-            print(f"   [roof] Nu pot converti raw={raw!r} la float: {e} – folosesc default {DEFAULT_ROOF_ANGLE_DEG}°", flush=True)
+                floor_roof_angles[i] = ang_from_gemini.get(gemini_idx, DEFAULT_ROOF_ANGLE_DEG)
+                gemini_idx += 1
+    if num_floors_roof >= 1:
+        floor_roof_angles = {i: float(floor_roof_angles.get(i, DEFAULT_ROOF_ANGLE_DEG)) for i in range(num_floors_roof)}
     else:
-        print(f"   [roof] Nicio pantă în formular – folosesc default {DEFAULT_ROOF_ANGLE_DEG}° pentru toate etajele.", flush=True)
-    floor_roof_angles: dict | None = {i: angle_deg for i in range(num_floors_roof)} if num_floors_roof >= 1 else None
+        floor_roof_angles = None
 
     print(f"   [roof] Valorile trimise la workflow: floor_roof_types={floor_roof_types}, floor_roof_angles={floor_roof_angles}", flush=True)
     print(f"\n⚙️  [{STAGE_NAME}] Acoperiș pentru {total} plan{'uri' if total > 1 else ''} (inclusiv beci în 3D, preț fix 10 EUR)...")

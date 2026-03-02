@@ -45,7 +45,11 @@ def _run_for_single_plan(
     original_name = plan.plan_image.stem
     output_root = work_dir.parent.parent
     job_root = output_root.parent.parent / "jobs" / run_id
-    metadata_file = job_root / "plan_metadata" / f"{original_name}.json"
+    metadata_dir = job_root / "plan_metadata"
+    # Căutare metadata: plan_id (ex: plan_01_cluster_1) apoi stem (cluster_1) – pentru cazul stem duplicat
+    metadata_file = metadata_dir / f"{plan.plan_id}.json"
+    if not metadata_file.exists():
+        metadata_file = metadata_dir / f"{original_name}.json"
     
     # Fișiere input
     # Perimetrul este acum în cubicasa_result.json din scale (STEP 6)

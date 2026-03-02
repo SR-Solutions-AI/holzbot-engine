@@ -192,8 +192,8 @@ def run_segmentation_and_classification_for_document(
     input_path = Path(input_path).resolve()
     job_root = build_job_root(job_id=job_id, prefix="segmentation_job")
     
-    # Save frontend data
-    if frontend_data_json:
+    # Save frontend data (from env). Skip if file already exists - API may have written full payload to avoid env truncation.
+    if frontend_data_json and not (job_root / "frontend_data.json").exists():
         try:
             parsed_data = json.loads(frontend_data_json)
             out_file = job_root / "frontend_data.json"
@@ -201,6 +201,8 @@ def run_segmentation_and_classification_for_document(
             print(f"✅ Frontend data saved to {out_file}")
         except Exception as e:
             print(f"⚠️ Failed to save frontend data: {e}")
+    elif (job_root / "frontend_data.json").exists():
+        print(f"✅ Using existing frontend_data.json from job root (written by API)")
 
     notify_ui("segmentation_start")
     
@@ -499,14 +501,14 @@ def run_segmentation_and_classification_for_document(
                         generate_roof_pricing(run_id=run_id, frontend_data=frontend_data)
                     except Exception as rp_err:
                         print(f"⚠️ Roof pricing Error: {rp_err}")
-                    pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None)
+                    pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
                     print(f"✅ [PDF] User PDF generated: {pdf_path}")
                     notify_ui("pdf_generation", pdf_path)
-                    admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None)
+                    admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
                     print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
                     notify_ui("pdf_generation", admin_pdf_path)
                     try:
-                        calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None)
+                        calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None, job_root=job_root)
                         print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
                         notify_ui("pdf_generation", calc_method_pdf_path)
                     except Exception as calc_err:

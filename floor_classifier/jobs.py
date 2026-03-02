@@ -75,23 +75,30 @@ def run_floor_classification(
     
     # Salvează rezultate
     results: List[FloorClassificationResult] = []
-    
-    for plan in house_plans:
-        plan_id = plan.image_path.stem
-        
-        # Găsește clasificarea AI pentru acest plan
+    classifications_list = ai_result.get("classifications") or []
+
+    for idx, plan in enumerate(house_plans):
+        stem = plan.image_path.stem
+
+        # Găsește clasificarea AI: mai întâi după plan_id (stem), apoi după index (când stem e duplicat)
         classification = next(
-            (c for c in ai_result["classifications"] if c["plan_id"] == plan_id),
+            (c for c in classifications_list if c["plan_id"] == stem),
             None
         )
-        
+        if classification is None and idx < len(classifications_list):
+            classification = classifications_list[idx]
+            print(f"  ℹ️  Match după index pentru {stem} (AI a returnat plan_id={classification.get('plan_id')!r})")
+
         if not classification:
-            print(f"  ⚠️  Nu am primit clasificare pentru {plan_id}")
+            print(f"  ⚠️  Nu am primit clasificare pentru {stem}")
             continue
-        
+
+        # Nume unic pentru fișier: plan_01_cluster_1, plan_02_cluster_1 (același format ca plan_id din load_plan_infos)
+        plan_id_file = f"plan_{idx + 1:02d}_{stem}"
+
         # Creează metadata file
         metadata = {
-            "plan_id": plan_id,
+            "plan_id": plan_id_file,
             "plan_image": str(plan.image_path),
             "label": plan.label,
             "floor_classification": {
@@ -112,7 +119,7 @@ def run_floor_classification(
             "pricing": None
         }
         
-        metadata_file = metadata_dir / f"{plan_id}.json"
+        metadata_file = metadata_dir / f"{plan_id_file}.json"
         with open(metadata_file, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         
@@ -126,7 +133,7 @@ def run_floor_classification(
         emoji = emoji_map.get(classification["floor_type"], "📄")
         
         results.append(FloorClassificationResult(
-            plan_id=plan_id,
+            plan_id=plan_id_file,
             floor_type=classification["floor_type"],
             confidence=classification["confidence"],
             reasoning=classification["reasoning"],
@@ -135,7 +142,7 @@ def run_floor_classification(
             door_count_exterior=classification.get("door_count_exterior")
         ))
         
-        print(f"  {emoji} {plan_id}:")
+        print(f"  {emoji} {plan_id_file}:")
         print(f"     → {classification['floor_type'].replace('_', ' ').title()}")
         print(f"     → Confidence: {classification['confidence']}")
         if classification.get("estimated_area_m2"):

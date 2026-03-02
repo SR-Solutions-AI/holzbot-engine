@@ -111,23 +111,23 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         print(f"⚠️ [PDF ROOF] Output nu există: {run_id}")
         return None
 
-    metrics_path = out_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_metrics.json"
-    if not metrics_path.exists():
-        print(f"⚠️ [PDF ROOF] roof_metrics.json lipsește: {metrics_path}")
-        return None
-
-    with open(metrics_path, encoding="utf-8") as f:
-        metrics = json.load(f)
-
-    by_floor = metrics.get("by_floor") or {}
-    if not by_floor:
-        print(f"⚠️ [PDF ROOF] by_floor gol în roof_metrics.json")
-        return None
-
     pdf_dir = out_root / "offer_pdf"
     pdf_dir.mkdir(parents=True, exist_ok=True)
     if output_path is None:
         output_path = pdf_dir / f"roof_measurements_{run_id}.pdf"
+
+    metrics_path = out_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_metrics.json"
+    metrics = {}
+    by_floor = {}
+    if metrics_path.exists():
+        try:
+            with open(metrics_path, encoding="utf-8") as f:
+                metrics = json.load(f)
+            by_floor = metrics.get("by_floor") or {}
+        except Exception as e:
+            print(f"⚠️ [PDF ROOF] Eroare la citire roof_metrics.json: {e}")
+    else:
+        print(f"⚠️ [PDF ROOF] roof_metrics.json lipsește – se generează PDF minimal pentru toți utilizatorii.")
 
     doc = SimpleDocTemplate(
         str(output_path),

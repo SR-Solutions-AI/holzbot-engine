@@ -1,0 +1,12 @@
+```json
+{
+  "parter": {
+    "type": "0_w",
+    "angle_deg": 0
+  },
+  "etaj_1": {
+    "type": "2_w",
+    "angle_deg": 40
+  }
+}
+```
