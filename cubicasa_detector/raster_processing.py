@@ -2235,9 +2235,33 @@ def generate_walls_from_room_coordinates(
             lines_removed_viz[flood_any > 0] = [0, 180, 0]
             lines_removed_viz[accepted_wall_segments_mask > 0] = [255, 255, 255]
             lines_removed_viz[walls_to_remove > 0] = [0, 0, 255]
+            # Etichetă în colț desenată peste doar unde nu e roșu, ca niciun roșu să nu fie acoperit
+            n_red = int(np.sum(walls_to_remove > 0))
+            n_white = int(np.sum(accepted_wall_segments_mask > 0))
+            label = f"rosii: {n_red}  albi: {n_white}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = max(0.5, min(1.2, h_orig / 800))
+            thickness = max(1, int(round(2 * font_scale)))
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            pad = 8
+            x2, y2 = tw + 2 * pad, th + 2 * pad
+            roi = lines_removed_viz[0:y2, 0:x2]
+            is_red = (roi[:, :, 2] == 255) & (roi[:, :, 0] == 0)
+            roi_bg = np.full_like(roi, (40, 40, 40))
+            roi_border = roi_bg.copy()
+            cv2.rectangle(roi_border, (0, 0), (x2 - 1, y2 - 1), (200, 200, 200), 1)
+            cv2.putText(roi_border, label, (pad, th + pad), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            np.copyto(roi, roi_border, where=np.broadcast_to(~is_red[:, :, None], roi.shape))
             lines_removed_path = output_dir / "00_flood_fill_lines_removed.png"
             cv2.imwrite(str(lines_removed_path), lines_removed_viz)
             print(f"      💾 Salvat: {lines_removed_path.name} (roșu = linii suplimentare eliminate, alb = pereți care rămân)")
+            # 00_flood_test.png: fundal negru, doar pixelii albi care nu sunt roșii (pereți care rămân după eliminare)
+            white_only = (accepted_wall_segments_mask > 0) & (walls_to_remove == 0)
+            flood_test = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+            flood_test[white_only] = [255, 255, 255]
+            flood_test_path = output_dir / "00_flood_test.png"
+            cv2.imwrite(str(flood_test_path), flood_test)
+            print(f"      💾 Salvat: {flood_test_path.name} (doar albi fără roșu = pereți care rămân)")
         if round_removed == 0:
             break
         accepted_wall_segments_mask[walls_to_remove > 0] = 0
@@ -2318,13 +2342,11 @@ def generate_walls_from_room_coordinates(
         walls_mask_for_roof = accepted_wall_segments_mask.copy()
         include_balcon_in_roof = False
 
-    # ✅ Salvăm 01_walls_from_coords.png: pereți 1px DUPĂ curățarea flood fill.
-    # walls_mask_for_roof e construit la final din accepted_wall_segments_mask (clean) → îl folosim direct
+    # ✅ Salvăm 01_walls_from_coords.png: același conținut ca 00_flood_test (albi fără roșu), skeletonizat 1px.
     segments_path = output_dir / "01_walls_from_coords.png"
     segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-    roof_mask_1px = walls_mask_for_roof if np.any(walls_mask_for_roof > 0) else accepted_wall_segments_mask
-    segments_img[roof_mask_1px > 0] = [255, 255, 255]
-    print(f"      💾 Salvat: {segments_path.name} (mască {'cu' if include_balcon_in_roof else 'fără'} balcon, 1px)")
+    segments_img[accepted_wall_segments_mask > 0] = [255, 255, 255]
+    print(f"      💾 Salvat: {segments_path.name} (același conținut ca 00_flood_test, 1px)")
     cv2.imwrite(str(segments_path), segments_img)
     
     # ✅ Recalculăm walls_barrier din segmentele acceptate DUPĂ eliminare; dacă inputul e 1px (api_walls_from_json_1px), păstrăm 1px
