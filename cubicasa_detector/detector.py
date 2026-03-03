@@ -2159,6 +2159,7 @@ def run_cubicasa_detection(
     raster_timings: list | None = None,
     brute_force_no_cache: bool = False,
     use_translation_only_raster: bool = True,
+    progress_callback: callable | None = None,
 ) -> dict:
     """
     Rulează detecția CubiCasa + măsurări + 3D Generation.
@@ -2223,6 +2224,8 @@ def run_cubicasa_detection(
             # 2a. RASTER TO VECTOR API CALL
             if steps_dir:
                 try:
+                    if progress_callback is not None:
+                        progress_callback(0)  # phase1 start (înainte de Raster API)
                     _rt_api = time.time()
                     print(f"   🔄 Apel RasterScan API pentru vectorizare...")
             
@@ -2297,8 +2300,10 @@ def run_cubicasa_detection(
                     _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     image_base64 = base64.b64encode(buffer).decode('utf-8')
                     print(f"      📦 Dimensiune payload: {len(image_base64) / 1024 / 1024:.2f} MB")
-            
-                    # Apelăm API-ul RasterScan (cu retry dacă masca e invalidă – cameră inundată)
+                    if progress_callback is not None:
+                        progress_callback(1)  # preprocess done (înainte de apel API)
+
+                    # Apelăm API-ul RasterScan
                     raster_api_key = os.environ.get('RASTER_API_KEY', '')
                     if raster_api_key:
                         url = "https://backend.rasterscan.com/raster-to-vector-base64"
@@ -2798,6 +2803,8 @@ def run_cubicasa_detection(
                 finally:
                     if raster_timings is not None:
                         raster_timings.append(("Raster P1: API + imagini", time.time() - _rt_api))
+                    if progress_callback is not None:
+                        progress_callback(2)  # raster API response primit
     
         # ✅ ADAPTIVE STRATEGY (tot în run_phase != 2)
         if raster_timings is not None:
@@ -2905,6 +2912,8 @@ def run_cubicasa_detection(
         save_step("02_ai_walls_closed", ai_walls_closed, str(steps_dir))
         if raster_timings is not None:
             raster_timings.append(("Raster P1: AI walls", time.time() - _rt_ai))
+        if progress_callback is not None:
+            progress_callback(3)  # phase1 end (AI walls done)
         if run_phase == 1:
             return {"model": model, "device": device}
     
@@ -2918,6 +2927,8 @@ def run_cubicasa_detection(
         raster_dir = Path(steps_dir) / "raster"
         if raster_dir.exists():
             # Verificăm dacă există deja configurația salvată (cache), dacă nu e dezactivat
+            if progress_callback is not None and run_phase == 2:
+                progress_callback(0)  # phase2 start
             config_path = raster_dir / "brute_force_best_config.json"
             _rt_bf = time.time() if raster_timings is not None else None
             if not brute_force_no_cache and config_path.exists():
@@ -3001,6 +3012,8 @@ def run_cubicasa_detection(
                     traceback.print_exc()
             if _rt_bf is not None and raster_timings is not None:
                 raster_timings.append(("Raster P2: Brute force", time.time() - _rt_bf))
+            if progress_callback is not None and run_phase == 2:
+                progress_callback(1)  # brute force done
             
             # Cale translation-only: mască 1px aliniată → garage + interior/exterior, fără construire segmente
             if translation_only_config is not None:
@@ -3027,6 +3040,8 @@ def run_cubicasa_detection(
                                 )
                                 if _rt_wfc is not None and raster_timings is not None:
                                     raster_timings.append(("Raster P2: Garage + interior/exterior (1px)", time.time() - _rt_wfc))
+                                if progress_callback is not None and run_phase == 2:
+                                    progress_callback(2)  # walls from coords done
                                 if walls_result:
                                     print(f"      ✅ Garaj + interior/exterior din mască 1px aliniată")
                                     walls_result_from_coords = walls_result
@@ -3095,6 +3110,8 @@ def run_cubicasa_detection(
                                     )
                                     if _rt_wfc is not None and raster_timings is not None:
                                         raster_timings.append(("Raster P2: Walls from room coords", time.time() - _rt_wfc))
+                                    if progress_callback is not None and run_phase == 2:
+                                        progress_callback(2)  # walls from coords done
                                 except Exception as walls_error:
                                     import traceback
                                     print(f"      ⚠️ Eroare la generarea pereților din coordonate: {walls_error}")
@@ -3255,6 +3272,8 @@ def run_cubicasa_detection(
         )
         if raster_timings is not None:
             raster_timings.append(("Raster P2: Interior/exterior", time.time() - _rt_ie))
+        if progress_callback is not None and run_phase == 2:
+            progress_callback(3)  # phase2 end
         
         # 3. Citim scala din room_scales.json generat de RasterScan (NU calculăm din nou!)
         if crop_img is not None:

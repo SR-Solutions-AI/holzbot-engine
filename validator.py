@@ -59,12 +59,13 @@ def validate_plan(file_url):
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an architect assistant. Verify if the image is a usable floor plan for detecting sizes.
+                    "content": """You are an architect assistant. Verify if the image is a usable architectural plan for our pipeline.
                     Check for:
-                    1. Room labels (Text inside rooms like Living, Bedroom, Bad) with square meter sizes.
-                    2. Clear walls structure.
+                    1. At least one FLOOR PLAN (Grundriss) – room labels, walls, clear structure.
+                    2. At least one SIDE VIEW / ELEVATION / SECTION (Ansicht, Schnitt, Fassade) – a view showing the building from the side or a cross-section (needed for roof type and pitch).
                     
-                    If it is a valid plan, return valid=true.
+                    If the document contains ONLY floor plans and NO side view / elevation / section, return valid=false with reason explaining that a side view (Ansicht or Schnitt) is required for roof classification.
+                    If it is a valid plan with both floor plan(s) and at least one side view, return valid=true.
                     If it looks like a photo, a generic sketch without text, or unrelated, valid=false.
                     
                     Return ONLY JSON: { "valid": boolean, "reason": "string" }"""
@@ -72,7 +73,7 @@ def validate_plan(file_url):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Validate this plan."},
+                        {"type": "text", "text": "Validate this plan. It must contain at least one floor plan (Grundriss) AND at least one side view or section (Ansicht/Schnitt) for roof classification."},
                         {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}}
                     ]
                 }

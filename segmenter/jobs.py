@@ -13,7 +13,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Callable, Optional
 
 from .common import set_output_dir, STEP_DIRS
 from .pdf_utils import convert_pdf_to_png
@@ -93,7 +93,8 @@ def _segment_single_page(
 def run_segmentation_for_documents(
     input_path: str | Path,
     output_base_dir: str | Path,
-    max_workers: int | None = None
+    max_workers: int | None = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[SegmentationJobResult]:
     """
     Procesează documente: câte un work_dir (src_* sau src_*_page_001, _page_002, ...) per pagină.
@@ -166,6 +167,8 @@ def run_segmentation_for_documents(
             try:
                 result = future.result()
                 results.append(result)
+                if progress_callback and total_tasks:
+                    progress_callback(len(results), total_tasks)
             except Exception as e:
                 print(f"❌ [Segmenter] Unexpected error for {doc_id}: {e}")
                 traceback.print_exc()
@@ -180,6 +183,8 @@ def run_segmentation_for_documents(
                         classification_results=[],
                     )
                 )
+                if progress_callback and total_tasks:
+                    progress_callback(len(results), total_tasks)
 
     successful = sum(1 for r in results if r.success)
     failed = total_tasks - successful

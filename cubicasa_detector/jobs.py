@@ -109,11 +109,13 @@ def run_cubicasa_phase1(
     output_dir: Path,
     gemini_api_key: str | None = None,
     raster_timings: list | None = None,
+    progress_callback: callable | None = None,
 ) -> dict:
     """
     Rulează doar faza 1 (Raster API + AI walls → 02_ai_walls_closed).
     Fiecare apel își încarcă propriul model/device (potrivit pentru execuție paralelă).
     raster_timings: listă mutabilă în care se adaugă (nume_pas, durată) pentru raportare timpi.
+    progress_callback: opțional, apelat cu (sub_step: int) 0=start, 1=raster API done, 2=phase1 end.
     """
     if not gemini_api_key:
         gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -132,6 +134,7 @@ def run_cubicasa_phase1(
         reused_model=None,
         reused_device=None,
         raster_timings=raster_timings,
+        progress_callback=progress_callback,
     )
 
 
@@ -139,11 +142,13 @@ def run_cubicasa_phase2(
     output_dir: Path,
     gemini_api_key: str | None = None,
     raster_timings: list | None = None,
+    progress_callback: callable | None = None,
 ) -> dict:
     """
     Rulează doar faza 2 (brute force + crop + walls from coords + restul pipeline-ului).
     Presupune că phase1 a rulat deja pentru acest output_dir (există 02_ai_walls_closed.png etc).
     raster_timings: listă mutabilă în care se adaugă (nume_pas, durată) pentru raportare timpi.
+    progress_callback: opțional, apelat cu (sub_step: int) 0=phase2 start, 1=brute done, 2=walls from coords done, 3=phase2 end.
     Returns:
         dict identic cu run_cubicasa_detection (scale_result, measurements, masks).
     """
@@ -162,6 +167,7 @@ def run_cubicasa_phase2(
         save_debug_steps=True,
         run_phase=2,
         raster_timings=raster_timings,
+        progress_callback=progress_callback,
     )
 
 
