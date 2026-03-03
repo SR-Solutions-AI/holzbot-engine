@@ -2242,6 +2242,9 @@ def generate_walls_from_room_coordinates(
             break
         accepted_wall_segments_mask[walls_to_remove > 0] = 0
         removed_total += round_removed
+        # ✅ Doar o rundă: eliminăm strict pixelii roșii din 00_flood_fill_lines_removed.png, nu mai multe runde
+        if _round == 0:
+            break
         if (_round + 1) % 100 == 0 and round_removed > 0:
             print(f"      🌊 Flood cleanup rundă {_round + 1}: eliminat {removed_total} pixeli până acum")
     walls_mask_validated = accepted_wall_segments_mask.copy()
