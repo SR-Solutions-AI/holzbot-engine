@@ -122,8 +122,8 @@ STATIC_TRANSLATIONS = {
     "Telefon": "Telefon",
     "E-Mail": "E-Mail",
     "Bauvorhaben": "Bauvorhaben",
-    "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Holzbaus",
-    "Angebot für Ihr Holzbaus": "Angebot für Ihr Holzbaus",
+    "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Holzhaus",
+    "Angebot für Ihr Holzhaus": "Angebot für Ihr Holzhaus",
     "Sehr geehrte Damen und Herren,": "Liebe Kundschaft,", 
     "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.": "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.",
     "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.": "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.",
@@ -948,7 +948,7 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     story.append(Spacer(1, 6*mm))
 
 def _intro(story, styles, client: dict, enforcer: GermanEnforcer, offer_title: str | None = None):
-    title = offer_title or enforcer.get("Angebot für Ihr Holzbaus")
+    title = offer_title or enforcer.get("Angebot für Ihr Holzhaus")
     # Elimină "Holzbau" din titlu dacă există
     if title and "Holzbau" in title:
         title = title.replace("Holzbau ", "").replace("Holzbau", "")
