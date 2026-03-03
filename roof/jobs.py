@@ -343,31 +343,55 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
 
     # Beci (dacă există) primește cel mai mic index (0); parter indexul următor (0 fără beci, 1 cu beci); apoi etajele.
     basement_plan_id: str | None = None
-    if run_dir.exists() and (run_dir / "basement_plan_id.json").exists():
-        try:
-            data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
-            original_basement_idx = data.get("basement_plan_index")
-            if original_basement_idx is not None and 0 <= original_basement_idx < len(plans):
-                basement_plan_id = plans[original_basement_idx].plan_id
-        except Exception:
-            pass
+    order_from_bottom: list[int] | None = None
+    if run_dir.exists():
+        if (run_dir / "floor_order.json").exists():
+            try:
+                data = json.loads((run_dir / "floor_order.json").read_text(encoding="utf-8"))
+                order_from_bottom = data.get("order_from_bottom")
+                if order_from_bottom is not None and len(order_from_bottom) == len(plans) and set(order_from_bottom) == set(range(len(plans))):
+                    pass
+                else:
+                    order_from_bottom = None
+            except Exception:
+                order_from_bottom = None
+        if order_from_bottom is None and (run_dir / "basement_plan_id.json").exists():
+            try:
+                data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+                original_basement_idx = data.get("basement_plan_index")
+                if original_basement_idx is not None and 0 <= original_basement_idx < len(plans):
+                    basement_plan_id = plans[original_basement_idx].plan_id
+            except Exception:
+                pass
 
-    # Sortare: beci=0, parter=1, intermediar=2, top=3, unknown=4; la egalitate după arie (parter = mai mare).
-    def _key(p):
-        return _floor_sort_key(p, job_root, basement_plan_id, run_id, run_dir)
+    if order_from_bottom is not None:
+        plans_roof = [plans[i] for i in order_from_bottom]
+        print(f"   [roof] Planuri ordonate după floor_order.json (de jos în sus): {[p.plan_id for p in plans_roof]}", flush=True)
+    else:
+        # Sortare: beci=0, parter=1, intermediar=2, top=3, unknown=4; la egalitate după arie (parter = mai mare).
+        def _key(p):
+            return _floor_sort_key(p, job_root, basement_plan_id, run_id, run_dir)
 
-    plans_roof = sorted(plans, key=_key)
-    for p in plans_roof:
-        k = _key(p)
-        rank_name = ("beci", "parter", "intermediar", "etaj", "unknown")[k[0]] if k[0] < 5 else "unknown"
-        print(f"   [roof] floor_{plans_roof.index(p)} ← {p.plan_id} (rang={rank_name}, arie_mask={-k[1]} px)", flush=True)
-    if plans_roof != plans:
-        order_desc = "beci=0, parter=1, etaj=2" if basement_plan_id else "parter=0, etaj=1"
-        print(f"   [roof] Planuri reordonate ({order_desc}): {[p.plan_id for p in plans_roof]}", flush=True)
+        plans_roof = sorted(plans, key=_key)
+        for p in plans_roof:
+            k = _key(p)
+            rank_name = ("beci", "parter", "intermediar", "etaj", "unknown")[k[0]] if k[0] < 5 else "unknown"
+            print(f"   [roof] floor_{plans_roof.index(p)} ← {p.plan_id} (rang={rank_name}, arie_mask={-k[1]} px)", flush=True)
+        if plans_roof != plans:
+            order_desc = "beci=0, parter=1, etaj=2" if basement_plan_id else "parter=0, etaj=1"
+            print(f"   [roof] Planuri reordonate ({order_desc}): {[p.plan_id for p in plans_roof]}", flush=True)
 
     # Indexul beciului în lista sortată (beci e mereu la 0 când există)
     basement_idx: int | None = None
-    if basement_plan_id:
+    if order_from_bottom is not None and (run_dir / "basement_plan_id.json").exists():
+        try:
+            data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+            if data.get("basement_plan_index") is not None:
+                basement_idx = 0
+                print(f"   [roof] Beci: plan la index 0 (din floor_order)", flush=True)
+        except Exception:
+            pass
+    if basement_idx is None and basement_plan_id:
         for i, p in enumerate(plans_roof):
             if p.plan_id == basement_plan_id:
                 basement_idx = i

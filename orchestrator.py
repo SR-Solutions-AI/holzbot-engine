@@ -18,6 +18,7 @@ import time
 from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo, get_run_dir
 from config.frontend_loader import load_frontend_data_for_run
 from floor_classifier.basement_scorer import run_basement_scoring
+from floor_classifier.floor_order_gemini import run_floor_order_from_gemini
 from typing import List, Tuple
 
 # ✅ IMPORT SEGMENTER JOBS
@@ -376,16 +377,32 @@ def run_segmentation_and_classification_for_document(
     pipeline_timer.add_step("Floor Classification", t.end_time - t.start_time)
 
     if house_plans:
-        # ---------- Dacă utilizatorul a ales beci: scor Gemini pentru a alege care plan e beciul ----------
+        # ---------- Ordine etaje (de jos în sus) din etichetele Gemini; beci = primul din ordine ----------
+        order_from_bottom = None
+        with Timer("STEP 4c: Floor order from labels (Gemini)") as _t:
+            order_from_bottom = run_floor_order_from_gemini(house_plans)
+        pipeline_timer.add_step("Floor order (Gemini)", _t.end_time - _t.start_time)
+
+        # ---------- Dacă nu avem ordine de la Gemini și userul a ales beci: scor Gemini pentru a alege beciul ----------
         basement_plan_index = None
-        if has_basement_form and our_floors > 0:
+        if order_from_bottom is not None and has_basement_form and our_floors > 0:
+            basement_plan_index = order_from_bottom[0]
+            print(f"   💾 Beci din ordine Gemini: plan index {basement_plan_index}")
+        elif has_basement_form and our_floors > 0:
             with Timer("STEP 4b: Basement scoring (Gemini)") as _t:
                 basement_plan_index = run_basement_scoring(house_plans)
             pipeline_timer.add_step("Basement scoring", _t.end_time - _t.start_time)
-        # ---------- Creare run și salvare basement_plan_index ----------
+
+        # ---------- Creare run și salvare floor_order / basement_plan_id ----------
         run_id = _create_run_for_detections(job_root, house_plans)
+        run_dir = get_run_dir(run_id)
+        if order_from_bottom is not None:
+            (run_dir / "floor_order.json").write_text(
+                json.dumps({"order_from_bottom": order_from_bottom}, indent=2),
+                encoding="utf-8",
+            )
+            print(f"   💾 Salvat: {run_dir / 'floor_order.json'}")
         if basement_plan_index is not None:
-            run_dir = get_run_dir(run_id)
             (run_dir / "basement_plan_id.json").write_text(
                 json.dumps({"basement_plan_index": basement_plan_index}, indent=2),
                 encoding="utf-8",

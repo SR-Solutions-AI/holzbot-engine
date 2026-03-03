@@ -31,20 +31,26 @@ PROMPT_BOXES = """You are an expert in visual analysis for architectural drawing
 
 CRITICAL FOR FLOOR PLANS: For each floor plan (blueprint), the bounding box must include the ENTIRE drawn floor plan: the building/house AND all attached areas (garage, terrace, balcony, covered entrance / Eingang überdacht, loggia, patio). Do NOT cut off garages, terraces, balconies or covered entrances. You may trim large empty margins and unrelated context (e.g. distant pools, separate gardens, legend text), but the box must show the full outline of the house including garage and any attached outdoor spaces so that room detection and scale work correctly.
 
+FLOOR ORDER ON THIS PAGE: You must also return the stacking order of the FLOOR PLANS on this page from BOTTOM to TOP (building levels: basement lowest, then ground floor, then upper floors). The floor plans appear in your "items" array; some items are floor plans, some are side views. Ignore side views for ordering. Number the FLOOR plans in the order they appear in the array as 0, 1, 2, ... (first floor plan = 0, second = 1, etc.). Return "floor_order": an array of these indices in order from BOTTOM to TOP. Example: if you have 3 floor plans at array positions 0, 1, 2 and they are KG, EG, OG, then floor_order must be [0, 1, 2]. If the order on the page is EG, KG, OG (positions 0,1,2), then floor_order must be [1, 0, 2] (basement KG first, then EG, then OG).
+
 IGNORE: the general site/lot plan (if the whole page is one big site map, still extract any smaller floor-plan or elevation boxes inside it). Exclude 3D color renderings and project data tables in corners. Focus on technical drawings only.
 
 COORDINATE SYSTEM: Use bounding boxes in format [ymin, xmin, ymax, xmax] normalized on a scale of 0 to 1000. So the image width and height each map to 0–1000. Example: left half of image ≈ xmin 0, xmax 500; top 10% ≈ ymin 0, ymax 100.
 
-Return ONLY a JSON array. No markdown, no code block, no text before or after. Each element must have:
-- "box_2d": [ymin, xmin, ymax, xmax] — integers or numbers in 0–1000 range.
-- "label": string — the exact label you see (e.g. "GRUNDRISS EG", "Ansicht Süd", "Schnitt A-A").
+Return a single JSON OBJECT with two keys:
+- "items": array of elements. Each element must have:
+  - "box_2d": [ymin, xmin, ymax, xmax] — integers or numbers in 0–1000 range.
+  - "label": string — the exact label you see (e.g. "GRUNDRISS EG", "Ansicht Süd", "Schnitt A-A").
+- "floor_order": array of integers — the indices of the FLOOR plan items (0 = first floor plan in "items", 1 = second floor plan, ...) in order from BOTTOM to TOP. If there is only one floor plan, use [0]. If there are no floor plans, use [].
 
-You MUST include EVERY floor plan and every side view/section on the page. Do not omit any. Keep the response concise: only the JSON array, no explanations.
+You MUST include EVERY floor plan and every side view/section on the page. Do not omit any. Output ONLY this JSON object, no markdown, no code block, no text before or after. Start with { and end with }.
 
 Example format:
-[{"box_2d": [30, 15, 550, 485], "label": "GRUNDRISS KG"}, {"box_2d": [30, 510, 340, 970], "label": "Ansicht Süd"}, {"box_2d": [670, 15, 980, 550], "label": "Schnitt A-A"}]
+{"items": [{"box_2d": [30, 15, 550, 485], "label": "GRUNDRISS KG"}, {"box_2d": [30, 510, 340, 970], "label": "Ansicht Süd"}, {"box_2d": [570, 15, 980, 550], "label": "GRUNDRISS EG"}], "floor_order": [0, 2]}
 
-Output ONLY the raw JSON array. Start with [ and end with ]."""
+(Here the first and third items are floor plans; KG is bottom so index 0 first, then EG index 2. Side view is not in floor_order.)
+
+Output ONLY the raw JSON object."""
 
 
 # Aliniere două măști de pereți: Gemini returnează procente (scara 0–1000), ca la box_2d
@@ -229,6 +235,69 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
         return []
 
 
+def _extract_json_object(text: str) -> tuple[list[dict[str, Any]], list[int]]:
+    """
+    Încearcă să parseze răspunsul ca obiect JSON cu "items" și "floor_order".
+    Returnează (items, floor_order). Dacă nu e obiect valid, returnează ([], []).
+    """
+    if not text or not text.strip():
+        return [], []
+    text = text.strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if m:
+        text = m.group(1).strip()
+    start = text.find("{")
+    if start == -1:
+        return [], []
+    depth = 0
+    end = -1
+    in_string = False
+    escape = False
+    quote_char = None
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == quote_char:
+                in_string = False
+            continue
+        if c in ('"', "'"):
+            in_string = True
+            quote_char = c
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        return [], []
+    chunk = text[start:end]
+    try:
+        data = json.loads(chunk)
+        if not isinstance(data, dict):
+            return [], []
+        items = data.get("items")
+        if not isinstance(items, list):
+            items = []
+        order = data.get("floor_order")
+        if isinstance(order, list):
+            order = [int(x) for x in order if isinstance(x, (int, float))]
+        else:
+            order = []
+        return items, order
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return [], []
+
+
 PROMPT_REPAIR_JSON = """The following text was returned by an AI that was asked to output a JSON array of bounding boxes for architectural floor plans and side views. The response is malformed or in the wrong format.
 
 Your task: output ONLY a valid JSON array. Each element must have:
@@ -312,13 +381,17 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         return []
 
     raw = raw.strip()
-    items = _extract_json_array(raw)
+    items, floor_order = _extract_json_object(raw)
+    if not items:
+        items = _extract_json_array(raw)
+        floor_order = []
     if not items:
         preview = (raw[:500] + "…") if len(raw) > 500 else raw
         print("⚠️ [Gemini Crop] Nu am putut parsa JSON din raspuns. Primele caractere:")
         print(f"   {preview!r}")
         print("   [Gemini Crop] Încerc reparare cu ChatGPT...")
         items = _repair_json_with_chatgpt(raw)
+        floor_order = []
     if not items:
         print("   [Gemini Crop] Retry: re-apel Gemini pentru aceeași pagină...")
         try:
@@ -330,9 +403,13 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             raw2 = _get_response_text(response)
             if raw2:
                 raw2 = raw2.strip()
-                items = _extract_json_array(raw2)
+                items, floor_order = _extract_json_object(raw2)
+                if not items:
+                    items = _extract_json_array(raw2)
+                    floor_order = []
                 if not items:
                     items = _repair_json_with_chatgpt(raw2)
+                    floor_order = []
         except Exception as e:
             print(f"   [Gemini Crop] Retry Gemini eroare: {e}")
     if not items:
@@ -390,7 +467,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             if ymax <= ymin or xmax <= xmin:
                 print(f"   [Gemini Crop] Item {i} label={raw_label!r}: skip (box invalid: ymax<=ymin sau xmax<=xmin)")
                 continue
-            out.append({"box_2d": [ymin, xmin, ymax, xmax], "label": label})
+            out.append({"box_2d": [ymin, xmin, ymax, xmax], "label": label, "raw_label": raw_label})
         return out
 
     valid = _validate_items(items)
@@ -406,9 +483,13 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             raw_retry = _get_response_text(response)
             if raw_retry:
                 raw_retry = raw_retry.strip()
-                items = _extract_json_array(raw_retry)
+                items, floor_order = _extract_json_object(raw_retry)
+                if not items:
+                    items = _extract_json_array(raw_retry)
+                    floor_order = []
                 if not items:
                     items = _repair_json_with_chatgpt(raw_retry)
+                    floor_order = []
                 if items:
                     valid = _validate_items(items)
                     if valid:
@@ -423,6 +504,16 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
                 valid = _validate_items(items)
                 if valid:
                     print(f"   [Gemini Crop] După reparare ChatGPT: {len(valid)} zone valide.")
+    # Ordine etaje pe pagină (de la Gemini): adăugăm position_from_bottom la fiecare plan floor
+    floor_indices = [i for i, v in enumerate(valid) if v.get("label") == "floor"]
+    n_floor = len(floor_indices)
+    if n_floor > 0 and isinstance(floor_order, list) and len(floor_order) == n_floor and set(floor_order) == set(range(n_floor)):
+        for k, idx in enumerate(floor_indices):
+            valid[idx]["position_from_bottom"] = floor_order.index(k)
+        print(f"   [Gemini Crop] floor_order pe pagină: {floor_order} → position_from_bottom setat")
+    elif n_floor > 0:
+        for k, idx in enumerate(floor_indices):
+            valid[idx]["position_from_bottom"] = k
     if items:
         n_floor = sum(1 for v in valid if v["label"] == "floor")
         n_side = len(valid) - n_floor
@@ -434,13 +525,13 @@ def crop_and_save(
     image_path: Path,
     work_dir: Path,
     boxes: list[dict[str, Any]],
-) -> list[ClassificationResult]:
+) -> tuple[list[ClassificationResult], list[dict[str, Any]]]:
     """
     Script general: decupează imaginea după coordonatele primite (box_2d în 0.0–1.0) și salvează
-    crop-urile. Fiecare element din boxes: {"box_2d": [ymin, xmin, ymax, xmax], "label": "floor"|"side_view"}.
+    crop-urile. Fiecare element din boxes: {"box_2d": [...], "label": "floor"|"side_view", "raw_label": "..."}.
     - label "floor" → work_dir/classified/blueprints/cluster_1.jpg, cluster_2.jpg, ...
     - label "side_view" → work_dir/classified/side_views/cluster_1.jpg, ...
-    Returnează lista de ClassificationResult pentru fiecare crop salvat.
+    Returnează (lista de ClassificationResult, lista de {file, raw_label} pentru floor crops).
     """
     bp_dir = work_dir / STEP_DIRS["classified"]["blueprints"]
     sv_dir = work_dir / STEP_DIRS["classified"]["side_views"]
@@ -451,16 +542,18 @@ def crop_and_save(
         img = Image.open(image_path).convert("RGB")
     except Exception as e:
         print(f"⚠️ [Gemini Crop] Eroare la deschidere imagine: {e}")
-        return []
+        return [], []
 
     width, height = img.size
     results: list[ClassificationResult] = []
+    floor_labels: list[dict[str, Any]] = []
     floor_idx = 0
     side_view_idx = 0
 
     for item in boxes:
         ymin, xmin, ymax, xmax = item["box_2d"]
         label = item["label"]
+        raw_label = item.get("raw_label") or item.get("label") or ""
         left = xmin * width
         top = ymin * height
         right = xmax * width
@@ -480,6 +573,11 @@ def crop_and_save(
             filename = f"cluster_{floor_idx}.jpg"
             dst = bp_dir / filename
             our_label = "house_blueprint"
+            floor_labels.append({
+                "file": filename,
+                "raw_label": raw_label,
+                "position_from_bottom": item.get("position_from_bottom", 0),
+            })
         else:
             side_view_idx += 1
             filename = f"cluster_{side_view_idx}.jpg"
@@ -502,4 +600,11 @@ def crop_and_save(
         )
         print(f"   ✅ {our_label}: {filename} (dimensiune: {cropped.size})")
 
-    return results
+    if floor_labels:
+        try:
+            labels_path = bp_dir / "crop_labels.json"
+            labels_path.write_text(json.dumps(floor_labels, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"⚠️ [Gemini Crop] Nu am putut scrie crop_labels.json: {e}")
+
+    return results, floor_labels

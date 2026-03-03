@@ -61,7 +61,7 @@ def _segment_single_page(
 
         boxes = get_gemini_boxes_for_page(page_path)
         print(f"  [Gemini Crop] {doc_id}: {len(boxes)} zone (etaje + side views)", flush=True)
-        classification_results = crop_and_save(page_path, work_dir, boxes)
+        classification_results, _ = crop_and_save(page_path, work_dir, boxes)
         n_bp = len([r for r in classification_results if r.label == "house_blueprint"])
         n_sv = len([r for r in classification_results if r.label == "side_view"])
         print(f"  [Gemini Crop] {doc_id} → blueprints: {n_bp}, side_views: {n_sv}", flush=True)
