@@ -122,7 +122,8 @@ STATIC_TRANSLATIONS = {
     "Telefon": "Telefon",
     "E-Mail": "E-Mail",
     "Bauvorhaben": "Bauvorhaben",
-    "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Chiemgauer Massivholzhaus",
+    "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Holzbaus",
+    "Angebot für Ihr Holzbaus": "Angebot für Ihr Holzbaus",
     "Sehr geehrte Damen und Herren,": "Liebe Kundschaft,", 
     "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.": "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.",
     "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.": "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.",
@@ -860,7 +861,7 @@ def _draw_firstpage_right_box(canv: Canvas, offer_no: str, handler: str):
         canv.drawRightString(box_x+cw-3*mm, y, v)
     canv.restoreState()
 
-def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None):
+def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None, tenant_slug: str = None):
     def _inner(canv: Canvas, doc):
         _draw_ribbon(canv)
         a = assets or {}
@@ -871,7 +872,9 @@ def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None):
         if identity_path and identity_path.exists():
             canv.drawImage(str(identity_path), A4[0]-18*mm-85*mm, A4[1]-53*mm, 85*mm, 22*mm, preserveAspectRatio=True, mask='auto')
 
-        if show_logos:
+        # Eder/ederholzbau: la fel ca Holzbau – fără logo-uri suplimentare
+        is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
+        if not is_eder and show_logos:
             logos_path = _asset_path(logos_file) if logos_file else IMG_LOGOS
             if logos_path and logos_path.exists():
                 canv.drawImage(str(logos_path), 18*mm, A4[1]-55*mm, 80*mm, 26*mm, preserveAspectRatio=True, mask='auto', anchor='sw')
@@ -911,7 +914,8 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     # Pentru holzbau@holzbot.com, mutăm textul mai sus (nu au iconițe)
     # Dacă nu există iconițe SAU dacă este tenant holzbau, mutăm textul mai sus
     is_holzbau = tenant_slug and tenant_slug.lower() == "holzbau"
-    if not has_identity and not has_logos or is_holzbau:
+    is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
+    if not has_identity and not has_logos or is_holzbau or is_eder:
         story.append(Spacer(1, 5*mm))  # Mutat și mai sus pentru holzbau
     else:
         story.append(Spacer(1, 36*mm))
@@ -944,7 +948,7 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     story.append(Spacer(1, 6*mm))
 
 def _intro(story, styles, client: dict, enforcer: GermanEnforcer, offer_title: str | None = None):
-    title = offer_title or enforcer.get("Angebot für Ihr Chiemgauer Massivholzhaus")
+    title = offer_title or enforcer.get("Angebot für Ihr Holzbaus")
     # Elimină "Holzbau" din titlu dacă există
     if title and "Holzbau" in title:
         title = title.replace("Holzbau ", "").replace("Holzbau", "")
@@ -2099,6 +2103,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             company_overrides = {**company_overrides, **job_pdf_company}
             print(f"🔍 [PDF] pdf_company from job: name={job_pdf_company.get('name')!r}, addr_lines={job_pdf_company.get('addr_lines')!r}, phone={job_pdf_company.get('phone')!r}, email={job_pdf_company.get('email')!r}, keys={list(job_pdf_company.keys())}", flush=True)
     offer_prefix = (branding.get("offer_prefix") or "CHH") if isinstance(branding, dict) else "CHH"
+    client_id = (branding.get("client_id") or offer_prefix) if isinstance(branding, dict) else offer_prefix
     handler = (branding.get("handler_name") or "Florian Siemer") if isinstance(branding, dict) else "Florian Siemer"
     # Prefer handler from job (Preisdatenbank "Reprezentant firmă")
     if isinstance(company_overrides, dict) and company_overrides.get("handler_name"):
@@ -2118,7 +2123,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 elif k == "email":
                     COMPANY[k] = str(v).strip()
                 elif k == "web":
-                    COMPANY[k] = str(v).strip()
+                    COMPANY[k] = str(v).strip() if v else ""
                 elif k == "phone":
                     COMPANY[k] = str(v).strip()
                 elif k == "fax":
@@ -2281,7 +2286,11 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     enforcer = GermanEnforcer()
 
     # --- BUILD PDF ---
-    offer_no = f"{offer_prefix}-{datetime.now().strftime('%Y')}-{random.randint(1000,9999)}"
+    # Prefer offer_no from job (API sets client_id-YYYY-NNN per tenant counter)
+    if isinstance(frontend_data, dict) and frontend_data.get("offer_no"):
+        offer_no = str(frontend_data["offer_no"]).strip()
+    else:
+        offer_no = f"{offer_prefix}-{datetime.now().strftime('%Y')}-{random.randint(1000,9999)}"
     doc = SimpleDocTemplate(
         str(output_path), 
         pagesize=A4, 
@@ -2581,7 +2590,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     
     doc.build(
         story, 
-        onFirstPage=_first_page_canvas(offer_no, handler, assets=assets), 
+        onFirstPage=_first_page_canvas(offer_no, handler, assets=assets, tenant_slug=tenant_slug), 
         onLaterPages=_later_pages_canvas
     )
     

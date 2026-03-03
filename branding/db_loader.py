@@ -12,8 +12,9 @@ def fetch_tenant_branding(tenant_slug: str) -> dict[str, Any]:
     Expected structure (all optional):
       tenants.config.pdf = {
         offer_prefix: "CHH",
+        client_id: "CHH",
         handler_name: "Florian Siemer",
-        offer_title: "Angebot für Ihr Chiemgauer Massivholzhaus",
+        offer_title: "Angebot für Ihr Holzbaus",
         company: { ... },
         assets: {
           identity_image: "chiemgauer.png",
