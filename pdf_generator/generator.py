@@ -123,6 +123,7 @@ STATIC_TRANSLATIONS = {
     "E-Mail": "E-Mail",
     "Bauvorhaben": "Bauvorhaben",
     "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Holzhaus",
+    "Angebot für Ihr Chiemgauer Holzhaus": "Angebot für Ihr Holzhaus",
     "Angebot für Ihr Holzhaus": "Angebot für Ihr Holzhaus",
     "Sehr geehrte Damen und Herren,": "Liebe Kundschaft,", 
     "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.": "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.",
@@ -949,9 +950,9 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
 
 def _intro(story, styles, client: dict, enforcer: GermanEnforcer, offer_title: str | None = None):
     title = offer_title or enforcer.get("Angebot für Ihr Holzhaus")
-    # Elimină "Holzbau" din titlu dacă există
-    if title and "Holzbau" in title:
-        title = title.replace("Holzbau ", "").replace("Holzbau", "")
+    title = enforcer.get(title) if title else enforcer.get("Angebot für Ihr Holzhaus")
+    if title and "Chiemgauer" in title:
+        title = "Angebot für Ihr Holzhaus"
     story.append(Paragraph(title, styles["H2"]))
     story.append(Paragraph(enforcer.get("Sehr geehrte Damen und Herren,"), styles["Body"]))
     
