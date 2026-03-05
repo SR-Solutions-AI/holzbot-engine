@@ -67,16 +67,14 @@ def main():
 
     segments_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
     segments_img[walls_1px > 0] = [255, 255, 255]
-    # Margine neagră 20px în jurul mastii
+    # Margine neagră 20px SUPLIMENTARĂ: mărim poza, conținutul rămâne în centru
     border_px = 20
-    h, w = segments_img.shape[:2]
-    if h > 2 * border_px and w > 2 * border_px:
-        segments_img[:border_px, :] = 0
-        segments_img[-border_px:, :] = 0
-        segments_img[:, :border_px] = 0
-        segments_img[:, -border_px:] = 0
-        print(f"Margine neagră {border_px}px aplicată.")
-    cv2.imwrite(str(out_path), segments_img)
+    h, w = img.shape[0], img.shape[1]
+    H, W = h + 2 * border_px, w + 2 * border_px
+    out_img = np.zeros((H, W, 3), dtype=np.uint8)
+    out_img[border_px : border_px + h, border_px : border_px + w] = segments_img
+    cv2.imwrite(str(out_path), out_img)
+    print(f"Salvat: {out_path} (cu margine {border_px}px suplimentară, {W}x{H})")
     print(f"Salvat: {out_path}")
     return 0
 

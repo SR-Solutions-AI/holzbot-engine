@@ -2291,17 +2291,6 @@ def generate_walls_from_room_coordinates(
         except Exception as e:
             print(f"      ⚠️ Skeleton 1px pentru 01_walls_from_coords eșuat: {e}")
 
-    # Margine neagră 20px în jurul mastii (evită atingerea marginilor la operațiuni ulterioare)
-    border_px = 20
-    if h_orig > 2 * border_px and w_orig > 2 * border_px:
-        accepted_wall_segments_mask[:border_px, :] = 0
-        accepted_wall_segments_mask[-border_px:, :] = 0
-        accepted_wall_segments_mask[:, :border_px] = 0
-        accepted_wall_segments_mask[:, -border_px:] = 0
-        walls_mask_validated = accepted_wall_segments_mask.copy()
-        walls_overlay_mask = accepted_wall_segments_mask.copy()
-        print(f"      🔲 Margine neagră {border_px}px aplicată în jurul mastii")
-
     # ✅ Regulă balcon acoperiș: număr laturi lipite de casă pe masca curată; walls_mask_for_roof construit aici
     # Folosim masca dinainte de strip (accepted_wall_segments_mask_before_strip) ca pereții de contact să existe
     if balcon_center is not None:
@@ -2354,11 +2343,17 @@ def generate_walls_from_room_coordinates(
         include_balcon_in_roof = False
 
     # ✅ Salvăm 01_walls_from_coords.png: același conținut ca 00_flood_test (albi fără roșu), skeletonizat 1px.
+    # Margine neagră 20px SUPLIMENTARĂ: mărim poza (canvas +40px pe lățime/înălțime), conținutul rămâne în centru.
     segments_path = output_dir / "01_walls_from_coords.png"
     segments_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
     segments_img[accepted_wall_segments_mask > 0] = [255, 255, 255]
+    border_px = 20
+    H, W = h_orig + 2 * border_px, w_orig + 2 * border_px
+    segments_img_with_border = np.zeros((H, W, 3), dtype=np.uint8)
+    segments_img_with_border[border_px : border_px + h_orig, border_px : border_px + w_orig] = segments_img
+    print(f"      🔲 Margine neagră {border_px}px suplimentară (poza mărită la {W}x{H})")
     print(f"      💾 Salvat: {segments_path.name} (același conținut ca 00_flood_test, 1px)")
-    cv2.imwrite(str(segments_path), segments_img)
+    cv2.imwrite(str(segments_path), segments_img_with_border)
     
     # ✅ Recalculăm walls_barrier din segmentele acceptate DUPĂ eliminare; dacă inputul e 1px (api_walls_from_json_1px), păstrăm 1px
     if _input_is_1px:
