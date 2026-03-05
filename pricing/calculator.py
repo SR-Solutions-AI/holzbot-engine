@@ -124,7 +124,7 @@ def calculate_pricing_for_plan(
     tip_fundatie_beci = _fv("foundation_type") or structura_cladirii.get("tipFundatieBeci", "")
     has_basement_livable = frontend_input.get("basementUse", False) or ("mit einfachem Ausbau" in str(tip_fundatie_beci))
     
-    # ---------- Plan dedicat beci: doar pereți interiori, finisaje interior, podele, utilități (fără exterior/fundație/acoperiș) ----------
+    # ---------- Plan dedicat beci: structură pereți interiori + exteriori; finisaje doar interior; podele, utilități (fără fundație/acoperiș) ----------
     if is_basement_plan:
         finish_int_beci = _norm_finish(
             mat_finisaj.get("finisajInteriorBeci") or mat_finisaj.get("finisajInterior", "Tencuială"),
@@ -132,15 +132,28 @@ def calculate_pricing_for_plan(
         )
         _wb_coeffs = pricing_coeffs.get("wandaufbau", {})
         _wb_beci_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
+        _wb_beci_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
+        items_walls_b = []
+        _cost_b_int = 0.0
+        _cost_b_ext = 0.0
         if _wb_coeffs and _wb_beci_innen:
-            _p_beci = float(_wb_coeffs.get("innen", {}).get(_wb_beci_innen, 280))
-            _cost_b_int = w_int_net_structure * _p_beci
-            cost_walls_b = {"total_cost": round(_cost_b_int, 2), "detailed_items": [{"category": "walls_structure_int", "name": f"Pereți Beci ({_wb_beci_innen})", "area_m2": round(w_int_net_structure, 2), "unit_price": round(_p_beci, 2), "cost": round(_cost_b_int, 2)}]}
+            _p_beci_innen = float(_wb_coeffs.get("innen", {}).get(_wb_beci_innen, 280))
+            _cost_b_int = w_int_net_structure * _p_beci_innen
+            items_walls_b.append({"category": "walls_structure_int", "name": f"Pereți Interiori Beci ({_wb_beci_innen})", "area_m2": round(w_int_net_structure, 2), "unit_price": round(_p_beci_innen, 2), "cost": round(_cost_b_int, 2)})
         else:
-            cost_walls_b = calculate_walls_details(
-                system_coeffs, w_int_net_structure, 0.0,
-                system=system_constructie
-            )
+            _p_int = float(system_coeffs.get("base_unit_prices", {}).get(system_constructie, {}).get("interior", 280))
+            _cost_b_int = w_int_net_structure * _p_int
+            items_walls_b.append({"category": "walls_structure_int", "name": f"Pereți Interiori Beci ({system_constructie})", "area_m2": round(w_int_net_structure, 2), "unit_price": round(_p_int, 2), "cost": round(_cost_b_int, 2)})
+        # Structură pereți exteriori beci (fără finisaje exterioare)
+        if _wb_coeffs and _wb_beci_aussen:
+            _p_beci_aussen = float(_wb_coeffs.get("aussen", {}).get(_wb_beci_aussen, 280))
+            _cost_b_ext = w_ext_net * _p_beci_aussen
+            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({_wb_beci_aussen})", "area_m2": round(w_ext_net, 2), "unit_price": round(_p_beci_aussen, 2), "cost": round(_cost_b_ext, 2)})
+        elif w_ext_net > 0:
+            _p_ext = float(system_coeffs.get("base_unit_prices", {}).get(system_constructie, {}).get("exterior", 280))
+            _cost_b_ext = w_ext_net * _p_ext
+            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net, 2), "unit_price": round(_p_ext, 2), "cost": round(_cost_b_ext, 2)})
+        cost_walls_b = {"total_cost": round(_cost_b_int + _cost_b_ext, 2), "detailed_items": items_walls_b}
         cost_finishes_b = calculate_finishes_details(
             finish_coeffs, w_int_net_finish, 0.0,
             type_int=finish_int_beci, type_ext="Tencuială",
@@ -182,7 +195,7 @@ def calculate_pricing_for_plan(
                 cost_utilities_b.get("detailed_items", [])
             )
         }
-        print(f"✅ [PRICING] Plan beci (dedicat): {cost_basement_only['total_cost']:,.0f} EUR (fără finisaje exterioare)")
+        print(f"✅ [PRICING] Plan beci (dedicat): {cost_basement_only['total_cost']:,.0f} EUR (structură interior + exterior, finisaje doar interior)")
         return {
             "total_cost_eur": round(total_b, 2),
             "total_area_m2": floor_area,
@@ -448,7 +461,22 @@ def calculate_pricing_for_plan(
         cost_fireplace = {"total_cost": 0.0, "detailed_items": []}
 
     # 5. TOTAL – Nivel ofertă (tag: offer_scope) decide CE includem, nu coeficient
-    nivel_oferta = (str(_fv("offer_scope") or sist_constr.get("nivelOferta") or "").strip())
+    nivel_oferta_raw = (str(_fv("offer_scope") or sist_constr.get("nivelOferta") or mat_finisaj.get("nivelOferta") or "").strip())
+    # Normalizare: RO/EN/altă limbă → chei DE pentru comparație
+    _nivel_map = {
+        "Structură": "Rohbau/Tragwerk",
+        "Structură + ferestre": "Tragwerk + Fenster",
+        "Casă completă": "Schlüsselfertiges Haus",
+    }
+    nivel_oferta = _nivel_map.get(nivel_oferta_raw, nivel_oferta_raw)
+    if nivel_oferta == nivel_oferta_raw:
+        nl = nivel_oferta.lower()
+        if ("rohbau" in nl or "tragwerk" in nl) and "fenster" not in nl:
+            nivel_oferta = "Rohbau/Tragwerk"
+        elif "tragwerk" in nl and "fenster" in nl:
+            nivel_oferta = "Tragwerk + Fenster"
+        elif "schlüsselfertig" in nl or "schlusselfertig" in nl:
+            nivel_oferta = "Schlüsselfertiges Haus"
     # Rohbau = doar structură; Tragwerk+Fenster = + deschideri; Schlüsselfertig sau necunoscut = tot
     include_openings = nivel_oferta != "Rohbau/Tragwerk"
     include_finishes = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
@@ -535,23 +563,37 @@ def calculate_pricing_for_plan(
         print(f"      - Pereți finisaje: {w_int_net_finish:.2f} m² × {coeff_walls:.0%} = {w_int_net_finish_basement:.2f} m²")
         print(f"      - Podele: {floor_area:.2f} m² × {coeff_floors:.0%} = {floor_area_basement:.2f} m²")
         
-        # Pereți interiori/exteriori pentru basement: același Wandaufbau (Keller) indiferent locuibil/nelocuibil
+        # Pereți interiori + exteriori pentru basement (structură); finisaje doar interior
         _wb_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
         _wb_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
-        if use_wandaufbau and (_wb_innen or _wb_aussen):
+        w_ext_net_basement = w_ext_net * coeff_walls
+        if use_wandaufbau and _wb_innen:
             _p_innen = float(wandaufbau_coeffs.get("innen", {}).get(_wb_innen, 280))
-            _p_aussen = float(wandaufbau_coeffs.get("aussen", {}).get(_wb_aussen, 280))
             _c_int_b = w_int_net_structure_basement * _p_innen
             _c_ext_b = 0.0
-            cost_walls_basement = {
-                "total_cost": round(_c_int_b + _c_ext_b, 2),
-                "detailed_items": [
-                    {"category": "walls_structure_int", "name": f"Pereți Beci ({_wb_innen or 'Wandaufbau'})", "area_m2": round(w_int_net_structure_basement, 2), "unit_price": round(_p_innen, 2), "cost": round(_c_int_b, 2)},
-                ]
-            }
+            items_b = [{"category": "walls_structure_int", "name": f"Pereți Interiori Beci ({_wb_innen})", "area_m2": round(w_int_net_structure_basement, 2), "unit_price": round(_p_innen, 2), "cost": round(_c_int_b, 2)}]
+            if w_ext_net_basement > 0:
+                if _wb_aussen:
+                    _p_aussen = float(wandaufbau_coeffs.get("aussen", {}).get(_wb_aussen, 280))
+                    _c_ext_b = w_ext_net_basement * _p_aussen
+                    items_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({_wb_aussen})", "area_m2": round(w_ext_net_basement, 2), "unit_price": round(_p_aussen, 2), "cost": round(_c_ext_b, 2)})
+                else:
+                    _p_ext_sys = float(system_coeffs.get("base_unit_prices", {}).get(system_constructie, {}).get("exterior", 280))
+                    _c_ext_b = w_ext_net_basement * _p_ext_sys
+                    items_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net_basement, 2), "unit_price": round(_p_ext_sys, 2), "cost": round(_c_ext_b, 2)})
+            cost_walls_basement = {"total_cost": round(_c_int_b + _c_ext_b, 2), "detailed_items": items_b}
+        elif use_wandaufbau and _wb_aussen and w_ext_net_basement > 0:
+            _p_aussen = float(wandaufbau_coeffs.get("aussen", {}).get(_wb_aussen, 280))
+            _p_innen = float(system_coeffs.get("base_unit_prices", {}).get(system_constructie, {}).get("interior", 280))
+            _c_int_b = w_int_net_structure_basement * _p_innen
+            _c_ext_b = w_ext_net_basement * _p_aussen
+            cost_walls_basement = {"total_cost": round(_c_int_b + _c_ext_b, 2), "detailed_items": [
+                {"category": "walls_structure_int", "name": f"Pereți Interiori Beci ({system_constructie})", "area_m2": round(w_int_net_structure_basement, 2), "unit_price": round(_p_innen, 2), "cost": round(_c_int_b, 2)},
+                {"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({_wb_aussen})", "area_m2": round(w_ext_net_basement, 2), "unit_price": round(_p_aussen, 2), "cost": round(_c_ext_b, 2)},
+            ]}
         else:
             cost_walls_basement = calculate_walls_details(
-                system_coeffs, w_int_net_structure_basement, 0.0,
+                system_coeffs, w_int_net_structure_basement, w_ext_net_basement,
                 system=system_constructie
             )
         

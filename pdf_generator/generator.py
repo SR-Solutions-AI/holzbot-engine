@@ -2664,9 +2664,61 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                 floor_type = "top_floor"
         
         sort_key = 0 if floor_type == "ground_floor" else 1
-        enriched_plans.append({"plan": plan, "floor_type": floor_type, "sort": sort_key})
+        enriched_plans.append({"plan": plan, "floor_type": floor_type, "sort": sort_key, "index": len(enriched_plans)})
         
     enriched_plans.sort(key=lambda x: x["sort"])
+
+    # Încărcăm ordinea etajelor (de jos în sus) și indexul beciului pentru denumiri corecte în PDF
+    order_from_bottom = None
+    basement_plan_index = None
+    for run_dir_candidate in (output_root, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id):
+        if not Path(run_dir_candidate).exists():
+            continue
+        if order_from_bottom is None:
+            fo_path = Path(run_dir_candidate) / "floor_order.json"
+            if fo_path.exists():
+                try:
+                    data = json.loads(fo_path.read_text(encoding="utf-8"))
+                    ob = data.get("order_from_bottom")
+                    if ob and len(ob) == len(plan_infos) and set(ob) == set(range(len(plan_infos))):
+                        order_from_bottom = ob
+                except Exception:
+                    pass
+        if basement_plan_index is None:
+            bp_path = Path(run_dir_candidate) / "basement_plan_id.json"
+            if bp_path.exists():
+                try:
+                    bp_data = json.loads(bp_path.read_text(encoding="utf-8"))
+                    raw = bp_data.get("basement_plan_index")
+                    if raw is not None and 0 <= int(raw) < len(plan_infos):
+                        basement_plan_index = int(raw)
+                except Exception:
+                    pass
+        if order_from_bottom is not None and basement_plan_index is not None:
+            break
+
+    # Ordine finală: folosim order_from_bottom dacă există, altfel păstrăm sortarea ground_floor apoi restul
+    enriched_by_idx = {p["index"]: p for p in enriched_plans}
+    if order_from_bottom is not None:
+        enriched_ordered = [enriched_by_idx[i] for i in order_from_bottom if i in enriched_by_idx]
+        if len(enriched_ordered) != len(enriched_plans):
+            enriched_ordered = enriched_plans
+    else:
+        enriched_ordered = enriched_plans
+
+    # Atribuim etichete etaj: Keller, Erdgeschoss, 1. Obergeschoss, 2. Obergeschoss, ..., Mansardă/Dachgeschoss
+    def _floor_display_label(pos: int, p_data: dict, basement_idx: int | None, ordered_list: list) -> str:
+        if basement_idx is not None and p_data.get("index") == basement_idx:
+            return "Keller"
+        ft = (p_data.get("floor_type") or "").strip().lower()
+        if ft == "ground_floor":
+            return "Erdgeschoss"
+        if ft == "top_floor":
+            return "Mansardă" if len(ordered_list) > 1 else "Dachgeschoss"
+        if ft == "intermediate":
+            inter_count = sum(1 for i in range(pos + 1) if (ordered_list[i].get("floor_type") or "").strip().lower() == "intermediate")
+            return f"{inter_count}. Obergeschoss"
+        return "Erdgeschoss" if pos == 0 else f"Obergeschoss {pos}"
 
     plans_data = []
     global_openings = []
@@ -2676,9 +2728,10 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta)
     
-    for p_data in enriched_plans:
+    for pos, p_data in enumerate(enriched_ordered):
         plan = p_data["plan"]
         pricing_path = plan.stage_work_dir / "pricing_raw.json"
+        floor_label = _floor_display_label(pos, p_data, basement_plan_index, enriched_ordered)
         
         if pricing_path.exists():
             with open(pricing_path, encoding="utf-8") as f: 
@@ -2737,7 +2790,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                         filtered_breakdown.get("roof", {})["total_cost"] -= cost
                         filtered_total += cost
             
-            plans_data.append({"info": plan, "type": p_data["floor_type"], "pricing": p_json})
+            plans_data.append({"info": plan, "type": p_data["floor_type"], "floor_label": floor_label, "pricing": p_json})
 
     # ADMIN: Enforcer simplu, fără branding
     enforcer = GermanEnforcer()
@@ -2912,6 +2965,54 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
     for item in summary_items:
         story.append(Paragraph(item, styles["Body"]))
     
+    # ADMIN: Secțiune Acoperiș – suprafață, tip, unghi
+    tip_acoperis_roof = sistem_constructiv.get("tipAcoperis", "—")
+    total_roof_area_m2 = 0.0
+    for entry in (plans_data or []):
+        plan = entry.get("info")
+        if not plan:
+            continue
+        area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+        if area_json_path.exists():
+            try:
+                with open(area_json_path, "r", encoding="utf-8") as f:
+                    area_data = json.load(f)
+                roof_m2 = area_data.get("surfaces", {}).get("roof_m2")
+                if roof_m2 is not None:
+                    total_roof_area_m2 += float(roof_m2)
+            except Exception:
+                pass
+    if total_roof_area_m2 == 0 and plans_data:
+        for entry in plans_data:
+            pricing = entry.get("pricing", {})
+            roof_bd = pricing.get("breakdown", {}).get("roof", {})
+            items = roof_bd.get("detailed_items", []) or roof_bd.get("items", [])
+            for it in items:
+                total_roof_area_m2 += float(it.get("area_m2", 0.0) or 0.0)
+    
+    roof_angles_str = "—"
+    for candidate in (output_root, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id):
+        r3d = Path(candidate) / "roof" / "roof_3d"
+        ang_path = r3d / "floor_roof_angles.json"
+        if ang_path.exists():
+            try:
+                ang_data = json.loads(ang_path.read_text(encoding="utf-8"))
+                vals = [float(ang_data[k]) for k in sorted(ang_data.keys(), key=lambda x: int(x)) if ang_data.get(k) is not None]
+                roof_angles_str = ", ".join(f"{v:.0f}°" for v in vals) if vals else "—"
+            except Exception:
+                pass
+            break
+    
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("<b>Dach / Acoperiș</b>", styles["H3"]))
+    roof_lines = [
+        f"<b>{enforcer.get('Dachfläche')}:</b> {total_roof_area_m2:.1f} m²" if total_roof_area_m2 > 0 else f"<b>{enforcer.get('Dachfläche')}:</b> —",
+        f"<b>{enforcer.get('Tip acoperiș')}:</b> {enforcer.get(tip_acoperis_roof) if tip_acoperis_roof and tip_acoperis_roof != '—' else '—'}",
+        f"<b>Dachneigung / Unghi acoperiș:</b> {roof_angles_str}",
+    ]
+    for line in roof_lines:
+        story.append(Paragraph(line, styles["Body"]))
+    
     story.append(Spacer(1, 4*mm))
 
     # ADMIN: Planuri cu imagini și date detaliate
@@ -2927,7 +3028,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
             story.append(Spacer(1, 6*mm))
         
         entry_type_clean = entry["type"].strip().lower() 
-        floor_label = "Erdgeschoss" if entry_type_clean == "ground_floor" else "Obergeschoss / Dachgeschoss"
+        floor_label = entry.get("floor_label") or ("Erdgeschoss" if entry_type_clean == "ground_floor" else "Obergeschoss / Dachgeschoss")
         
         story.append(Paragraph(f"Plan: {floor_label} ({plan.plan_id})", styles["H2"]))
         story.append(Spacer(1, 2*mm))

@@ -1818,8 +1818,8 @@ def generate_walls_from_room_coordinates(
             mask_ff = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
             cv2.floodFill(free_space.copy(), mask_ff, (sx, sy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
             house_interior = np.maximum(house_interior, (mask_ff[1:-1, 1:-1] > 0).astype(np.uint8) * 255)
-            if np.any(house_interior > 0):
-                break
+            # Nu facem break: reunim toate componentele de spațiu liber care nu sunt terasă/balcon,
+            # ca pereții „lipiți de casă" (frontiera casă–terasă) să aibă vecin în house_interior.
         if np.any(house_interior > 0):
             cv2.imwrite(str(strip_dir / "flood_interior_casa.png"), house_interior)
 

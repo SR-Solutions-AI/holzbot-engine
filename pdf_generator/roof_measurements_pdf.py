@@ -12,7 +12,8 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-from config.settings import OUTPUT_ROOT, RUNNER_ROOT, JOBS_ROOT
+from config.settings import OUTPUT_ROOT, RUNNER_ROOT, JOBS_ROOT, RUNS_ROOT, load_plan_infos, PlansListError
+from config.frontend_loader import load_frontend_data_for_run
 
 
 def _load_floor_data_from_pricing(out_root: Path) -> list[dict[str, Any]]:
@@ -83,6 +84,7 @@ def _load_floor_data_from_pricing(out_root: Path) -> list[dict[str, Any]]:
             elif "window" in t:
                 num_windows += 1
         floors_data.append({
+            "plan_id": plan_dir.name,
             "structure_int_net_m2": round(int_net, 2),
             "structure_ext_net_m2": round(ext_net, 2),
             "finish_int_net_m2": round(fin_int, 2),
@@ -110,6 +112,102 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     if not out_root.exists():
         print(f"⚠️ [PDF ROOF] Output nu există: {run_id}")
         return None
+
+    job_root = JOBS_ROOT / run_id
+    if not job_root.exists():
+        job_root = None
+    frontend_data = load_frontend_data_for_run(run_id, job_root)
+    sistem_constructiv = frontend_data.get("sistemConstructiv", {})
+    tip_acoperis = sistem_constructiv.get("tipAcoperis", "—")
+
+    # Ordine etaje și etichete (Keller, Erdgeschoss, 1. Obergeschoss, Mansardă, etc.)
+    plan_id_to_label: dict[str, str] = {}
+    roof_floor_labels: list[str] = []  # etichete pentru by_floor "0", "1", "2" (doar etaje cu acoperiș)
+    try:
+        plan_infos = load_plan_infos(run_id, stage_name="pricing")
+    except PlansListError:
+        plan_infos = []
+    order_from_bottom = None
+    basement_plan_index = None
+    for run_dir_candidate in (out_root, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id):
+        run_dir = Path(run_dir_candidate)
+        if not run_dir.exists():
+            continue
+        if order_from_bottom is None:
+            fo_path = run_dir / "floor_order.json"
+            if fo_path.exists():
+                try:
+                    data = json.loads(fo_path.read_text(encoding="utf-8"))
+                    ob = data.get("order_from_bottom")
+                    if ob and len(ob) == len(plan_infos) and set(ob) == set(range(len(plan_infos))):
+                        order_from_bottom = ob
+                except Exception:
+                    pass
+        if basement_plan_index is None:
+            bp_path = run_dir / "basement_plan_id.json"
+            if bp_path.exists():
+                try:
+                    bp_data = json.loads(bp_path.read_text(encoding="utf-8"))
+                    raw = bp_data.get("basement_plan_index")
+                    if raw is not None and 0 <= int(raw) < len(plan_infos):
+                        basement_plan_index = int(raw)
+                except Exception:
+                    pass
+        if order_from_bottom is not None and basement_plan_index is not None:
+            break
+
+    if plan_infos:
+        # Construim enriched_plans cu floor_type din plan_metadata
+        enriched_plans = []
+        for i, plan in enumerate(plan_infos):
+            plan_name_parts = plan.plan_id.split("_")
+            meta_filename = f"{plan_name_parts[-2]}_{plan_name_parts[-1]}.json" if len(plan_name_parts) >= 2 and plan_name_parts[-2] == "cluster" else f"{plan.plan_id}.json"
+            meta_path = out_root / "plan_metadata" / meta_filename
+            floor_type = "unknown"
+            if meta_path.exists():
+                try:
+                    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+                    floor_type = (raw.get("floor_classification", {}).get("floor_type", "unknown") or "unknown").strip().lower()
+                except Exception:
+                    pass
+            if floor_type == "unknown":
+                if "parter" in plan.plan_id.lower() or "ground" in plan.plan_id.lower():
+                    floor_type = "ground_floor"
+                elif "etaj" in plan.plan_id.lower() or "top" in plan.plan_id.lower():
+                    floor_type = "top_floor"
+            sort_key = 0 if floor_type == "ground_floor" else 1
+            enriched_plans.append({"plan": plan, "floor_type": floor_type, "sort": sort_key, "index": i})
+        enriched_plans.sort(key=lambda x: x["sort"])
+        enriched_by_idx = {p["index"]: p for p in enriched_plans}
+        enriched_ordered = [enriched_by_idx[i] for i in order_from_bottom] if order_from_bottom else enriched_plans
+        if order_from_bottom and len(enriched_ordered) != len(enriched_plans):
+            enriched_ordered = enriched_plans
+
+        def _floor_display_label(pos: int, p_data: dict, basement_idx: int | None, ordered_list: list) -> str:
+            if basement_idx is not None and p_data.get("index") == basement_idx:
+                return "Keller"
+            ft = (p_data.get("floor_type") or "").strip().lower()
+            if ft == "ground_floor":
+                return "Erdgeschoss"
+            if ft == "top_floor":
+                return "Mansardă" if len(ordered_list) > 1 else "Dachgeschoss"
+            if ft == "intermediate":
+                inter_count = sum(1 for i in range(pos + 1) if (ordered_list[i].get("floor_type") or "").strip().lower() == "intermediate")
+                return f"{inter_count}. Obergeschoss"
+            return "Erdgeschoss" if pos == 0 else f"Obergeschoss {pos}"
+
+        for pos, p_data in enumerate(enriched_ordered):
+            plan = p_data["plan"]
+            label = _floor_display_label(pos, p_data, basement_plan_index, enriched_ordered)
+            plan_id_to_label[plan.plan_id] = label
+        # Etichete doar pentru etajele cu acoperiș (fără Keller)
+        for pos, p_data in enumerate(enriched_ordered):
+            if basement_plan_index is not None and p_data.get("index") == basement_plan_index:
+                continue
+            label = _floor_display_label(pos, p_data, basement_plan_index, enriched_ordered)
+            roof_floor_labels.append(label)
+    else:
+        roof_floor_labels = ["Erdgeschoss", "1. Obergeschoss / Dachgeschoss", "2. Obergeschoss", "3. Obergeschoss"]
 
     pdf_dir = out_root / "offer_pdf"
     pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -159,9 +257,31 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         "Alle Angaben basieren auf der 3D-Roof-Analyse.",
         body
     ))
+    story.append(Spacer(1, 6 * mm))
+
+    total = metrics.get("total") or {}
+    total_roof_area_m2 = total.get("area_m2")
+    roof_angles_str = "—"
+    for candidate in (out_root, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id):
+        ang_path = Path(candidate) / "roof" / "roof_3d" / "floor_roof_angles.json"
+        if ang_path.exists():
+            try:
+                ang_data = json.loads(ang_path.read_text(encoding="utf-8"))
+                vals = [float(ang_data[k]) for k in sorted(ang_data.keys(), key=lambda x: int(x)) if ang_data.get(k) is not None]
+                roof_angles_str = ", ".join(f"{v:.0f}°" for v in vals) if vals else "—"
+            except Exception:
+                pass
+            break
+    story.append(Paragraph("<b>Übersicht Dach</b>", heading_style))
+    story.append(Paragraph(
+        f"<b>Dachfläche (Gesamt):</b> {total_roof_area_m2:.2f} m²" if total_roof_area_m2 is not None else "<b>Dachfläche (Gesamt):</b> —",
+        body
+    ))
+    story.append(Paragraph(f"<b>Dachtyp:</b> {tip_acoperis}", body))
+    story.append(Paragraph(f"<b>Dachneigung:</b> {roof_angles_str}", body))
     story.append(Spacer(1, 8 * mm))
 
-    floor_labels = {
+    floor_labels_fallback = {
         "0": "Erdgeschoss",
         "1": "1. Obergeschoss / Dachgeschoss",
         "2": "2. Obergeschoss",
@@ -170,7 +290,8 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
 
     for floor_key in sorted(by_floor.keys(), key=lambda k: int(k) if str(k).isdigit() else 0):
         data = by_floor[floor_key]
-        label = floor_labels.get(str(floor_key), f"Etaj {floor_key}")
+        idx = int(floor_key) if str(floor_key).isdigit() else 0
+        label = roof_floor_labels[idx] if idx < len(roof_floor_labels) else floor_labels_fallback.get(str(floor_key), f"Etaj {floor_key}")
 
         story.append(Paragraph(f"<b>{label}</b>", heading_style))
 
@@ -201,7 +322,6 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         story.append(t)
         story.append(Spacer(1, 10 * mm))
 
-    total = metrics.get("total") or {}
     total_area = total.get("area_m2")
     total_contour = total.get("contour_m")
     if total_area is not None or total_contour is not None:
@@ -237,7 +357,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         ))
         story.append(Spacer(1, 8 * mm))
         for idx, fd in enumerate(floors_data):
-            label = floor_labels.get(str(idx), f"Etaj {idx}")
+            label = plan_id_to_label.get(fd.get("plan_id", ""), floor_labels_fallback.get(str(idx), f"Etaj {idx}"))
             story.append(Paragraph(f"<b>{label}</b>", heading_style))
             rows = [
                 ["Kennzahl", "Wert", "Einheit"],
