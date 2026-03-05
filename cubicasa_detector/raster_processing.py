@@ -1794,21 +1794,57 @@ def generate_walls_from_room_coordinates(
 
     removed_terasa_balcon = 0
     if np.any(flood_terasa_balcon_combined > 0):
+        # Interior casă: flood în spațiul liber (non-perete), excluzând terasa/balcon/wintergarden,
+        # ca să păstrăm pereții „lipiți de casă" (frontiera casă–terasă/balcon).
+        wall_2d = (accepted_wall_segments_mask > 0).astype(np.uint8)
+        free_space = (1 - wall_2d) * 255
+        house_interior = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        seed_candidates = [
+            (w_orig // 2, h_orig // 2),
+            (w_orig // 4, h_orig // 2),
+            (3 * w_orig // 4, h_orig // 2),
+            (w_orig // 2, h_orig // 4),
+            (w_orig // 2, 3 * h_orig // 4),
+        ]
+        step = max(10, min(w_orig, h_orig) // 15)
+        for py in range(step, h_orig - step, step):
+            for px in range(step, w_orig - step, step):
+                seed_candidates.append((px, py))
+        for sx, sy in seed_candidates:
+            if sy >= h_orig or sx >= w_orig:
+                continue
+            if free_space[sy, sx] == 0 or flood_terasa_balcon_combined[sy, sx] > 0:
+                continue
+            mask_ff = np.zeros((h_orig + 2, w_orig + 2), dtype=np.uint8)
+            cv2.floodFill(free_space.copy(), mask_ff, (sx, sy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
+            house_interior = np.maximum(house_interior, (mask_ff[1:-1, 1:-1] > 0).astype(np.uint8) * 255)
+            if np.any(house_interior > 0):
+                break
+        if np.any(house_interior > 0):
+            cv2.imwrite(str(strip_dir / "flood_interior_casa.png"), house_interior)
+
         to_remove = np.zeros((h_orig, w_orig), dtype=np.uint8)
         is_wall_tb = (accepted_wall_segments_mask > 0).copy()
         for y in range(h_orig):
             for x in range(w_orig):
                 if not is_wall_tb[y, x]:
                     continue
+                adj_terasa = False
+                adj_house = False
                 for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and flood_terasa_balcon_combined[ny, nx] > 0:
-                        to_remove[y, x] = 255
-                        break
+                    if 0 <= ny < h_orig and 0 <= nx < w_orig:
+                        if flood_terasa_balcon_combined[ny, nx] > 0:
+                            adj_terasa = True
+                        if house_interior[ny, nx] > 0:
+                            adj_house = True
+                # Eliminăm doar pereții care mărginesc terasa/balcon dar NU și casa (pereții lipiți de casă rămân).
+                if adj_terasa and not adj_house:
+                    to_remove[y, x] = 255
         removed_terasa_balcon = int(np.sum(to_remove > 0))
         accepted_wall_segments_mask[to_remove > 0] = 0
         walls_mask_validated[to_remove > 0] = 0
-        print(f"      [STRIP] Eliminat {removed_terasa_balcon} pixeli pereți (doar terasă + balcon + wintergarden; garaj și intrare acoperită rămân în 01_walls_from_coords)")
+        print(f"      [STRIP] Eliminat {removed_terasa_balcon} pixeli pereți (doar terasă + balcon + wintergarden; pereții lipiți de casă păstrați)")
     cv2.imwrite(str(strip_dir / "flood_interior_terasa_balcon.png"), (flood_terasa_balcon_combined > 0).astype(np.uint8) * 255)
     without_tb = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
     without_tb[accepted_wall_segments_mask > 0] = [255, 255, 255]
