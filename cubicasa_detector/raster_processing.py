@@ -2291,6 +2291,17 @@ def generate_walls_from_room_coordinates(
         except Exception as e:
             print(f"      ⚠️ Skeleton 1px pentru 01_walls_from_coords eșuat: {e}")
 
+    # Margine neagră 20px în jurul mastii (evită atingerea marginilor la operațiuni ulterioare)
+    border_px = 20
+    if h_orig > 2 * border_px and w_orig > 2 * border_px:
+        accepted_wall_segments_mask[:border_px, :] = 0
+        accepted_wall_segments_mask[-border_px:, :] = 0
+        accepted_wall_segments_mask[:, :border_px] = 0
+        accepted_wall_segments_mask[:, -border_px:] = 0
+        walls_mask_validated = accepted_wall_segments_mask.copy()
+        walls_overlay_mask = accepted_wall_segments_mask.copy()
+        print(f"      🔲 Margine neagră {border_px}px aplicată în jurul mastii")
+
     # ✅ Regulă balcon acoperiș: număr laturi lipite de casă pe masca curată; walls_mask_for_roof construit aici
     # Folosim masca dinainte de strip (accepted_wall_segments_mask_before_strip) ca pereții de contact să existe
     if balcon_center is not None:

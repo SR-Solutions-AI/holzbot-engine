@@ -67,6 +67,15 @@ def main():
 
     segments_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
     segments_img[walls_1px > 0] = [255, 255, 255]
+    # Margine neagră 20px în jurul mastii
+    border_px = 20
+    h, w = segments_img.shape[:2]
+    if h > 2 * border_px and w > 2 * border_px:
+        segments_img[:border_px, :] = 0
+        segments_img[-border_px:, :] = 0
+        segments_img[:, :border_px] = 0
+        segments_img[:, -border_px:] = 0
+        print(f"Margine neagră {border_px}px aplicată.")
     cv2.imwrite(str(out_path), segments_img)
     print(f"Salvat: {out_path}")
     return 0
