@@ -4,9 +4,17 @@ from __future__ import annotations
 import sys
 import os
 
+# Limită thread-uri OpenCV/NumPy ca paralelizarea etajelor să nu se bată cu thread-urile interne
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
+
+import cv2
+cv2.setNumThreads(1)
 
 from dataclasses import dataclass
 from pathlib import Path

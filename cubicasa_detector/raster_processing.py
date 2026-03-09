@@ -165,13 +165,12 @@ def detect_interior_exterior_from_raster(
     cv2.floodFill(inv_pad_walls, flood_mask, (0, 0), 128, flags=4)  # 4-conectivitate: nu trece prin diagonală
     
     outdoor_mask = (inv_pad_walls[1:h+1, 1:w+1] == 128).astype(np.uint8) * 255
-    
-    # Dilatăm exterior-ul pentru a acoperi zonele libere
-    kernel_grow = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    free_space = cv2.bitwise_not(api_walls_mask)
-    
-    for _ in range(30):
-        outdoor_mask = cv2.bitwise_and(cv2.dilate(outdoor_mask, kernel_grow), free_space)
+
+    # Contur exterior al casei + umplere: exterior = 255, interior contur = 0 (fără 30x dilate)
+    contours, _ = cv2.findContours(api_walls_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    outdoor_mask = np.ones_like(api_walls_mask) * 255
+    if contours:
+        cv2.drawContours(outdoor_mask, contours, -1, 0, thickness=-1)
     
     # Interior = total - exterior - pereți
     total_space = np.ones_like(outdoor_mask) * 255
@@ -1911,7 +1910,7 @@ def generate_walls_from_room_coordinates(
 
     # ✅ Balcon: mască casă fără balcon, mască doar balcon, regulă pentru includere la acoperiș (folosim primul balcon valid)
     def _flood_fill_remove_supplementary_lines(wall_mask_2d: np.ndarray, h: int, w: int) -> np.ndarray:
-        """Elimină liniile suplimentare: pixeli de perete cu ≥2 vecini flood în părți opuse (N-S sau E-W) și <3 vecini pereți (8-conectivitate)."""
+        """Elimină liniile suplimentare: pixeli de perete cu ≥2 vecini flood în părți opuse (N-S sau E-W) și <3 vecini pereți (8-conectivitate). Variantă vectorizată."""
         work = (wall_mask_2d > 0).astype(np.uint8) * 255
         flood_base = np.where(work > 0, 0, 255).astype(np.uint8)
         seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
@@ -1922,38 +1921,8 @@ def generate_walls_from_room_coordinates(
         for py in range(0, h, step):
             seeds.append((0, py))
             seeds.append((w - 1, py))
-        flood_any = np.zeros((h, w), dtype=np.uint8)
-        for cx, cy in seeds:
-            if cy >= h or cx >= w or flood_base[cy, cx] != 255:
-                continue
-            region_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-            img_f = flood_base.copy()
-            cv2.floodFill(img_f, region_mask, (cx, cy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
-            flood_any[region_mask[1:-1, 1:-1] > 0] = 255
-        for _ in range(5000):
-            wall_coords = np.argwhere(work > 0)
-            if wall_coords.size == 0:
-                break
-            to_remove = np.zeros((h, w), dtype=np.uint8)
-            for idx in range(len(wall_coords)):
-                y, x = int(wall_coords[idx, 0]), int(wall_coords[idx, 1])
-                flood_n = 1 if y > 0 and flood_any[y - 1, x] > 0 else 0
-                flood_s = 1 if y < h - 1 and flood_any[y + 1, x] > 0 else 0
-                flood_e = 1 if x < w - 1 and flood_any[y, x + 1] > 0 else 0
-                flood_w = 1 if x > 0 and flood_any[y, x - 1] > 0 else 0
-                if not ((flood_n and flood_s) or (flood_e and flood_w)):
-                    continue
-                n_wall = sum(
-                    1 for dy in (-1, 0, 1) for dx in (-1, 0, 1)
-                    if (dx or dy) and 0 <= y + dy < h and 0 <= x + dx < w and work[y + dy, x + dx] != 0
-                )
-                if n_wall >= 3:
-                    continue
-                to_remove[y, x] = 255
-            if np.sum(to_remove) == 0:
-                break
-            work[to_remove > 0] = 0
-            flood_base = np.where(work > 0, 0, 255).astype(np.uint8)
+        kernel_neighbors = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+        for _ in range(50):  # max 50 runde (în loc de 5000), fiecare vectorizată
             flood_any = np.zeros((h, w), dtype=np.uint8)
             for cx, cy in seeds:
                 if cy >= h or cx >= w or flood_base[cy, cx] != 255:
@@ -1962,6 +1931,25 @@ def generate_walls_from_room_coordinates(
                 img_f = flood_base.copy()
                 cv2.floodFill(img_f, region_mask, (cx, cy), 128, None, None, cv2.FLOODFILL_MASK_ONLY | 4)
                 flood_any[region_mask[1:-1, 1:-1] > 0] = 255
+            flood_mask = (flood_any > 0)
+            wall_bin = (work > 0).astype(np.uint8)
+            flood_N = np.roll(flood_mask, 1, axis=0)
+            flood_N[0, :] = False
+            flood_S = np.roll(flood_mask, -1, axis=0)
+            flood_S[-1, :] = False
+            flood_E = np.roll(flood_mask, -1, axis=1)
+            flood_E[:, -1] = False
+            flood_W = np.roll(flood_mask, 1, axis=1)
+            flood_W[:, 0] = False
+            opp_NS = flood_N & flood_S
+            opp_EW = flood_E & flood_W
+            has_opposite_flood = opp_NS | opp_EW
+            wall_neighbors = cv2.filter2D(wall_bin, -1, kernel_neighbors)
+            to_remove = (wall_bin.astype(bool) & has_opposite_flood & (wall_neighbors < 3))
+            if np.sum(to_remove) == 0:
+                break
+            work[to_remove] = 0
+            flood_base = np.where(work > 0, 0, 255).astype(np.uint8)
         return work
 
     def _estimate_wall_thickness(walls_mask: np.ndarray) -> int:
@@ -2287,80 +2275,65 @@ def generate_walls_from_room_coordinates(
     _log(f"      💾 Salvat: {flood_viz_path.name} (flood din colțuri = verde, pereți = alb, înainte de ștergerea liniilor cu ≥2 vecini flood opuși)")
 
     # Eliminăm pixelii de perete care au ≥2 vecini flood în părți OPUSE (N-S sau E-W).
-    # Un pixel este șters doar dacă are 0, 1 sau 2 vecini pereți (astfel se elimină și liniile subțiri
-    # între două zone de exterior; pixelii cu 3+ vecini = colțuri/T-uri și sunt păstrați).
-    # Iterăm doar peste pixelii de perete (nu tot planul) ca să nu blocăm pe imagini mari.
-    removed_total = 0
-    max_rounds = 5000
-    for _round in range(max_rounds):
-        wall_coords = np.argwhere(accepted_wall_segments_mask > 0)  # (N, 2) -> (y, x)
-        if wall_coords.size == 0:
-            break
-        walls_to_remove = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        for idx in range(len(wall_coords)):
-            y, x = int(wall_coords[idx, 0]), int(wall_coords[idx, 1])
-            flood_n = 1 if y > 0 and flood_any[y - 1, x] > 0 else 0
-            flood_s = 1 if y < h_orig - 1 and flood_any[y + 1, x] > 0 else 0
-            flood_e = 1 if x < w_orig - 1 and flood_any[y, x + 1] > 0 else 0
-            flood_w = 1 if x > 0 and flood_any[y, x - 1] > 0 else 0
-            opposite_ns = flood_n and flood_s
-            opposite_ew = flood_e and flood_w
-            if not (opposite_ns or opposite_ew):
-                continue
-            n_wall = 0
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dx == 0 and dy == 0:
-                        continue
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h_orig and 0 <= nx < w_orig and accepted_wall_segments_mask[ny, nx] != 0:
-                        n_wall += 1
-            if n_wall >= 3:
-                continue
-            walls_to_remove[y, x] = 255
-        round_removed = int(np.sum(walls_to_remove > 0))
-        # În prima rundă salvăm vizualizare: verde = flood, alb = pereți care rămân, roșu = linii suplimentare (eliminate)
-        if _round == 0:
-            lines_removed_viz = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-            lines_removed_viz[flood_any > 0] = [0, 180, 0]
-            lines_removed_viz[accepted_wall_segments_mask > 0] = [255, 255, 255]
-            lines_removed_viz[walls_to_remove > 0] = [0, 0, 255]
-            # Etichetă în colț desenată peste doar unde nu e roșu, ca niciun roșu să nu fie acoperit
-            n_red = int(np.sum(walls_to_remove > 0))
-            n_white = int(np.sum(accepted_wall_segments_mask > 0))
-            label = f"rosii: {n_red}  albi: {n_white}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = max(0.5, min(1.2, h_orig / 800))
-            thickness = max(1, int(round(2 * font_scale)))
-            (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-            pad = 8
-            x2, y2 = tw + 2 * pad, th + 2 * pad
-            roi = lines_removed_viz[0:y2, 0:x2]
-            is_red = (roi[:, :, 2] == 255) & (roi[:, :, 0] == 0)
-            roi_bg = np.full_like(roi, (40, 40, 40))
-            roi_border = roi_bg.copy()
-            cv2.rectangle(roi_border, (0, 0), (x2 - 1, y2 - 1), (200, 200, 200), 1)
-            cv2.putText(roi_border, label, (pad, th + pad), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-            np.copyto(roi, roi_border, where=np.broadcast_to(~is_red[:, :, None], roi.shape))
-            lines_removed_path = output_dir / "00_flood_fill_lines_removed.png"
-            cv2.imwrite(str(lines_removed_path), lines_removed_viz)
-            _log(f"      💾 Salvat: {lines_removed_path.name} (roșu = linii suplimentare eliminate, alb = pereți care rămân)")
-            # 00_flood_test.png: fundal negru, doar pixelii albi care nu sunt roșii (pereți care rămân după eliminare)
-            white_only = (accepted_wall_segments_mask > 0) & (walls_to_remove == 0)
-            flood_test = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-            flood_test[white_only] = [255, 255, 255]
-            flood_test_path = output_dir / "00_flood_test.png"
-            cv2.imwrite(str(flood_test_path), flood_test)
-            _log(f"      💾 Salvat: {flood_test_path.name} (doar albi fără roșu = pereți care rămân)")
-        if round_removed == 0:
-            break
-        accepted_wall_segments_mask[walls_to_remove > 0] = 0
-        removed_total += round_removed
-        # ✅ Doar o rundă: eliminăm strict pixelii roșii din 00_flood_fill_lines_removed.png, nu mai multe runde
-        if _round == 0:
-            break
-        if (_round + 1) % 100 == 0 and round_removed > 0:
-            _log(f"      🌊 Flood cleanup rundă {_round + 1}: eliminat {removed_total} pixeli până acum")
+    # Un pixel este șters doar dacă are 0, 1 sau 2 vecini pereți (8-conectivitate).
+    # Variantă vectorizată (NumPy/OpenCV) în loc de buclă Python pe milioane de pixeli.
+    flood_mask = (flood_any > 0)
+    wall_bin = (accepted_wall_segments_mask > 0).astype(np.uint8)
+
+    # 1. Vecinii flood N/S/E/W prin shiftare matriceală (fără wrap la margini)
+    flood_N = np.roll(flood_mask, 1, axis=0).astype(bool)
+    flood_N[0, :] = False
+    flood_S = np.roll(flood_mask, -1, axis=0).astype(bool)
+    flood_S[-1, :] = False
+    flood_E = np.roll(flood_mask, -1, axis=1).astype(bool)
+    flood_E[:, -1] = False
+    flood_W = np.roll(flood_mask, 1, axis=1).astype(bool)
+    flood_W[:, 0] = False
+
+    opp_NS = flood_N & flood_S
+    opp_EW = flood_E & flood_W
+    has_opposite_flood = opp_NS | opp_EW
+
+    # 2. Număr de vecini pereți (8-conectivitate) cu convoluție
+    kernel_neighbors = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    wall_neighbors = cv2.filter2D(wall_bin, -1, kernel_neighbors)
+
+    # 3. Pixelii de șters: perete + flood opus + < 3 vecini pereți
+    to_remove = wall_bin.astype(bool) & has_opposite_flood & (wall_neighbors < 3)
+    removed_total = int(np.sum(to_remove))
+    accepted_wall_segments_mask[to_remove] = 0
+
+    # Vizualizare prima rundă (roșu = eliminate, alb = rămase)
+    if removed_total > 0:
+        lines_removed_viz = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+        lines_removed_viz[flood_any > 0] = [0, 180, 0]
+        lines_removed_viz[accepted_wall_segments_mask > 0] = [255, 255, 255]
+        lines_removed_viz[to_remove] = [0, 0, 255]
+        n_red = removed_total
+        n_white = int(np.sum(accepted_wall_segments_mask > 0))
+        label = f"rosii: {n_red}  albi: {n_white}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = max(0.5, min(1.2, h_orig / 800))
+        thickness = max(1, int(round(2 * font_scale)))
+        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+        pad = 8
+        x2, y2 = tw + 2 * pad, th + 2 * pad
+        roi = lines_removed_viz[0:y2, 0:x2]
+        is_red = (roi[:, :, 2] == 255) & (roi[:, :, 0] == 0)
+        roi_bg = np.full_like(roi, (40, 40, 40))
+        roi_border = roi_bg.copy()
+        cv2.rectangle(roi_border, (0, 0), (x2 - 1, y2 - 1), (200, 200, 200), 1)
+        cv2.putText(roi_border, label, (pad, th + pad), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        np.copyto(roi, roi_border, where=np.broadcast_to(~is_red[:, :, None], roi.shape))
+        lines_removed_path = output_dir / "00_flood_fill_lines_removed.png"
+        cv2.imwrite(str(lines_removed_path), lines_removed_viz)
+        _log(f"      💾 Salvat: {lines_removed_path.name} (roșu = linii suplimentare eliminate, alb = pereți care rămân)")
+        white_only = (accepted_wall_segments_mask > 0)
+        flood_test = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+        flood_test[white_only] = [255, 255, 255]
+        flood_test_path = output_dir / "00_flood_test.png"
+        cv2.imwrite(str(flood_test_path), flood_test)
+        _log(f"      💾 Salvat: {flood_test_path.name} (doar albi = pereți care rămân)")
     walls_mask_validated = accepted_wall_segments_mask.copy()
     walls_overlay_mask = walls_mask_validated.copy()
     if removed_total > 0:
