@@ -1,5 +1,9 @@
 # new/runner/cubicasa_detector/config.py
 from pathlib import Path
+import os
+
+# Dacă 1/true/yes: salvează toate imaginile de debug și afișează mai multe print-uri
+DEBUG = os.environ.get("HOLZBOT_DEBUG", "").lower() in ("1", "true", "yes")
 
 # Path-uri relative
 MODULE_DIR = Path(__file__).parent

@@ -47,6 +47,7 @@ from .wall_repair import (
     smart_wall_closing,
     get_strict_1px_outline,
 )
+from .config import DEBUG
 from .raster_processing import (
     generate_raster_walls_overlay,
     detect_interior_exterior_from_raster,
@@ -111,7 +112,15 @@ except ImportError as e:
 def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
+# Nume de step-uri care trebuie mereu salvate (folosite de phase 2 / scale / count_objects)
+_REQUIRED_STEP_NAMES = {"00_original", "02_ai_walls_closed", "03_outdoor_mask"}
+# Setat la intrarea în run_cubicasa_detection; folosit de save_step
+_save_debug_steps = True
+
 def save_step(name, img, steps_dir):
+    """Salvează imaginea doar dacă e necesară sau _save_debug_steps e True."""
+    if name not in _REQUIRED_STEP_NAMES and not _save_debug_steps:
+        return
     path = Path(steps_dir) / f"{name}.png"
     cv2.imwrite(str(path), img)
 
@@ -483,38 +492,21 @@ def interval_merging_axis_projections(walls_mask: np.ndarray, steps_dir: str = N
     def test_intrusion(start_pt, end_pt, walls_mask_image):
         """
         Test de Intruziune: Verifică dacă între capete există pereți perpendiculari.
+        Implementare optimizată: linie pe mască + intersecție cu pereții (OpenCV), fără bucle Python.
         """
-        # Eșantionăm puncte de-a lungul liniei
-        dx = end_pt[0] - start_pt[0]
-        dy = end_pt[1] - start_pt[1]
-        dist = np.sqrt(dx*dx + dy*dy)
-        num_samples = max(10, int(dist / 5))
-        perpendicular_walls = 0
-        
-        for t in np.linspace(0.1, 0.9, num_samples):  # Evităm capetele
-            px = int(start_pt[0] + t * dx)
-            py = int(start_pt[1] + t * dy)
-            
-            if 0 <= px < w and 0 <= py < h:
-                # Verificăm pe o bandă perpendiculară pe linie
-                check_radius = 5
-                if abs(dx) > abs(dy):  # Linie orizontală
-                    for offset in range(-check_radius, check_radius + 1):
-                        check_y = py + offset
-                        if 0 <= check_y < h and abs(offset) > 2:
-                            if walls_mask_image[check_y, px] == 255:
-                                perpendicular_walls += 1
-                                break
-                else:  # Linie verticală
-                    for offset in range(-check_radius, check_radius + 1):
-                        check_x = px + offset
-                        if 0 <= check_x < w and abs(offset) > 2:
-                            if walls_mask_image[py, check_x] == 255:
-                                perpendicular_walls += 1
-                                break
-        
-        # Dacă mai mult de 20% din eșantioane au pereți perpendiculari, respingem
-        return perpendicular_walls <= num_samples * 0.2
+        h, w = walls_mask_image.shape[:2]
+        start_pt = (int(start_pt[0]), int(start_pt[1]))
+        end_pt = (int(end_pt[0]), int(end_pt[1]))
+        # Bandă similară cu vechiul check_radius*2 (10 px)
+        line_thickness = 10
+        line_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.line(line_mask, start_pt, end_pt, 255, thickness=line_thickness)
+        intersection = cv2.bitwise_and(walls_mask_image, line_mask)
+        line_pixels = cv2.countNonZero(line_mask)
+        wall_pixels_on_line = cv2.countNonZero(intersection)
+        # Acceptăm dacă cel mult 20% din pixeli de pe linie sunt pereți (același prag ca înainte)
+        threshold = 0.2 * line_pixels if line_pixels > 0 else 0
+        return wall_pixels_on_line <= threshold
     
     def test_ghost_profile(start_pt, end_pt, ghost_image):
         """
@@ -2065,53 +2057,57 @@ def export_walls_to_obj(walls_mask, output_path, scale_m_px, wall_height_m=2.5, 
 # ✅ NEW: ADAPTIVE TILING FOR LARGE IMAGES (nemodificată)
 # ============================================
 
-def _process_with_adaptive_tiling(img, model, device, tile_size=512, overlap=64):
-    """Procesează imagini mari prin tiling adaptiv."""
+def _process_with_adaptive_tiling(img, model, device, tile_size=1536, overlap=64):
+    """Procesează imagini mari prin tiling adaptiv, cu batch inference (4 pe CUDA, 2 altfel)."""
     h_orig, w_orig = img.shape[:2]
-    print(f"   🧩 TILING Mode: {w_orig}x{h_orig} -> tiles de {tile_size}x{tile_size}")
-    
     stride = tile_size - overlap
     n_tiles_h = math.ceil(h_orig / stride)
     n_tiles_w = math.ceil(w_orig / stride)
-    
-    print(f"   📦 Generez {n_tiles_w}x{n_tiles_h} = {n_tiles_w * n_tiles_h} tiles")
+    total_tiles = n_tiles_w * n_tiles_h
+    batch_size = 4 if device.type == "cuda" else 2
+    if DEBUG:
+        print(f"   🧩 TILING {w_orig}x{h_orig} -> {n_tiles_w}x{n_tiles_h} tiles (batch={batch_size})", flush=True)
     
     full_pred = np.zeros((h_orig, w_orig), dtype=np.float32)
     weight_map = np.zeros((h_orig, w_orig), dtype=np.float32)
-    
+    tile_indices = [(i, j) for i in range(n_tiles_h) for j in range(n_tiles_w)]
     tile_count = 0
-    for i in range(n_tiles_h):
-        for j in range(n_tiles_w):
+    
+    for batch_start in range(0, len(tile_indices), batch_size):
+        batch_inds = tile_indices[batch_start : batch_start + batch_size]
+        tensors_list = []
+        tile_infos = []
+        
+        for i, j in batch_inds:
             y_start = i * stride
             x_start = j * stride
             y_end = min(y_start + tile_size, h_orig)
             x_end = min(x_start + tile_size, w_orig)
-            
             tile = img[y_start:y_end, x_start:x_end]
-            
             tile_resized = cv2.resize(tile, (tile_size, tile_size))
-            
             norm_tile = 2 * (tile_resized.astype(np.float32) / 255.0) - 1
             tensor = torch.from_numpy(norm_tile).float().permute(2, 0, 1).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                output = model(tensor)
-                # Am ajustat pentru a rula chiar dacă modelul nu e încărcat corect, deși e o problemă de setup
-                if isinstance(output, dict) and output.get('out') is not None:
-                     pred_tile = torch.argmax(output['out'][:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
-                else:
-                    pred_tile = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
-            
-            actual_h = y_end - y_start
-            actual_w = x_end - x_start
+            tensors_list.append(tensor)
+            actual_h, actual_w = y_end - y_start, x_end - x_start
+            tile_infos.append((y_start, x_start, y_end, x_end, actual_h, actual_w))
+        
+        batch_tensor = torch.cat(tensors_list, dim=0)
+        with torch.inference_mode():
+            output = model(batch_tensor)
+            if isinstance(output, dict) and output.get('out') is not None:
+                out_slice = output['out'][:, 21:33, :, :]
+            else:
+                out_slice = output[:, 21:33, :, :]
+            pred_batch = torch.argmax(out_slice, dim=1).cpu().numpy()
+        
+        for idx, (y_start, x_start, y_end, x_end, actual_h, actual_w) in enumerate(tile_infos):
+            pred_tile = pred_batch[idx]
             pred_tile_resized = cv2.resize(
                 pred_tile.astype('uint8'),
                 (actual_w, actual_h),
                 interpolation=cv2.INTER_NEAREST
             ).astype(np.float32)
-            
             weight_tile = np.ones((actual_h, actual_w), dtype=np.float32)
-            
             if overlap > 0:
                 fade = min(overlap // 2, 32)
                 for k in range(fade):
@@ -2124,21 +2120,18 @@ def _process_with_adaptive_tiling(img, model, device, tile_size=512, overlap=64)
                         weight_tile[:, k] *= alpha
                     if x_end < w_orig and k < actual_w:
                         weight_tile[:, -(k+1)] *= alpha
-            
             full_pred[y_start:y_end, x_start:x_end] += pred_tile_resized * weight_tile
             weight_map[y_start:y_end, x_start:x_end] += weight_tile
-            
             tile_count += 1
-            if tile_count % 10 == 0:
-                print(f"      ⏳ Procesat {tile_count}/{n_tiles_w * n_tiles_h} tiles...")
+        
+        if DEBUG and (tile_count % 4 == 0 or tile_count == total_tiles):
+            print(f"      ⏳ Procesat {tile_count}/{total_tiles} tiles...", flush=True)
     
     weight_map[weight_map == 0] = 1
     full_pred = full_pred / weight_map
-    
     pred_mask = np.round(full_pred).astype(np.uint8)
-    
-    print(f"   ✅ Tiling complet: {tile_count} tiles procesate")
-    
+    if DEBUG:
+        print(f"   ✅ Tiling complet: {tile_count} tiles", flush=True)
     return pred_mask
 
 
@@ -2171,6 +2164,8 @@ def run_cubicasa_detection(
     reused_model / reused_device: când run_phase=1, poți pasa model/device reîntors de un plan
                                   anterior ca să nu reîncarci modelul.
     """
+    global _save_debug_steps
+    _save_debug_steps = save_debug_steps
     output_dir = Path(output_dir)
     steps_dir = output_dir / "cubicasa_steps"
     walls_result_from_coords = None
@@ -2227,14 +2222,16 @@ def run_cubicasa_detection(
                     if progress_callback is not None:
                         progress_callback(0)  # phase1 start (înainte de Raster API)
                     _rt_api = time.time()
-                    print(f"   🔄 Apel RasterScan API pentru vectorizare...")
+                    if DEBUG:
+                        print(f"   🔄 Apel RasterScan API pentru vectorizare...")
             
                     # Creăm folderul raster
                     raster_dir = Path(steps_dir) / "raster"
                     raster_dir.mkdir(parents=True, exist_ok=True)
             
                     # ✅ PREPROCESARE: Ștergem liniile foarte subțiri înainte de trimitere la RasterScan
-                    print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
+                    if DEBUG:
+                        print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
                     api_img = img.copy()
             
                     # Convertim la grayscale pentru procesare
@@ -2261,11 +2258,13 @@ def run_cubicasa_detection(
             
                     # Eliminăm liniile subțiri din imagine
                     api_img = cv2.inpaint(api_img, thin_lines_mask, 3, cv2.INPAINT_TELEA)
-            
-                    # Salvăm copia preprocesată în folderul raster
-                    preprocessed_path = raster_dir / "00_original_preprocessed.png"
-                    cv2.imwrite(str(preprocessed_path), api_img)
-                    print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
+                    
+                    # Salvăm copia preprocesată doar în mod debug (nu e necesară pentru phase 2)
+                    if _save_debug_steps:
+                        preprocessed_path = raster_dir / "00_original_preprocessed.png"
+                        cv2.imwrite(str(preprocessed_path), api_img)
+                        if DEBUG:
+                            print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat)")
             
                     # Scale-down doar pentru trimitere la Raster: max 1000px pe latura lungă
                     MAX_RASTER_SIDE = 1000
@@ -2276,7 +2275,8 @@ def run_cubicasa_detection(
                         new_w_api = max(1, int(w_api * scale_factor))
                         new_h_api = max(1, int(h_api * scale_factor))
                         api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
-                        print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
+                        if DEBUG:
+                            print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
                     else:
                         new_w_api, new_h_api = w_api, h_api
 
@@ -2289,17 +2289,20 @@ def run_cubicasa_detection(
                             "scale_factor": float(scale_factor)
                         }, f, indent=2)
 
-                    # Salvăm imaginea care se trimite la API (scale/raster) – nume explicit
+                    # Salvăm imaginea care se trimite la API (raster_request doar în debug)
+                    request_png_path = raster_dir / "raster_request.png"
+                    if _save_debug_steps:
+                        cv2.imwrite(str(request_png_path), api_img)
                     api_img_path = raster_dir / "input_resized.jpg"
                     cv2.imwrite(str(api_img_path), api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    request_png_path = raster_dir / "raster_request.png"
-                    cv2.imwrite(str(request_png_path), api_img)
-                    print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
+                    if DEBUG:
+                        print(f"      📄 Salvat (trimis la Raster): {request_png_path.name}")
 
                     # Convertim în base64 (folosim JPEG comprimat)
                     _, buffer = cv2.imencode('.jpg', api_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     image_base64 = base64.b64encode(buffer).decode('utf-8')
-                    print(f"      📦 Dimensiune payload: {len(image_base64) / 1024 / 1024:.2f} MB")
+                    if DEBUG:
+                        print(f"      📦 Dimensiune payload: {len(image_base64) / 1024 / 1024:.2f} MB")
                     if progress_callback is not None:
                         progress_callback(1)  # preprocess done (înainte de apel API)
 
@@ -2809,31 +2812,38 @@ def run_cubicasa_detection(
         # ✅ ADAPTIVE STRATEGY (tot în run_phase != 2)
         if raster_timings is not None:
             _rt_ai = time.time()
-        LARGE_IMAGE_THRESHOLD = 3000  # px
+        LARGE_IMAGE_THRESHOLD = 4000  # px – peste acest prag folosim tiling (mai mare = mai puține planuri cu tiling)
         USE_TILING = h_orig > LARGE_IMAGE_THRESHOLD or w_orig > LARGE_IMAGE_THRESHOLD
         
         if USE_TILING:
-            print(f"   🚀 LARGE IMAGE ({w_orig}x{h_orig}) -> Folosesc TILING ADAPTIV")
+            if DEBUG:
+                print(f"   🚀 LARGE IMAGE ({w_orig}x{h_orig}) -> Folosesc TILING ADAPTIV")
             pred_mask = _process_with_adaptive_tiling(
-                img, 
-                model, 
-                device, 
-                tile_size=512,
+                img,
+                model,
+                device,
+                tile_size=1536,
                 overlap=64
             )
         else:
-            print(f"   🚀 SMALL IMAGE ({w_orig}x{h_orig}) -> Resize Standard la 2048px")
-            max_dim = 2048
+            if DEBUG:
+                print(f"   🚀 SMALL IMAGE ({w_orig}x{h_orig}) -> Resize Standard la 1536px")
+            max_dim = 1536
             scale = min(max_dim / w_orig, max_dim / h_orig, 1.0)
             new_w = int(w_orig * scale)
             new_h = int(h_orig * scale)
-            print(f"      Resize: {w_orig}x{h_orig} -> {new_w}x{new_h}")
+            if DEBUG:
+                print(f"      Resize: {w_orig}x{h_orig} -> {new_w}x{new_h}")
             input_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
             norm_img = 2 * (input_img.astype(np.float32) / 255.0) - 1
             tensor = torch.from_numpy(norm_img).float().permute(2, 0, 1).unsqueeze(0).to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = model(tensor)
-                pred_mask_small = torch.argmax(output[:, 21:33, :, :], dim=1).squeeze().cpu().numpy()
+                if isinstance(output, dict) and output.get('out') is not None:
+                    out_slice = output['out'][:, 21:33, :, :]
+                else:
+                    out_slice = output[:, 21:33, :, :]
+                pred_mask_small = torch.argmax(out_slice, dim=1).squeeze().cpu().numpy()
             pred_mask = cv2.resize(
                 pred_mask_small.astype('uint8'),
                 (w_orig, h_orig),
@@ -3037,11 +3047,10 @@ def run_cubicasa_detection(
                                     str(steps_dir),
                                     gemini_api_key,
                                     initial_walls_mask_1px=aligned_1px,
+                                    progress_callback=(lambda: progress_callback(2)) if (progress_callback is not None and run_phase == 2) else None,
                                 )
                                 if _rt_wfc is not None and raster_timings is not None:
                                     raster_timings.append(("Raster P2: Garage + interior/exterior (1px)", time.time() - _rt_wfc))
-                                if progress_callback is not None and run_phase == 2:
-                                    progress_callback(2)  # walls from coords done
                                 if walls_result:
                                     print(f"      ✅ Garaj + interior/exterior din mască 1px aliniată")
                                     walls_result_from_coords = walls_result
@@ -3106,12 +3115,11 @@ def run_cubicasa_detection(
                                         best_config,
                                         raster_dir,
                                         str(steps_dir),
-                                        gemini_api_key
+                                        gemini_api_key,
+                                        progress_callback=(lambda: progress_callback(2)) if (progress_callback is not None and run_phase == 2) else None,
                                     )
                                     if _rt_wfc is not None and raster_timings is not None:
                                         raster_timings.append(("Raster P2: Walls from room coords", time.time() - _rt_wfc))
-                                    if progress_callback is not None and run_phase == 2:
-                                        progress_callback(2)  # walls from coords done
                                 except Exception as walls_error:
                                     import traceback
                                     print(f"      ⚠️ Eroare la generarea pereților din coordonate: {walls_error}")

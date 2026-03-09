@@ -470,8 +470,8 @@ def brute_force_translation_only(
 ) -> Optional[Dict[str, Any]]:
     """
     Brute force doar cu translații (fără scale) între două măști de aceeași dimensiune.
-    Faza 1: căutare cu pas 5 px pe intervalul complet. Faza 2: rafinare cu pas 1 px
-    în jurul zonei bune (±5 px pe fiecare axă).
+    Pentru imagini mari: căutare pe versiune redusă (max 500 px), apoi rafinare la scara originală.
+    Faza 1: căutare cu pas 5 px (pe redus sau full). Faza 2: rafinare cu pas 1 px în jurul zonei bune.
 
     Returns:
         Dict cu position: (tx, ty), score: float, direction: "translation_only", template_size: (w, h)
@@ -480,53 +480,89 @@ def brute_force_translation_only(
     if ref_binary.shape != api_binary.shape:
         return None
     h, w = ref_binary.shape[:2]
-    tx_min, tx_max = -w + 1, w
-    ty_min, ty_max = -h + 1, h
+    max_side_for_coarse = 500  # peste această latură facem căutarea pe imagine redusă
+    scale_down = 1.0
+    ref_work = ref_binary
+    api_work = api_binary
+    h_work, w_work = h, w
+    if max(h, w) > max_side_for_coarse:
+        scale_down = max_side_for_coarse / max(h, w)
+        w_work = max(1, int(round(w * scale_down)))
+        h_work = max(1, int(round(h * scale_down)))
+        ref_work = cv2.resize(ref_binary, (w_work, h_work), interpolation=cv2.INTER_NEAREST)
+        api_work = cv2.resize(api_binary, (w_work, h_work), interpolation=cv2.INTER_NEAREST)
+        # Binarizare după resize (resize poate produce valori intermediare)
+        _, ref_work = cv2.threshold(ref_work, 127, 255, cv2.THRESH_BINARY)
+        _, api_work = cv2.threshold(api_work, 127, 255, cv2.THRESH_BINARY)
+    tx_min, tx_max = -w_work + 1, w_work
+    ty_min, ty_max = -h_work + 1, h_work
     best_score = 0.0
     best_tx = best_ty = 0
-    canvas = np.zeros_like(ref_binary)
+    canvas = np.zeros_like(ref_work)
     step_coarse = 5
     refine_radius = 5  # rafinare ±5 px (acoperă gap-ul dintre pașii de 5)
 
-    def overlap_at(tx: int, ty: int) -> float:
+    def overlap_at(tx: int, ty: int, rref: np.ndarray, rapi: np.ndarray, cvs: np.ndarray) -> float:
+        hh, ww = rref.shape[:2]
         x_src_start = max(0, -tx)
         y_src_start = max(0, -ty)
         x_dst_start = max(0, tx)
         y_dst_start = max(0, ty)
-        w_copy = min(w - x_src_start, w - x_dst_start)
-        h_copy = min(h - y_src_start, h - y_dst_start)
+        w_copy = min(ww - x_src_start, ww - x_dst_start)
+        h_copy = min(hh - y_src_start, hh - y_dst_start)
         if w_copy <= 0 or h_copy <= 0:
             return 0.0
-        canvas.fill(0)
-        canvas[y_dst_start : y_dst_start + h_copy, x_dst_start : x_dst_start + w_copy] = (
-            api_binary[y_src_start : y_src_start + h_copy, x_src_start : x_src_start + w_copy]
+        cvs.fill(0)
+        cvs[y_dst_start : y_dst_start + h_copy, x_dst_start : x_dst_start + w_copy] = (
+            rapi[y_src_start : y_src_start + h_copy, x_src_start : x_src_start + w_copy]
         )
-        inter = int(((canvas == 255) & (ref_binary == 255)).sum())
-        count_api = int((canvas == 255).sum())
-        count_ref = int((ref_binary == 255).sum())
+        inter = int(((cvs == 255) & (rref == 255)).sum())
+        count_api = int((cvs == 255).sum())
+        count_ref = int((rref == 255).sum())
         if count_api == 0 or count_ref == 0:
             return 0.0
         pct_api_on_ref = inter / count_api
         pct_ref_covered = inter / count_ref
         return float(min(pct_api_on_ref, pct_ref_covered))
 
-    # Faza 1: căutare grosieră, pas 5 px
+    # Faza 1: căutare grosieră pe (ref_work, api_work)
     for tx in range(tx_min, tx_max, step_coarse):
         for ty in range(ty_min, ty_max, step_coarse):
-            s = overlap_at(tx, ty)
+            s = overlap_at(tx, ty, ref_work, api_work, canvas)
             if s > best_score:
                 best_score = s
                 best_tx, best_ty = tx, ty
 
-    # Faza 2: rafinare cu pas 1 în zona bună (±refine_radius)
+    # Faza 2: rafinare pe imaginea de lucru
     for tx in range(best_tx - refine_radius, best_tx + refine_radius + 1):
         for ty in range(best_ty - refine_radius, best_ty + refine_radius + 1):
             if tx < tx_min or tx >= tx_max or ty < ty_min or ty >= ty_max:
                 continue
-            s = overlap_at(tx, ty)
+            s = overlap_at(tx, ty, ref_work, api_work, canvas)
             if s > best_score:
                 best_score = s
                 best_tx, best_ty = tx, ty
+
+    # Dacă am lucrat pe imagine redusă, scalăm translația la dimensiunile originale
+    if scale_down < 1.0:
+        scale_up_x = w / w_work
+        scale_up_y = h / h_work
+        best_tx_orig = int(round(best_tx * scale_up_x))
+        best_ty_orig = int(round(best_ty * scale_up_y))
+        # Rafinare la scara originală într-o fereastră mică (±10 px) pentru precizie
+        refine_orig = 10
+        canvas_full = np.zeros_like(ref_binary)
+        tx_min_o = best_tx_orig - refine_orig
+        tx_max_o = best_tx_orig + refine_orig + 1
+        ty_min_o = best_ty_orig - refine_orig
+        ty_max_o = best_ty_orig + refine_orig + 1
+        for tx_o in range(tx_min_o, tx_max_o):
+            for ty_o in range(ty_min_o, ty_max_o):
+                s = overlap_at(tx_o, ty_o, ref_binary, api_binary, canvas_full)
+                if s > best_score:
+                    best_score = s
+                    best_tx_orig, best_ty_orig = tx_o, ty_o
+        best_tx, best_ty = best_tx_orig, best_ty_orig
 
     return {
         "position": (int(best_tx), int(best_ty)),

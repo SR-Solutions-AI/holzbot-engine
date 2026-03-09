@@ -6,6 +6,7 @@ import torch
 from pathlib import Path
 
 from .detector import run_cubicasa_detection
+from .config import DEBUG
 
 
 def run_cubicasa_for_plan(
@@ -70,12 +71,12 @@ def run_cubicasa_for_plan(
     # 4. RULEAZĂ DETECTION
     # ✅ CRITICAL: Trimite parametrii cu numele CORECT
     return run_cubicasa_detection(
-        image_path=str(plan_image),           # ✅ image_path (NU plan_image)
-        model_weights_path=str(weights_file), # ✅ model_weights_path (NU weights_file)
-        output_dir=str(output_dir),           # ✅ output_dir
-        gemini_api_key=gemini_api_key,        # ✅ gemini_api_key
-        device=device,                        # ✅ device
-        save_debug_steps=True                 # ✅ save_debug_steps
+        image_path=str(plan_image),
+        model_weights_path=str(weights_file),
+        output_dir=str(output_dir),
+        gemini_api_key=gemini_api_key,
+        device=device,
+        save_debug_steps=DEBUG,
     )
 
 
@@ -113,7 +114,6 @@ def run_cubicasa_phase1(
 ) -> dict:
     """
     Rulează doar faza 1 (Raster API + AI walls → 02_ai_walls_closed).
-    Fiecare apel își încarcă propriul model/device (potrivit pentru execuție paralelă).
     raster_timings: listă mutabilă în care se adaugă (nume_pas, durată) pentru raportare timpi.
     progress_callback: opțional, apelat cu (sub_step: int) 0=start, 1=raster API done, 2=phase1 end.
     """
@@ -129,7 +129,7 @@ def run_cubicasa_phase1(
         output_dir=str(output_dir),
         gemini_api_key=gemini_api_key,
         device=device,
-        save_debug_steps=True,
+        save_debug_steps=DEBUG,
         run_phase=1,
         reused_model=None,
         reused_device=None,
@@ -164,7 +164,7 @@ def run_cubicasa_phase2(
         output_dir=str(output_dir),
         gemini_api_key=gemini_api_key,
         device=device,
-        save_debug_steps=True,
+        save_debug_steps=DEBUG,
         run_phase=2,
         raster_timings=raster_timings,
         progress_callback=progress_callback,
@@ -195,7 +195,7 @@ def run_cubicasa_phase2_brute_only(
         output_dir=str(output_dir),
         gemini_api_key=gemini_api_key,
         device=device,
-        save_debug_steps=True,
+        save_debug_steps=DEBUG,
         run_phase=3,  # doar brute force + overlay
         raster_timings=raster_timings,
         brute_force_no_cache=no_cache,

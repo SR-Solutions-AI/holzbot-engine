@@ -14,6 +14,8 @@ import json
 import shutil
 import argparse
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import build_job_root, RUNS_ROOT, RUNNER_ROOT, load_plan_infos, PlanInfo, get_run_dir
 from config.frontend_loader import load_frontend_data_for_run
@@ -26,7 +28,7 @@ from segmenter.jobs import run_segmentation_for_documents, get_all_classificatio
 
 from floor_classifier import run_floor_classification, FloorClassificationResult
 from detections.jobs import run_detections_for_run
-from cubicasa_detector.jobs import run_cubicasa_for_plan, run_cubicasa_phase1, run_cubicasa_phase2
+from cubicasa_detector.jobs import run_cubicasa_phase1, run_cubicasa_phase2
 from scale import run_scale_detection_for_run
 from count_objects import run_count_objects_for_run
 from roof.jobs import run_roof_for_run
@@ -57,6 +59,50 @@ def notify_progress(percent: int):
     msg = f">>> UI:PROGRESS:{percent}"
     print(msg, flush=True)
     sys.stdout.flush()
+
+
+# Progress monoton: un singur contor 0–100, creștere uniformă pe parcursul rulării.
+# Greutăți aproximativ proporționale cu timpul (RasterScan ~50%, Count+Roof ~22%, etc.).
+_PROGRESS_WEIGHTS = {
+    "seg_end": 3,
+    "floor_end": 6,
+    "detections_end": 8,
+    "raster_start": 8,
+    "raster_end": 58,   # 50% pentru RasterScan (8→58)
+    "scale_end": 60,
+    "count_roof_end": 82,
+    "pricing_end": 85,
+    "offer_end": 88,
+    "pdf_end": 100,
+}
+
+
+def _make_progress_sender():
+    """Returnează (set_progress, get_raster_progress_fn).
+    set_progress(pct) trimite doar dacă pct > ultimul trimis (monoton).
+    get_raster_progress_fn(num_plans) returnează on_raster_tick() pentru RasterScan.
+    """
+    max_sent = [0]
+
+    def set_progress(pct: int):
+        pct = max(0, min(100, pct))
+        if pct > max_sent[0]:
+            max_sent[0] = pct
+            notify_progress(pct)
+
+    def get_raster_progress_fn(num_plans: int):
+        total_ticks = 14 * num_plans  # 4 P1 + 2 P2 start+brute + 7 walls_from_coords + 1 P2 end
+        raster_done = [0]
+
+        def on_raster_tick():
+            raster_done[0] += 1
+            pct = _PROGRESS_WEIGHTS["raster_start"] + (
+                _PROGRESS_WEIGHTS["raster_end"] - _PROGRESS_WEIGHTS["raster_start"]
+            ) * min(raster_done[0], total_ticks) / total_ticks
+            set_progress(round(pct))
+        return on_raster_tick
+
+    return set_progress, get_raster_progress_fn
 
 
 def _notify_all_cubicasa_images_for_plan(plan: PlanInfo) -> None:
@@ -213,7 +259,8 @@ def run_segmentation_and_classification_for_document(
         print(f"✅ Using existing frontend_data.json from job root (written by API)")
 
     notify_ui("segmentation_start")
-    notify_progress(2)
+    set_progress, get_raster_progress_fn = _make_progress_sender()
+    set_progress(_PROGRESS_WEIGHTS["seg_end"])
     
     # Preview pentru UI (Input files)
     preview_dir = job_root / "_previews"
@@ -246,7 +293,11 @@ def run_segmentation_and_classification_for_document(
     with Timer("STEP 1-3: Multi-file Segmentation & Classification") as t:
         def _seg_progress(done: int, total: int):
             if total and total > 0:
-                notify_progress(round(2 + 3 * (done / total)))
+                # Interpolare între seg_end și floor_end pentru smoothness
+                pct = _PROGRESS_WEIGHTS["seg_end"] + (
+                    _PROGRESS_WEIGHTS["floor_end"] - _PROGRESS_WEIGHTS["seg_end"]
+                ) * (done / total) * 0.9  # 90% din segmentare, 10% la final
+                set_progress(round(pct))
         seg_results = run_segmentation_for_documents(
             input_path=input_path,
             output_base_dir=segmentation_out_base,
@@ -258,7 +309,7 @@ def run_segmentation_and_classification_for_document(
         # ✅ 1. UI: SOLID WALLS FIRST (Robust Check)
         # -------------------------------------------------------------
         print("📢 [UI] Sending Solid Walls previews (Priority 1)...")
-        notify_progress(3)  # segmentare rulată
+        set_progress(_PROGRESS_WEIGHTS["seg_end"] + 1)
         for i, seg_result in enumerate(seg_results):
             # Calea standard generată de segmenter
             standard_solid_img = seg_result.work_dir / "solid_walls" / "solidified.jpg"
@@ -279,7 +330,7 @@ def run_segmentation_and_classification_for_document(
             if not sent:
                 print(f"⚠️ [UI] Nu am găsit solid walls pentru doc {i}: {seg_result.doc_id}", flush=True)
         
-        notify_progress(4)  # solid walls trimise
+        set_progress(_PROGRESS_WEIGHTS["floor_end"] - 1)
         # -------------------------------------------------------------
         # ✅ 2. UI: CLASSIFICATION -> DOAR BLUEPRINTS
         # -------------------------------------------------------------
@@ -292,7 +343,7 @@ def run_segmentation_and_classification_for_document(
                 for img in bp_dir.glob("*.*"):
                     notify_ui("classification", img)
 
-    notify_progress(5)  # segmentare + clasificare (înainte de a ști numărul de etaje)
+    set_progress(_PROGRESS_WEIGHTS["floor_end"])
     pipeline_timer.add_step("Multi-Segmentation", t.end_time - t.start_time)
 
     # Colectăm rezultatele
@@ -313,13 +364,9 @@ def run_segmentation_and_classification_for_document(
     if len(house_plans) < len(plans):
         print(f"⚠️  {len(plans) - len(house_plans)} plans EXCLUDED (not house_blueprint)\n")
 
-    # Progress dinamic: 3 seg, 4 floor, 5 detections, 6 + 8*etaje (raster) + 13 (scale→pdf)
+    # Progress: greutăți fixe (seg_end, floor_end, detections_end, raster 8→58, scale→pdf)
     num_plans = len(house_plans)
-    CUBICASA_SUB_STEPS_PER_PLAN = 8  # start, preprocess, raster_api_done, phase1_end, phase2_start, brute_done, walls_done, phase2_end
-    total_progress_steps = 19 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans
-    def _progress(done: int) -> int:
-        return round((done / total_progress_steps) * 100)
-    notify_progress(_progress(3))  # seg_start, segmentation, classification
+    set_progress(_PROGRESS_WEIGHTS["detections_end"] - 1)  # după clasificare, înainte de floor/detections
 
     # ---------- Verificare număr etaje vs formular (chiar după ce știm ce e blueprint) ----------
     frontend_data = load_frontend_data_for_run(job_root.name, job_root)
@@ -373,7 +420,7 @@ def run_segmentation_and_classification_for_document(
     with Timer("STEP 4: Floor Classification") as t:
         floor_results = run_floor_classification(job_root, plans)
         notify_ui("floor_classification")
-    notify_progress(_progress(4))
+    set_progress(_PROGRESS_WEIGHTS["floor_end"])
     pipeline_timer.add_step("Floor Classification", t.end_time - t.start_time)
 
     if house_plans:
@@ -413,7 +460,7 @@ def run_segmentation_and_classification_for_document(
             run_detections_for_run(run_id)
             # Notificarea UI pentru detections este trimisă direct din raster_processing.py
             # după generarea 01_openings.png (în timpul scale detection - STEP 6)
-        notify_progress(_progress(5))
+        set_progress(_PROGRESS_WEIGHTS["detections_end"])
         pipeline_timer.add_step("Detections", t.end_time - t.start_time)
         
         # ✅ STEP 5.5: RasterScan Processing (generează room_scales.json)
@@ -428,16 +475,16 @@ def run_segmentation_and_classification_for_document(
             # Încărcăm planurile pentru acest run
             plans = load_plan_infos(run_id, "scale")  # Folosim "scale" pentru că output_dir va fi în scale/
             raster_scan_failed = False
-            notify_progress(_progress(6))  # început RasterScan
-            # Un singur contor în ordinea executării: la fiecare callback incrementăm și raportăm (progres mereu crescător)
-            raster_done = [6]  # 6 = început RasterScan; apoi +1 la fiecare sub-pas (phase1 plan0, phase1 plan1, phase2 plan0, phase2 plan1)
-            def _raster_step():
-                raster_done[0] += 1
-                notify_progress(_progress(raster_done[0]))
-            # Phase 1 secvențial (NU în paralel) ca să nu trimitem toate planurile la Raster API în același timp
+            on_raster_tick = get_raster_progress_fn(num_plans)
+            set_progress(_PROGRESS_WEIGHTS["raster_start"])
+            # Număr workers: env override sau min(3, nr_planuri)
+            _raster_workers = os.environ.get("HOLZBOT_RASTER_WORKERS", "")
+            max_workers = int(_raster_workers) if _raster_workers.isdigit() else min(3, len(plans)) if plans else 1
+            # Phase 1 în paralel
             def do_phase1(plan, plan_index: int):
                 def on_progress(sub_step: int):
-                    _raster_step()  # la fiecare sub_step (0,1,2,3) un pas completat
+                    on_raster_tick()
+                _t0 = time.time()
                 print(f"[RasterScan] Phase 1 {plan.plan_id} → Raster API + 02_ai_walls_closed", flush=True)
                 run_cubicasa_phase1(
                     plan_image=plan.plan_image,
@@ -445,35 +492,46 @@ def run_segmentation_and_classification_for_document(
                     raster_timings=raster_timings,
                     progress_callback=on_progress,
                 )
-                print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK", flush=True)
-            for i, plan in enumerate(plans):
-                try:
-                    do_phase1(plan, i)
-                except Exception as e:
-                    print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    raster_scan_failed = True
+                dur = time.time() - _t0
+                raster_timings.append((f"Raster P1 plan {plan.plan_id}", dur))
+                print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK ({dur:.1f}s)", flush=True)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures_phase1 = {executor.submit(do_phase1, plan, i): plan for i, plan in enumerate(plans)}
+                for future in as_completed(futures_phase1):
+                    plan = futures_phase1[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        raster_scan_failed = True
             if not raster_scan_failed:
-                # Phase 2 secvențial (un plan după altul): brute force + room_scales.json, ca să nu se blocheze
+                # Phase 2 în paralel (același max_workers, fără reuse)
                 def do_phase2(plan, plan_index: int):
                     def on_progress(sub_step: int):
-                        _raster_step()  # la fiecare sub_step (0,1,2,3) un pas completat
+                        on_raster_tick()
+                    _t0 = time.time()
                     print(f"[RasterScan] Phase 2 {plan.plan_id} → brute force + room_scales.json", flush=True)
                     run_cubicasa_phase2(
                         output_dir=plan.stage_work_dir,
                         raster_timings=raster_timings,
                         progress_callback=on_progress,
                     )
-                    print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes", flush=True)
-                for i, plan in enumerate(plans):
-                    try:
-                        do_phase2(plan, i)
-                    except Exception as e:
-                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-                        raster_scan_failed = True
+                    dur = time.time() - _t0
+                    raster_timings.append((f"Raster P2 plan {plan.plan_id}", dur))
+                    print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes ({dur:.1f}s)", flush=True)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures_phase2 = {executor.submit(do_phase2, plan, i): plan for i, plan in enumerate(plans)}
+                    for future in as_completed(futures_phase2):
+                        plan = futures_phase2[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
+                            import traceback
+                            traceback.print_exc()
+                            raster_scan_failed = True
                 # Trimite toate imaginile Cubicasa (pereți, camere, fill, openings, etc.) la admin Details
                 if not raster_scan_failed:
                     for plan in plans:
@@ -488,12 +546,17 @@ def run_segmentation_and_classification_for_document(
             print(f"[RasterScan] RasterScan Processing Complete")
             print(f"{'='*60}\n")
         pipeline_timer.add_step("RasterScan Processing", t.end_time - t.start_time)
-        # Pași detaliați Raster (agregare pe toate planurile)
+        # Pași detaliați Raster (agregare pe toate planurile + timpi per plan)
         if raster_timings:
             by_name = defaultdict(float)
             for name, dur in raster_timings:
                 by_name[name] += dur
-            for name, dur in sorted(by_name.items(), key=lambda x: -x[1]):
+            # Sortează: mai întâi pașii agregați (fără "plan"), apoi per-plan (pentru diagnostic)
+            steps_agg = [(n, d) for n, d in sorted(by_name.items(), key=lambda x: -x[1]) if " plan " not in n]
+            steps_plan = [(n, d) for n, d in sorted(by_name.items(), key=lambda x: -x[1]) if " plan " in n]
+            for name, dur in steps_agg:
+                pipeline_timer.add_step(f"  └ {name}", dur)
+            for name, dur in steps_plan:
                 pipeline_timer.add_step(f"  └ {name}", dur)
         
         if not raster_ok:
@@ -502,35 +565,43 @@ def run_segmentation_and_classification_for_document(
             print(f"   Asigură-te că RasterScan finalizează (room_scales.json + rooms.png) pentru fiecare etaj în ordine, apoi rulează din nou.\n", flush=True)
         
         if raster_ok:
-            notify_progress(_progress(6 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
+            set_progress(_PROGRESS_WEIGHTS["raster_end"])
             with Timer("STEP 6: Scale") as t:
                 run_scale_detection_for_run(run_id)
-            notify_progress(_progress(7 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
+            set_progress(_PROGRESS_WEIGHTS["scale_end"])
             pipeline_timer.add_step("Scale", t.end_time - t.start_time)
 
-            notify_progress(_progress(8 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
-            with Timer("STEP 7: Count Objects") as t:
+            # STEP 7 (Count Objects) și STEP 13 (Roof) rulează în PARALEL
+            set_progress(_PROGRESS_WEIGHTS["scale_end"] + 1)
+            def _run_count_objects_timed():
+                _start = time.time()
                 run_count_objects_for_run(run_id)
-            notify_progress(_progress(9 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
-            pipeline_timer.add_step("Count Objects", t.end_time - t.start_time)
-
-            notify_progress(_progress(10 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
-            with Timer("STEP 13: Roof") as t:
+                return time.time() - _start
+            def _run_roof_timed():
+                _start = time.time()
                 run_roof_for_run(run_id)
                 notify_ui("roof")
-            notify_progress(_progress(11 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
-            pipeline_timer.add_step("Roof", t.end_time - t.start_time)
+                return time.time() - _start
+            with Timer("STEP 7 + 13: Count Objects || Roof (parallel)") as t_par:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    fut_co = executor.submit(_run_count_objects_timed)
+                    fut_roof = executor.submit(_run_roof_timed)
+                    t_count_objects = fut_co.result()
+                    t_roof = fut_roof.result()
+            pipeline_timer.add_step("Count Objects", t_count_objects)
+            pipeline_timer.add_step("Roof", t_roof)
+            set_progress(_PROGRESS_WEIGHTS["count_roof_end"])
 
             frontend_data = load_frontend_data_for_run(run_id, job_root)
 
-            notify_progress(_progress(12 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
+            set_progress(_PROGRESS_WEIGHTS["pricing_end"] - 2)
             with Timer("STEP 14-15: Pricing") as t:
                 pricing_results = run_pricing_for_run(run_id, frontend_data_override=frontend_data)
                 notify_ui("pricing")
-            notify_progress(_progress(13 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
+            set_progress(_PROGRESS_WEIGHTS["pricing_end"])
             pipeline_timer.add_step("Pricing", t.end_time - t.start_time)
 
-            notify_progress(_progress(14 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))
+            set_progress(_PROGRESS_WEIGHTS["offer_end"] - 2)
             with Timer("STEP 16-17: Offer Generation") as t:
                 nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta")
                 if not nivel_oferta:
@@ -555,7 +626,7 @@ def run_segmentation_and_classification_for_document(
                         except Exception as e:
                             print(f"⚠️ Error building offer for {res.plan_id}: {e}")
                 notify_ui("offer_generation")
-            notify_progress(_progress(15 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))  # sfârșit Offer
+            set_progress(_PROGRESS_WEIGHTS["offer_end"])
             pipeline_timer.add_step("Offer Generation", t.end_time - t.start_time)
 
             with Timer("STEP 18-19: PDF GENERATION") as t:
@@ -568,15 +639,15 @@ def run_segmentation_and_classification_for_document(
                         generate_roof_pricing(run_id=run_id, frontend_data=frontend_data)
                     except Exception as rp_err:
                         print(f"⚠️ Roof pricing Error: {rp_err}")
-                    notify_progress(_progress(16 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))  # început PDF
+                    set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 12)  # început PDF
                     pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
                     print(f"✅ [PDF] User PDF generated: {pdf_path}")
                     notify_ui("pdf_generation", pdf_path)
-                    notify_progress(_progress(17 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))  # după PDF utilizator
+                    set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 8)
                     admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
                     print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
                     notify_ui("pdf_generation", admin_pdf_path)
-                    notify_progress(_progress(18 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))  # după PDF admin
+                    set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 4)
                     try:
                         calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None, job_root=job_root)
                         print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
@@ -585,7 +656,7 @@ def run_segmentation_and_classification_for_document(
                         print(f"⚠️ Calculation Method PDF Error: {calc_err}")
                         import traceback
                         traceback.print_exc()
-                    notify_progress(_progress(19 + CUBICASA_SUB_STEPS_PER_PLAN * num_plans))  # după PDF calc method
+                    set_progress(_PROGRESS_WEIGHTS["pdf_end"])
                     roof_pdf_path = generate_roof_measurements_pdf(run_id=run_id, output_path=None)
                     if roof_pdf_path:
                         notify_ui("pdf_generation", roof_pdf_path)
@@ -597,7 +668,7 @@ def run_segmentation_and_classification_for_document(
             pipeline_timer.add_step("PDF", t.end_time - t.start_time)
 
             time.sleep(2.0)
-            notify_progress(100)
+            set_progress(100)
             notify_ui("computation_complete", pdf_path if pdf_path and Path(pdf_path).exists() else None)
 
         pipeline_timer.finish()

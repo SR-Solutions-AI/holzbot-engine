@@ -53,6 +53,12 @@ GARAGE_SCAN_REGIONS = [
     (0.20, 0.55, 0.60, 0.90, 4, "6"),   # Zona garaj (dreapta/jos), zoom 4x, PSM 6
 ]
 
+# Regiuni reduse pentru un singur OCR combinat (fallback rapid: 1 pas în loc de 5)
+FAST_OCR_REGIONS = [
+    (0.00, 0.00, 1.00, 1.00, 2, "11"),   # Întreaga imagine, zoom 2x
+    (0.15, 0.05, 0.75, 0.95, 3, "11"),   # Zona clădirii, zoom 3x
+]
+
 
 def _deduplicate_detections(
     detections: list, min_dist_px: int = 100
@@ -176,6 +182,85 @@ def run_ocr_scan_regions(
             all_hits.append((bx, by, bw, bh, word, float(conf)))
 
     return _deduplicate_detections(all_hits, min_dist_px=100)
+
+
+# Termeni per zonă pentru OCR combinat (un singur pas când Gemini lipsește)
+ZONE_OCR_TERMS = {
+    "garage": [
+        "garage", "garaj", "carport", "parking", "stellplatz",
+        "garaz", "garáž", "garaž", "garaż", "autohaus", "gara", "überdacht",
+    ],
+    "intrare_acoperita": [
+        "intrare", "eingang", "zugang", "acoperit", "überdacht", "vorraum",
+        "eingangsbereich", "hall", "entrance",
+    ],
+    "terasa": [
+        "terasa", "terasă", "terrace", "terrasse", "tarrace", "patio", "garden",
+    ],
+    "balcon": [
+        "balcon", "balcony", "balkon", "balkón", "loggia",
+    ],
+    "wintergarden": [
+        "wintergarten", "wintergarden", "winter garden", "glasanbau",
+    ],
+}
+
+
+def _text_matches_zone(text: str, terms: list) -> bool:
+    """True dacă text se potrivește cu vreun termen din listă (lower + normalizat)."""
+    if not text or not terms:
+        return False
+    word_lower = text.lower()
+    word_norm = _normalize_for_match(text)
+    for term in terms:
+        term_lower = term.lower()
+        term_norm = _normalize_for_match(term)
+        if term_lower in word_lower or term_norm in word_norm:
+            return True
+    return False
+
+
+def run_ocr_all_zones_fallback(
+    image: np.ndarray,
+    lang: str = "deu+eng",
+    min_conf: int = 25,
+) -> dict:
+    """
+    Un singur pas OCR cu toți termenii (garaj, terasă, balcon, intrare, wintergarden).
+    Folosit când Gemini nu e disponibil – evită 5 OCR-uri separate (mult mai rapid).
+
+    Returns:
+        Dict zone_name -> list of (cx, cy) centre, ordonate după confidență.
+    """
+    if not TESSERACT_AVAILABLE:
+        return {z: [] for z in ZONE_OCR_TERMS}
+
+    all_terms = list(set(t for terms in ZONE_OCR_TERMS.values() for t in terms))
+    boxes = run_ocr_scan_regions(
+        image, all_terms,
+        scan_regions=FAST_OCR_REGIONS,
+        lang=lang,
+        min_conf=min_conf,
+    )
+    # Asignare fiecare box la prima zonă al cărei termen se potrivește
+    results = {z: [] for z in ZONE_OCR_TERMS}
+    for (x, y, w, h, text, conf) in boxes:
+        cx, cy = x + w // 2, y + h // 2
+        for zone_name, terms in ZONE_OCR_TERMS.items():
+            if _text_matches_zone(text, terms):
+                results[zone_name].append((cx, cy, conf))
+                break
+    # Sort by conf desc, deduplicate by distance per zone
+    out = {}
+    for z, list_with_conf in results.items():
+        list_with_conf.sort(key=lambda t: t[2], reverse=True)
+        seen = []
+        for cx, cy, conf in list_with_conf:
+            if any(abs(cx - sx) < 80 and abs(cy - sy) < 80 for (sx, sy) in seen):
+                continue
+            seen.append((cx, cy))
+        out[z] = seen
+    return out
 
 
 def preprocess_image_for_ocr(image: np.ndarray) -> np.ndarray:

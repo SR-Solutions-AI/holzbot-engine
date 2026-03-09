@@ -52,6 +52,23 @@ Returnează JSON:
 Dacă nu găsești o suprafață asociată unei cameri concrete (doar total NNF/Nutzfläche etc.), returnează null pentru area_m2.
 """
 
+# Prompt pentru batch de camere (N imagini → un singur răspuns JSON cu array)
+GEMINI_PROMPT_ROOMS_BATCH = """
+You receive {n} images of floor plan room crops (in order: Image 1, Image 2, ... Image {n}).
+For EACH image in the same order, extract:
+1. room_name – name of the room(s) in that crop (e.g. "Living Room", "Kitchen", "Terrasse"). Use "Multiple rooms" if several.
+2. area_m2 – ONLY if there is an explicit m² value FOR A CONCRETE ROOM in that crop (same rules as single-room: ignore NNF/Nutzfläche totals).
+
+RULES (same as single room):
+- Extract area_m2 ONLY when it is clearly labeled for a specific room (e.g. "Küche 15 m²"). Ignore totals for the whole level.
+- If the crop shows only NNF/total/Net floor area, use null for area_m2.
+- Black areas are not part of the room.
+
+Return ONLY this JSON (no markdown):
+{{"rooms": [{{"room_name": "...", "area_m2": 12.5}}, {{"room_name": "...", "area_m2": null}}, ...]}}
+with exactly {n} objects in the "rooms" array, one per image in order.
+"""
+
 
 def is_informational_total_result(result: dict) -> bool:
     """
@@ -527,7 +544,163 @@ def call_gemini(image_path, prompt, api_key, max_retries=2, repair_callback: Cal
         return None
 
 
-# Prompt pentru alinierea a două măști de pereți (referință + template)
+def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 2):
+    """
+    Trimite toate crop-urile de camere într-un singur apel Gemini.
+    Returnează list[dict] în aceeași ordine (fiecare dict: room_name, area_m2) sau None la eșec.
+    """
+    if not image_paths or not api_key:
+        return None
+    image_paths = [Path(p) for p in image_paths]
+    n = len(image_paths)
+    parts = []
+    for p in image_paths:
+        with open(p, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('utf-8')
+        ext = p.suffix.lower()
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
+        mime_type = mime_map.get(ext, 'image/png')
+        parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
+    prompt = GEMINI_PROMPT_ROOMS_BATCH.format(n=n)
+    parts.append({"text": prompt + "\n\nIMPORTANT: Răspunde DOAR cu un obiect JSON valid (rooms array cu exact " + str(n) + " elemente)."})
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    gen_config = {"temperature": 0.0, "maxOutputTokens": 2048, "responseMimeType": "application/json"}
+    payload = {"contents": [{"parts": parts}], "generationConfig": gen_config}
+    headers = {"Content-Type": "application/json"}
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=90)
+            if response.status_code != 200:
+                return None
+            result = response.json()
+            if 'candidates' not in result or not result['candidates']:
+                return None
+            text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
+            if not text:
+                return None
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].lstrip().startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                text = text[start:end]
+            data = json.loads(text)
+            rooms = data.get("rooms")
+            if not isinstance(rooms, list) or len(rooms) != n:
+                if attempt < max_retries:
+                    continue
+                return None
+            out = []
+            for r in rooms:
+                if not isinstance(r, dict):
+                    out.append({"room_name": "", "area_m2": None})
+                else:
+                    out.append({
+                        "room_name": r.get("room_name") or "",
+                        "area_m2": r.get("area_m2")
+                    })
+            return out
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            if attempt < max_retries:
+                continue
+            print(f"⚠️  Gemini rooms batch error: {e}")
+            return None
+        except Exception as e:
+            print(f"⚠️  Gemini rooms batch error: {e}")
+            return None
+    return None
+
+# Batch clasificare uși/ferestre (N imagini → un JSON cu array de tipuri)
+GEMINI_PROMPT_DOORS_BATCH = """You receive {n} images of floor plan openings (doors, windows, garage doors, stairs). For each image in the same order (Image 1, 2, ... {n}), classify as exactly one type.
+
+CRITICAL DISTINCTIONS:
+- "window" - Glass panes (parallel lines/grid), typically narrower, often near exterior walls.
+- "door" - Passage opening, single or double, may show door swing arc. Interior or exterior.
+- "garage_door" - Very wide opening (2-3x doors), ground level, multiple panels/tracks.
+- "stairs" - Step pattern (parallel lines up/down), rectangular or L-shaped.
+
+Return ONLY this JSON (no markdown): {{"types": ["door", "window", "garage_door", "stairs", ...]}}
+with exactly {n} strings in the "types" array, one per image in order.
+"""
+
+
+def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 2) -> list[str] | None:
+    """
+    Trimite toate crop-urile de deschideri (doors) într-un singur apel Gemini.
+    Returnează list[str] de tipuri ('door', 'window', 'garage_door', 'stairs') în aceeași ordine, sau None.
+    """
+    if not image_paths or not api_key:
+        return None
+    image_paths = [Path(p) for p in image_paths]
+    n = len(image_paths)
+    parts = []
+    for p in image_paths:
+        with open(p, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('utf-8')
+        ext = p.suffix.lower()
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
+        mime_type = mime_map.get(ext, 'image/png')
+        parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
+    prompt = GEMINI_PROMPT_DOORS_BATCH.format(n=n)
+    parts.append({"text": prompt + "\n\nIMPORTANT: Reply only with JSON object with key 'types' and an array of exactly " + str(n) + " strings."})
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    gen_config = {"temperature": 0.0, "maxOutputTokens": 1024, "responseMimeType": "application/json"}
+    payload = {"contents": [{"parts": parts}], "generationConfig": gen_config}
+    headers = {"Content-Type": "application/json"}
+    valid_types = {'door', 'window', 'garage_door', 'stairs'}
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            if response.status_code != 200:
+                return None
+            result = response.json()
+            if 'candidates' not in result or not result['candidates']:
+                return None
+            text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
+            if not text:
+                return None
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].lstrip().startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                text = text[start:end]
+            data = json.loads(text)
+            types_raw = data.get("types")
+            if not isinstance(types_raw, list) or len(types_raw) != n:
+                if attempt < max_retries:
+                    continue
+                return None
+            out = []
+            for t in types_raw:
+                s = (t if isinstance(t, str) else str(t)).lower().strip()
+                out.append(s if s in valid_types else 'door')
+            return out
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            if attempt < max_retries:
+                continue
+            print(f"⚠️  Gemini doors batch error: {e}")
+            return None
+        except Exception as e:
+            print(f"⚠️  Gemini doors batch error: {e}")
+            return None
+    return None
+
+
 GEMINI_PROMPT_WALL_ALIGNMENT = """
 You are given TWO images of floor plan wall masks (binary or grayscale: white/light = walls, black = background).
 

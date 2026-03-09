@@ -975,19 +975,13 @@ def remove_walls_adjacent_to_region(
 ) -> int:
     """
     Setează la 0 toți pixelii de perete (wall_mask > 0) care au cel puțin un vecin 4-conectat
-    în regiunea umplută (visited > 0). Returnează numărul de pixeli eliminați.
+    în regiunea umplută (visited > 0). Vectorizat cu cv2.dilate.
     """
     h, w = wall_mask.shape
-    to_remove = np.zeros((h, w), dtype=np.uint8)
-    for y in range(h):
-        for x in range(w):
-            if wall_mask[y, x] == 0:
-                continue
-            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h and visited[ny, nx] > 0:
-                    to_remove[y, x] = 255
-                    break
-    n_removed = int(np.sum(to_remove > 0))
-    wall_mask[to_remove > 0] = 0
+    visited_uint8 = (visited > 0).astype(np.uint8)
+    kernel_4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    dilated = cv2.dilate(visited_uint8, kernel_4)
+    to_remove = (wall_mask > 0) & (dilated > 0)
+    n_removed = int(np.sum(to_remove))
+    wall_mask[to_remove] = 0
     return n_removed
