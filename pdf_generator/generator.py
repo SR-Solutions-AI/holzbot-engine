@@ -852,7 +852,8 @@ def _draw_firstpage_right_box(canv: Canvas, offer_no: str, handler: str):
     box_y = A4[1]-62*mm
     cw = 65*mm
     row_h = 8.2*mm
-    rows = [("Datum", datetime.now().strftime("%d.%m.%Y")), ("Bearbeiter", handler), ("Kunden-Nr.", "—"), ("Auftrag", offer_no)]
+    # Bearbeiter = person who generated the offer; Kunden-Nr. (Fibu-Info) removed per requirement
+    rows = [("Datum", datetime.now().strftime("%d.%m.%Y")), ("Bearbeiter", handler), ("Auftrag", offer_no)]
     canv.setFont(BASE_FONT, 9)
     canv.setStrokeColor(colors.black)
     canv.rect(box_x, box_y - row_h*len(rows), cw, row_h*len(rows), stroke=1, fill=0)
