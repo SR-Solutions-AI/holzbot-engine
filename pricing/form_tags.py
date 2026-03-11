@@ -29,6 +29,8 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
     ("ferestreUsi", "bodentiefeFenster"): "floor_level_windows",
     ("ferestreUsi", "windowQuality"): "window_quality",
     ("ferestreUsi", "turhohe"): "door_height",
+    ("ferestreUsi", "doorMaterialInterior"): "door_material_interior",
+    ("ferestreUsi", "doorMaterialExterior"): "door_material_exterior",
     ("performantaEnergetica", "nivelEnergetic"): "energy_level",
     ("performantaEnergetica", "tipIncalzire"): "heating_type",
     ("performantaEnergetica", "ventilatie"): "ventilation",

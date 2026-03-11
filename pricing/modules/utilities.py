@@ -183,15 +183,14 @@ def calculate_fireplace_details(
             "total_cost": round(fireplace_cost, 2)
         })
 
-        horn_base_cost = 4500.0
-        horn_cost_per_floor = 1500.0
-        horn_total_cost = horn_base_cost + (horn_cost_per_floor * total_floors)
+        horn_cost_per_floor = float((fireplace_coeffs or {}).get("horn_per_floor", 1500.0))
+        horn_total_cost = horn_cost_per_floor * total_floors
         total_cost += horn_total_cost
 
         items.append({
             "category": "chimney",
-            "name": f"Schornstein (4500€ Standardpreis + 1500€ pro Geschoss für {total_floors} Geschosse)",
-            "unit_price": horn_base_cost + (horn_cost_per_floor * total_floors),
+            "name": f"Schornstein ({horn_cost_per_floor:.0f}€ pro Geschoss für {total_floors} Geschosse)",
+            "unit_price": horn_cost_per_floor * total_floors,
             "quantity": 1,
             "total_cost": round(horn_total_cost, 2)
         })

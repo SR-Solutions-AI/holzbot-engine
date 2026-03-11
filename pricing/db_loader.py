@@ -128,9 +128,21 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             }
         },
         "openings": {
-            # Uși: un preț per m² pentru interior, unul pentru exterior (folosit doar pentru calcul arie × preț)
+            # Uși: preț per m² per material (interior / exterior); fallback la un singur preț dacă opțiunea lipsește
             "door_interior_price_per_m2": data_map.get("door_interior_price", data_map.get("door_standard_2m_price", 0)),
             "door_exterior_price_per_m2": data_map.get("door_exterior_price", data_map.get("door_standard_2m_price", 0)),
+            "door_interior_prices": {
+                "Standard": data_map.get("door_interior_standard", data_map.get("door_interior_price", 380)),
+                "Holz": data_map.get("door_interior_holz", 420),
+                "Glas": data_map.get("door_interior_glas", 520),
+                "Weiß lackiert": data_map.get("door_interior_weiss_lackiert", 400),
+            },
+            "door_exterior_prices": {
+                "Standard": data_map.get("door_exterior_standard", data_map.get("door_exterior_price", 480)),
+                "Holz": data_map.get("door_exterior_holz", 550),
+                "Aluminium": data_map.get("door_exterior_aluminium", 620),
+                "Kunststoff": data_map.get("door_exterior_kunststoff", 420),
+            },
             # Ferestre: doar 2 straturi sau 3 straturi (alegere din formular Fensterart)
             "windows_price_per_m2": {
                 "2-fach verglast": data_map.get("window_2_fach_price", data_map.get("window_3fach_verglast_price", 320)),
@@ -185,7 +197,8 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Pelletofen (automatisch)": data_map.get("tip_semineu_pelletofen_price", 8500),
                 "Einbaukamin": data_map.get("tip_semineu_einbaukamin_price", 7200),
                 "Kachel-/wassergeführter Kamin": data_map.get("tip_semineu_kachel_price", 9500),
-            }
+            },
+            "horn_per_floor": data_map.get("horn_price_per_floor", 1500.0),
         },
         "wandaufbau": {
             "aussen": {

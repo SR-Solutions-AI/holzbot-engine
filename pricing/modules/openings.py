@@ -27,9 +27,18 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         elif turhohe == "Standard (2m)":
             door_height_m = 2.0
 
-    # Prețuri: uși interior/exterior (€/m²), ferestre după Fensterart (2-fach / 3-fach)
+    # Prețuri: uși interior/exterior (€/m²) – per material dacă e selectat, altfel fallback la un singur preț
+    door_int_prices = coeffs.get("door_interior_prices", {})
+    door_ext_prices = coeffs.get("door_exterior_prices", {})
     door_int_price = float(coeffs.get("door_interior_price_per_m2", 0))
     door_ext_price = float(coeffs.get("door_exterior_price_per_m2", 0))
+    door_material_int = (ferestre_usi.get("doorMaterialInterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
+    door_material_ext = (ferestre_usi.get("doorMaterialExterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
+    if door_int_prices and door_material_int in door_int_prices:
+        door_int_price = float(door_int_prices[door_material_int])
+    if door_ext_prices and door_material_ext in door_ext_prices:
+        door_ext_price = float(door_ext_prices[door_material_ext])
+
     windows_prices = coeffs.get("windows_price_per_m2", {})
     window_quality = (ferestre_usi.get("windowQuality", "3-fach verglast") if frontend_data else "3-fach verglast")
     window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
@@ -53,6 +62,8 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         total += cost
 
         material_label = "Interior" if not is_exterior and "door" in obj_type else ("Exterior" if "door" in obj_type else window_quality)
+        if "door" in obj_type:
+            material_label = door_material_int if not is_exterior else door_material_ext
         items.append({
             "id": op.get("id"),
             "name": f"{obj_type.replace('_', ' ').title()} #{op.get('id')}",
