@@ -1266,9 +1266,10 @@ def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None, 
         if identity_path and identity_path.exists():
             canv.drawImage(str(identity_path), A4[0]-18*mm-85*mm, A4[1]-53*mm, 85*mm, 22*mm, preserveAspectRatio=True, mask='auto')
 
-        # Eder/ederholzbau: la fel ca Holzbau – fără logo-uri suplimentare
+        # Eder/ederholzbau/betonbau: la fel ca Holzbau – fără logo-uri suplimentare
         is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
-        if not is_eder and show_logos:
+        is_betonbau = tenant_slug and tenant_slug.lower() == "betonbau"
+        if not is_eder and not is_betonbau and show_logos:
             logos_path = _asset_path(logos_file) if logos_file else IMG_LOGOS
             if logos_path and logos_path.exists():
                 canv.drawImage(str(logos_path), 18*mm, A4[1]-55*mm, 80*mm, 26*mm, preserveAspectRatio=True, mask='auto', anchor='sw')
@@ -1305,11 +1306,11 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
         else:
             has_logos = IMG_LOGOS.exists()
     
-    # Pentru holzbau@holzbot.com, mutăm textul mai sus (nu au iconițe)
-    # Dacă nu există iconițe SAU dacă este tenant holzbau, mutăm textul mai sus
+    # Pentru holzbau / betonbau, mutăm textul mai sus (fără iconițe – structură ca Holzbau)
     is_holzbau = tenant_slug and tenant_slug.lower() == "holzbau"
     is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
-    if not has_identity and not has_logos or is_holzbau or is_eder:
+    is_betonbau = tenant_slug and tenant_slug.lower() == "betonbau"
+    if not has_identity and not has_logos or is_holzbau or is_eder or is_betonbau:
         story.append(Spacer(1, 5*mm))  # Mutat și mai sus pentru holzbau
     else:
         story.append(Spacer(1, 36*mm))
@@ -2503,6 +2504,8 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     if isinstance(company_overrides, dict) and company_overrides.get("handler_name"):
         handler = str(company_overrides.get("handler_name", "")).strip() or handler
     offer_title = branding.get("offer_title") if isinstance(branding, dict) else None
+    if tenant_slug and str(tenant_slug).lower() == "betonbau":
+        offer_title = "Angebot für Ihr Massivhaus"
 
     # Apply company overrides (header/footer content)
     if isinstance(company_overrides, dict) and company_overrides:
