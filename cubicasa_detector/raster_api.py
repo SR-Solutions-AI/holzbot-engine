@@ -872,8 +872,8 @@ def apply_detections_edited(raster_dir: Path) -> bool:
     """
     edited_path = raster_dir / "detections_edited.json"
     if not edited_path.exists():
-            return False
-        response_path = raster_dir / "response.json"
+        return False
+    response_path = raster_dir / "response.json"
     if not response_path.exists():
         print(f"      ⚠️ apply_detections_edited: response.json lipsește în {raster_dir}")
         return False
