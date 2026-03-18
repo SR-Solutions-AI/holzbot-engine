@@ -129,7 +129,7 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
             cv2.imwrite(str(no_filter_path), img_resized_no_filter)
         except OSError:
             pass
-
+        
         # ✅ PREPROCESARE: Ștergem liniile foarte subțiri înainte de trimitere la RasterScan
         print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
         api_img = img.copy()
@@ -872,8 +872,8 @@ def apply_detections_edited(raster_dir: Path) -> bool:
     """
     edited_path = raster_dir / "detections_edited.json"
     if not edited_path.exists():
-        return False
-    response_path = raster_dir / "response.json"
+            return False
+        response_path = raster_dir / "response.json"
     if not response_path.exists():
         print(f"      ⚠️ apply_detections_edited: response.json lipsește în {raster_dir}")
         return False
@@ -950,11 +950,11 @@ def _draw_response_overlay(
     offset_xy: (tx, ty) adăugat la toate coordonatele (pentru aliniere cu masca Raster la translația brute force).
     """
     response_path = raster_dir / "response.json"
-    if not response_path.exists():
-        return False
-    with open(response_path, "r", encoding="utf-8") as f:
-        result = json.load(f)
-    data = result.get("data", result)
+        if not response_path.exists():
+            return False
+        with open(response_path, "r", encoding="utf-8") as f:
+            result = json.load(f)
+        data = result.get("data", result)
     # Tipuri uși/geamuri: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed)
     doors_types_list = []
     doors_types_path = raster_dir / "doors_types.json"
@@ -968,7 +968,7 @@ def _draw_response_overlay(
     h, w = overlay.shape[:2]
     ox, oy = offset_xy
 
-    def pt(x: float, y: float):
+        def pt(x: float, y: float):
         return (int(round(x + ox)), int(round(y + oy)))
 
     # Culoare distinctă per cameră (BGR) din HSV
@@ -980,37 +980,37 @@ def _draw_response_overlay(
         return (int(b * 255), int(g * 255), int(r * 255))
 
     if draw_walls and "walls" in data and data["walls"]:
-        for wall in data["walls"]:
-            pos = wall.get("position")
-            if pos and len(pos) >= 2:
+            for wall in data["walls"]:
+                pos = wall.get("position")
+                if pos and len(pos) >= 2:
                 p1, p2 = pos[0], pos[1]
-                x1, y1 = (p1["x"], p1["y"]) if isinstance(p1, dict) else (p1[0], p1[1])
-                x2, y2 = (p2["x"], p2["y"]) if isinstance(p2, dict) else (p2[0], p2[1])
-                cv2.line(overlay, pt(x1, y1), pt(x2, y2), (0, 255, 0), 3)
+                    x1, y1 = (p1["x"], p1["y"]) if isinstance(p1, dict) else (p1[0], p1[1])
+                    x2, y2 = (p2["x"], p2["y"]) if isinstance(p2, dict) else (p2[0], p2[1])
+                    cv2.line(overlay, pt(x1, y1), pt(x2, y2), (0, 255, 0), 3)
 
     if draw_rooms and "rooms" in data and data["rooms"]:
-        for i, room in enumerate(data["rooms"]):
-            pts = []
-            for point in room:
-                if "x" in point and "y" in point:
-                    pts.append(pt(point["x"], point["y"]))
-            if len(pts) >= 3:
-                pts_np = np.array(pts, dtype=np.int32)
+            for i, room in enumerate(data["rooms"]):
+                pts = []
+                for point in room:
+                    if "x" in point and "y" in point:
+                        pts.append(pt(point["x"], point["y"]))
+                if len(pts) >= 3:
+                    pts_np = np.array(pts, dtype=np.int32)
                 color = _room_color(i)
                 fill_layer = overlay.copy()
                 cv2.fillPoly(fill_layer, [pts_np], color)
                 overlay = cv2.addWeighted(fill_layer, _FILL_ALPHA, overlay, 1.0 - _FILL_ALPHA, 0).astype(np.uint8)
-                cv2.polylines(overlay, [pts_np], True, color, 2)
-                if pts:
-                    cx = sum(p[0] for p in pts) // len(pts)
-                    cy = sum(p[1] for p in pts) // len(pts)
-                    cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.polylines(overlay, [pts_np], True, color, 2)
+                    if pts:
+                        cx = sum(p[0] for p in pts) // len(pts)
+                        cy = sum(p[1] for p in pts) // len(pts)
+                        cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
     if draw_doors and "doors" in data and data["doors"]:
         for door_idx, door in enumerate(data["doors"]):
             if "bbox" in door and len(door["bbox"]) != 4:
                 continue
-            x1, y1, x2, y2 = map(int, door["bbox"])
+                    x1, y1, x2, y2 = map(int, door["bbox"])
             x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
             if x2 <= x1 or y2 <= y1:
                 continue
@@ -1655,7 +1655,7 @@ def generate_raster_images(api_result: Dict[str, Any], original_img: np.ndarray,
                 if door_is_window_list and idx < len(door_is_window_list):
                     is_window = door_is_window_list[idx]
                 else:
-                    aspect = width / max(1, height)
+                aspect = width / max(1, height)
                     is_window = aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT)
                 if is_window:
                     label = "Window"
@@ -1761,7 +1761,7 @@ def generate_raster_images(api_result: Dict[str, Any], original_img: np.ndarray,
                 if door_is_window_list and door_idx < len(door_is_window_list):
                     is_window = door_is_window_list[door_idx]
                 else:
-                    aspect = width / max(1, height)
+                aspect = width / max(1, height)
                     is_window = aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT)
                 if is_window:
                     label = "Win"
