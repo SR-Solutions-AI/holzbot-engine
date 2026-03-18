@@ -26,6 +26,7 @@ class CountObjectsJobResult:
     work_dir: Path
     success: bool
     message: str
+    ui_image_path: Path | None = None  # pentru notificare batch în LiveFeed (după ce toate planurile sunt gata)
 
 
 def _run_for_single_plan(
@@ -61,7 +62,7 @@ def _run_for_single_plan(
         if (work_dir / "plan.jpg").exists():
             plan_jpg = work_dir / "plan.jpg"
         else:
-            return CountObjectsJobResult(plan.plan_id, work_dir, False, "Lipsă plan.jpg (nici în detections, nici local)")
+            return CountObjectsJobResult(plan.plan_id, work_dir, False, "Lipsă plan.jpg (nici în detections, nici local)", ui_image_path=None)
 
     # Configurare API Roboflow (pentru scări, dacă e nevoie)
     api_key = os.getenv("ROBOFLOW_API_KEY", "")
@@ -103,25 +104,19 @@ def _run_for_single_plan(
             outdoor_mask_path=outdoor_mask_path # <--- Aici intră masca
         )
         
-        # 5. NOTIFICARE UI (Live Feed) - Folosim imaginea din raster (01_openings.png)
-        # Prioritate: 01_openings.png din raster_processing (detecții de la RasterScan)
+        # 5. Cale imagine pentru notificare UI batch (se trimite o dată după ce toate planurile sunt gata)
         scale_dir = run_output_root / "scale" / plan.plan_id
         raster_openings_img = scale_dir / "cubicasa_steps" / "raster_processing" / "openings" / "01_openings.png"
-        
         if raster_openings_img.exists():
-            # Folosim imaginea din raster (detecții de la RasterScan)
-            print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(raster_openings_img)}", flush=True)
+            ui_path = raster_openings_img
         else:
-            # Fallback la imaginea portocalie (dacă nu există raster)
             orange_img = work_dir / "final_orange.jpg"
-            if success and orange_img.exists():
-                print(f">>> UI:STAGE:{STAGE_NAME}|IMG:{str(orange_img)}", flush=True)
-        
-        return CountObjectsJobResult(plan.plan_id, work_dir, success, message)
+            ui_path = orange_img if (success and orange_img.exists()) else None
+        return CountObjectsJobResult(plan.plan_id, work_dir, success, message, ui_image_path=ui_path)
     
     except Exception as e:
         traceback.print_exc()
-        return CountObjectsJobResult(plan.plan_id, work_dir, False, str(e))
+        return CountObjectsJobResult(plan.plan_id, work_dir, False, str(e), ui_image_path=None)
 
 
 def run_count_objects_for_run(run_id: str, max_parallel: int | None = None) -> List[CountObjectsJobResult]:
@@ -144,5 +139,6 @@ def run_count_objects_for_run(run_id: str, max_parallel: int | None = None) -> L
         }
         for fut in as_completed(futures):
             results.append(fut.result())
-            
+
+    # Nu trimitem count_objects în LiveFeed – doar editorul detections_review (input_resized + poligoane)
     return results

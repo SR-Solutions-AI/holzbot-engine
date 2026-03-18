@@ -53,20 +53,31 @@ Dacă nu găsești o suprafață asociată unei cameri concrete (doar total NNF/
 """
 
 # Prompt pentru batch de camere (N imagini → un singur răspuns JSON cu array)
+# room_number = numărul desenat pe imagine (room_no:N) – pentru asociere cu poligoanele din 09_interior (OCR)
+# room_name și room_type = EXACT textul de pe plan, aceeași limbă (fără traducere). Planurile sunt adesea în germană.
 GEMINI_PROMPT_ROOMS_BATCH = """
 You receive {n} images of floor plan room crops (in order: Image 1, Image 2, ... Image {n}).
-For EACH image in the same order, extract:
-1. room_name – name of the room(s) in that crop (e.g. "Living Room", "Kitchen", "Terrasse"). Use "Multiple rooms" if several.
-2. area_m2 – ONLY if there is an explicit m² value FOR A CONCRETE ROOM in that crop (same rules as single-room: ignore NNF/Nutzfläche totals).
+Each image has in the TOP-LEFT corner two labels: "area_px:NNNNN" and "room_no:N" (N = room number 0, 1, 2, ...). READ both numbers.
 
-RULES (same as single room):
-- Extract area_m2 ONLY when it is clearly labeled for a specific room (e.g. "Küche 15 m²"). Ignore totals for the whole level.
-- If the crop shows only NNF/total/Net floor area, use null for area_m2.
+CRITICAL – room_number and EXACT text from plan:
+- room_number = the integer you see in "room_no:N" on that image. Return it exactly (required for matching).
+- room_name and room_type = copy the EXACT word(s) written ON THE PLAN for that room. Same language as the plan. DO NOT translate. If the plan is in German you get German (Küche, Bad, Flur, Wohnzimmer, Schlafzimmer, Abstellraum, etc.). If the plan is in English you get English. Copy character for character. Use "Raum" only if no readable label or multiple labels in one crop.
+
+For EACH image in order, extract:
+1. room_number – integer from "room_no:N" in the corner. Required.
+2. area_px – integer from "area_px:NNNNN". Required.
+3. room_name – EXACT text from the plan (same language, no translation). "Mehrere Räume" only if several room names in crop and plan is German; otherwise "Multiple rooms" etc. as on plan.
+4. area_m2 – number only if m² is explicitly written for that room; ignore NNF/Nutzfläche totals.
+5. room_type – EXACT room label as written on the plan. Do not translate.
+
+RULES:
+- room_number and area_px = copy from corner labels.
+- room_name and room_type = copy EXACTLY from plan, same language.
 - Black areas are not part of the room.
 
 Return ONLY this JSON (no markdown):
-{{"rooms": [{{"room_name": "...", "area_m2": 12.5}}, {{"room_name": "...", "area_m2": null}}, ...]}}
-with exactly {n} objects in the "rooms" array, one per image in order.
+{{"rooms": [{{"room_number": 0, "area_px": 33060, "room_name": "<exact from plan>", "area_m2": 12.5, "room_type": "<exact from plan>"}}, ...]}}
+with exactly {n} objects. Every object MUST have room_number (int), area_px (int), room_name (string), and room_type (string).
 """
 
 
@@ -544,10 +555,119 @@ def call_gemini(image_path, prompt, api_key, max_retries=2, repair_callback: Cal
         return None
 
 
+def _repair_json_rooms_response(raw: str) -> str:
+    """
+    Încearcă reparații locale pe textul JSON (fără apel extern).
+    - Elimină virgula trailing înainte de ] sau }
+    - Închide bracket-uri lipsă la sfârșit (răspuns trunchiat)
+    """
+    if not raw or not raw.strip():
+        return raw
+    # Trailing comma înainte de ] sau }
+    s = re.sub(r",\s*([\]}])", r"\1", raw)
+    # Stack de închideri: la [ push ']', la { push '}'
+    stack = []
+    in_string = False
+    escape = False
+    quote = None
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == quote:
+                in_string = False
+            i += 1
+            continue
+        if c in ('"', "'"):
+            in_string = True
+            quote = c
+            i += 1
+            continue
+        if c == "{":
+            stack.append("}")
+        elif c == "[":
+            stack.append("]")
+        elif c == "}" or c == "]":
+            if stack and stack[-1] == c:
+                stack.pop()
+            # altfel e închidere neașteptată, nu push
+        i += 1
+    # Adaugă închiderile lipsă în ordine corectă
+    s += "".join(reversed(stack))
+    return s
+
+
+def _parse_rooms_batch_text(text: str, n: int):
+    """
+    Extrage și curăță textul JSON din răspuns, parsează și validează.
+    Returnează (list[dict] pentru out, None) la succes, sau (None, err) la eșec.
+    """
+    if not text or not text.strip():
+        return None, "empty text"
+    # Markdown code block
+    if "```" in text:
+        lines = text.splitlines()
+        if lines and "```" in lines[0]:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None, "no JSON object"
+    text = text[start:end]
+    # Încercare parsare directă, apoi cu repair
+    for raw in (text, _repair_json_rooms_response(text)):
+        try:
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        return None, "JSON decode failed"
+    rooms = data.get("rooms")
+    if not isinstance(rooms, list):
+        return None, "missing or invalid 'rooms' array"
+    if len(rooms) != n:
+        return None, f"rooms length {len(rooms)} != {n}"
+    out = []
+    for pos, r in enumerate(rooms):
+        if not isinstance(r, dict):
+            out.append({"room_number": pos, "room_name": "", "area_m2": None, "room_type": "Raum", "area_px": None})
+        else:
+            apx = r.get("area_px")
+            if apx is not None:
+                try:
+                    apx = int(apx)
+                except (TypeError, ValueError):
+                    apx = None
+            rnum = r.get("room_number")
+            if rnum is not None:
+                try:
+                    rnum = int(rnum)
+                except (TypeError, ValueError):
+                    rnum = pos
+            else:
+                rnum = pos
+            out.append({
+                "room_number": rnum,
+                "room_name": r.get("room_name") or "",
+                "area_m2": r.get("area_m2"),
+                "room_type": (r.get("room_type") or "Raum").strip() or "Raum",
+                "area_px": apx,
+            })
+    return out, None
+
+
 def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 2):
     """
     Trimite toate crop-urile de camere într-un singur apel Gemini.
-    Returnează list[dict] în aceeași ordine (fiecare dict: room_name, area_m2) sau None la eșec.
+    Returnează list[dict] în aceeași ordine (fiecare dict: room_name, area_m2, room_type, area_px) sau None la eșec.
     """
     if not image_paths or not api_key:
         return None
@@ -578,36 +698,31 @@ def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 
             if 'candidates' not in result or not result['candidates']:
                 return None
             text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
-            if not text:
-                return None
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines and lines[0].lstrip().startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                text = text[start:end]
-            data = json.loads(text)
-            rooms = data.get("rooms")
-            if not isinstance(rooms, list) or len(rooms) != n:
-                if attempt < max_retries:
-                    continue
-                return None
-            out = []
-            for r in rooms:
-                if not isinstance(r, dict):
-                    out.append({"room_name": "", "area_m2": None})
-                else:
-                    out.append({
-                        "room_name": r.get("room_name") or "",
-                        "area_m2": r.get("area_m2")
-                    })
-            return out
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            out, err = _parse_rooms_batch_text(text, n)
+            if out is not None:
+                return out
+            # Reparare cu GPT dacă e disponibil
+            if attempt == max_retries and os.getenv("OPENAI_API_KEY"):
+                try:
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                    from common.json_repair import repair_json_with_gpt
+                    schema = (
+                        'Object with key "rooms" (array of exactly ' + str(n) + ' objects). '
+                        'Each object: room_number (int), area_px (int), room_name (str), area_m2 (number or null), room_type (str).'
+                    )
+                    repaired = repair_json_with_gpt(text, schema)
+                    if repaired and isinstance(repaired.get("rooms"), list) and len(repaired["rooms"]) == n:
+                        out, _ = _parse_rooms_batch_text(json.dumps(repaired), n)
+                        if out is not None:
+                            return out
+                except Exception as gpt_err:
+                    print(f"⚠️  Gemini rooms batch GPT repair failed: {gpt_err}")
+            if attempt < max_retries:
+                continue
+            print(f"⚠️  Gemini rooms batch error: {err}")
+            return None
+        except (KeyError, TypeError) as e:
             if attempt < max_retries:
                 continue
             print(f"⚠️  Gemini rooms batch error: {e}")
@@ -618,17 +733,59 @@ def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 
     return None
 
 # Batch clasificare uși/ferestre (N imagini → un JSON cu array de tipuri)
-GEMINI_PROMPT_DOORS_BATCH = """You receive {n} images of floor plan openings (doors, windows, garage doors, stairs). For each image in the same order (Image 1, 2, ... {n}), classify as exactly one type.
+GEMINI_PROMPT_DOORS_BATCH = """You receive {n} images of floor plan openings. For each image in order (Image 1, 2, ... {n}), classify as exactly ONE type. You MUST use both "door" and "window" where appropriate – do NOT return "door" for all.
 
-CRITICAL DISTINCTIONS:
-- "window" - Glass panes (parallel lines/grid), typically narrower, often near exterior walls.
-- "door" - Passage opening, single or double, may show door swing arc. Interior or exterior.
-- "garage_door" - Very wide opening (2-3x doors), ground level, multiple panels/tracks.
-- "stairs" - Step pattern (parallel lines up/down), rectangular or L-shaped.
+CRITICAL – when to use "window":
+- "window" = glass opening: parallel lines or grid inside, usually narrower than doors, often horizontal or vertical strip. Use "window" for any opening that clearly shows glass/fenestration. Many images will be windows.
+- "door" = passage for people: single or double leaf, may show swing arc, typically wider than windows.
+- "garage_door" = very wide (2-3x a normal door), multiple panels, ground level.
+- "stairs" = visible step pattern (parallel lines), connects floors.
+
+Rule: If the opening looks like a window (narrow, lines/grid, glass) → "window". If it looks like a door (passage, swing) → "door". Vary your answers.
 
 Return ONLY this JSON (no markdown): {{"types": ["door", "window", "garage_door", "stairs", ...]}}
-with exactly {n} strings in the "types" array, one per image in order.
+with exactly {n} strings, one per image in order.
 """
+
+
+def _parse_doors_batch_text(text: str, n: int):
+    """
+    Extrage și curăță JSON din răspuns, parsează și validează.
+    Returnează (list[str] pentru types, None) la succes, sau (None, err) la eșec.
+    """
+    if not text or not text.strip():
+        return None, "empty text"
+    if "```" in text:
+        lines = text.splitlines()
+        if lines and "```" in lines[0]:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None, "no JSON object"
+    text = text[start:end]
+    valid_types = {'door', 'window', 'garage_door', 'stairs'}
+    for raw in (text, _repair_json_rooms_response(text)):
+        try:
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        return None, "JSON decode failed"
+    types_raw = data.get("types")
+    if not isinstance(types_raw, list):
+        return None, "missing or invalid 'types' array"
+    if len(types_raw) != n:
+        return None, f"types length {len(types_raw)} != {n}"
+    out = []
+    for t in types_raw:
+        s = (t if isinstance(t, str) else str(t)).lower().strip()
+        out.append(s if s in valid_types else 'door')
+    return out, None
 
 
 def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 2) -> list[str] | None:
@@ -655,7 +812,6 @@ def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 
     gen_config = {"temperature": 0.0, "maxOutputTokens": 1024, "responseMimeType": "application/json"}
     payload = {"contents": [{"parts": parts}], "generationConfig": gen_config}
     headers = {"Content-Type": "application/json"}
-    valid_types = {'door', 'window', 'garage_door', 'stairs'}
 
     for attempt in range(max_retries + 1):
         try:
@@ -666,31 +822,30 @@ def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 
             if 'candidates' not in result or not result['candidates']:
                 return None
             text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
-            if not text:
-                return None
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines and lines[0].lstrip().startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                text = text[start:end]
-            data = json.loads(text)
-            types_raw = data.get("types")
-            if not isinstance(types_raw, list) or len(types_raw) != n:
-                if attempt < max_retries:
-                    continue
-                return None
-            out = []
-            for t in types_raw:
-                s = (t if isinstance(t, str) else str(t)).lower().strip()
-                out.append(s if s in valid_types else 'door')
-            return out
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            out, err = _parse_doors_batch_text(text, n)
+            if out is not None:
+                return out
+            if attempt == max_retries and os.getenv("OPENAI_API_KEY"):
+                try:
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                    from common.json_repair import repair_json_with_gpt
+                    schema = (
+                        'Object with key "types" (array of exactly ' + str(n) + ' strings). '
+                        'Each string is one of: "door", "window", "garage_door", "stairs".'
+                    )
+                    repaired = repair_json_with_gpt(text, schema)
+                    if repaired and isinstance(repaired.get("types"), list) and len(repaired["types"]) == n:
+                        out, _ = _parse_doors_batch_text(json.dumps(repaired), n)
+                        if out is not None:
+                            return out
+                except Exception as gpt_err:
+                    print(f"⚠️  Gemini doors batch GPT repair failed: {gpt_err}")
+            if attempt < max_retries:
+                continue
+            print(f"⚠️  Gemini doors batch error: {err}")
+            return None
+        except (KeyError, TypeError) as e:
             if attempt < max_retries:
                 continue
             print(f"⚠️  Gemini doors batch error: {e}")

@@ -15,7 +15,7 @@ import json
 import base64
 import requests
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Sequence
 
 from .alignment_methods import (
     align_brute_force_pyramid,
@@ -114,6 +114,22 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
         raster_dir = Path(steps_dir) / "raster"
         raster_dir.mkdir(parents=True, exist_ok=True)
         
+        # Dimensiuni request (scale-down max 1000px) – le folosim pentru imaginea fără filtru (pentru UI)
+        MAX_RASTER_SIDE = 1000
+        h_orig, w_orig = img.shape[:2]
+        scale_factor = 1.0
+        if max(h_orig, w_orig) > MAX_RASTER_SIDE:
+            scale_factor = MAX_RASTER_SIDE / max(h_orig, w_orig)
+        new_w_api = max(1, int(w_orig * scale_factor))
+        new_h_api = max(1, int(h_orig * scale_factor))
+        # Imagine fără filtru de linii subțiri – aceeași dimensiune ca request (pentru editor UI)
+        img_resized_no_filter = cv2.resize(img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
+        try:
+            no_filter_path = raster_dir / "input_resized_no_filter.png"
+            cv2.imwrite(str(no_filter_path), img_resized_no_filter)
+        except OSError:
+            pass
+
         # ✅ PREPROCESARE: Ștergem liniile foarte subțiri înainte de trimitere la RasterScan
         print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
         api_img = img.copy()
@@ -156,18 +172,11 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
         else:
             print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat - linii subțiri eliminate)")
         
-        # Scale-down doar pentru trimiterea la Raster: max 1000px pe latura lungă (restul pipeline-ului nu se atinge)
-        MAX_RASTER_SIDE = 1000
+        # Scale-down la aceleași dimensiuni ca img_resized_no_filter (consistență request space)
         h_api, w_api = api_img.shape[:2]
-        scale_factor = 1.0
-        if max(h_api, w_api) > MAX_RASTER_SIDE:
-            scale_factor = MAX_RASTER_SIDE / max(h_api, w_api)
-            new_w_api = max(1, int(w_api * scale_factor))
-            new_h_api = max(1, int(h_api * scale_factor))
+        if (w_api, h_api) != (new_w_api, new_h_api):
             api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
             print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
-        else:
-            new_w_api, new_h_api = w_api, h_api
 
         # Salvăm imaginea care se trimite la API (scale/raster) – nume explicit ca să fie ușor de găsit
         try:
@@ -355,6 +364,682 @@ def call_raster_api(img: np.ndarray, steps_dir: str) -> Optional[Dict[str, Any]]
         return None
 
 
+def _desaturate_keep_black(img: np.ndarray, saturation_scale: float = 0.5) -> np.ndarray:
+    """Reduce saturația culorilor păstrând negrul neschimbat (pentru blueprint mai puțin viu)."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return cv2.addWeighted(img, saturation_scale, gray_bgr, 1.0 - saturation_scale, 0).astype(np.uint8)
+
+
+def _load_review_base_image(raster_dir: Path) -> Optional[np.ndarray]:
+    """
+    Încarcă imaginea de plan în spațiul request, identic cu cea folosită pentru
+    base_with_walls_skeleton.png (aceleași fișiere și ordine).
+    """
+    base = cv2.imread(str(raster_dir / "input_resized_no_filter.png"))
+    if base is None:
+        base = cv2.imread(str(raster_dir / "input_resized.jpg"))
+    if base is None:
+        base = cv2.imread(str(raster_dir / "raster_request.png"))
+    return base
+
+
+def _build_base_with_blue_like_brute_steps(
+    raster_dir: Path,
+    base_img: np.ndarray,
+) -> Tuple[Optional[np.ndarray], Tuple[int, int]]:
+    """
+    Construiește aceeași imagine ca base_with_blue_mask.png din brute_steps: plan + masca Raster
+    la poziția (tx, ty). Returnează (base_with_blue, (tx, ty)) sau (None, (0, 0)) dacă nu există config.
+    """
+    config_path = raster_dir / "brute_steps" / "translation_only_config.json"
+    if not config_path.exists():
+        return (None, (0, 0))
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        pos = config.get("position")
+        if not pos or len(pos) != 2:
+            return (None, (0, 0))
+        tx, ty = int(pos[0]), int(pos[1])
+    except Exception:
+        return (None, (0, 0))
+    req_h, req_w = base_img.shape[:2]
+    api_request = build_api_walls_mask_from_json(raster_dir, req_w, req_h)
+    if api_request is None:
+        return (None, (0, 0))
+    _, api_bin = cv2.threshold(api_request, 127, 255, cv2.THRESH_BINARY)
+    if api_bin.shape[:2] != (req_h, req_w):
+        return (None, (0, 0))
+    x_dst, y_dst = max(0, tx), max(0, ty)
+    x_src, y_src = max(0, -tx), max(0, -ty)
+    w_c = min(req_w - x_dst, api_bin.shape[1] - x_src)
+    h_c = min(req_h - y_dst, api_bin.shape[0] - y_src)
+    base_with_blue = base_img.copy()
+    if w_c > 0 and h_c > 0:
+        api_region = api_bin[y_src:y_src + h_c, x_src:x_src + w_c]
+        blue_mask = api_region > 0
+        base_with_blue[y_dst:y_dst + h_c, x_dst:x_dst + w_c][blue_mask] = [255, 0, 0]  # BGR blue
+    return (base_with_blue, (tx, ty))
+
+
+def _get_room_polygons_from_response(
+    raster_dir: Path,
+    offset_xy: Tuple[int, int],
+    request_w: int,
+    request_h: int,
+) -> List[np.ndarray]:
+    """
+    Poligoane pentru editor din rooms (boss): response.json data.rooms.
+    Returnează liste de contururi în coordonate request (cu offset), sau listă goală.
+    """
+    response_path = raster_dir / "response.json"
+    if not response_path.exists():
+        return []
+    try:
+        with open(response_path, "r", encoding="utf-8") as f:
+            data = json.load(f).get("data", {})
+        rooms_data = data.get("rooms") or []
+        if not rooms_data:
+            return []
+        ox, oy = offset_xy
+        polygons_request: List[np.ndarray] = []
+        for room in rooms_data:
+            pts = []
+            for p in room:
+                if isinstance(p, dict) and "x" in p and "y" in p:
+                    pts.append([int(p["x"]) + ox, int(p["y"]) + oy])
+            if len(pts) >= 3:
+                polygons_request.append(np.array(pts, dtype=np.int32).reshape(-1, 1, 2))
+        return polygons_request
+    except Exception:
+        return []
+
+
+def _touches_image_border(comp_mask: np.ndarray, h_f: int, w_f: int) -> bool:
+    """Identic cu raster_processing: excludem componente care ating marginea ca ordinea să coincidă cu room_scales."""
+    if np.any(comp_mask[0, :] > 0) or np.any(comp_mask[h_f - 1, :] > 0):
+        return True
+    if np.any(comp_mask[:, 0] > 0) or np.any(comp_mask[:, w_f - 1] > 0):
+        return True
+    return False
+
+
+def _read_room_number_ocr(img_09: np.ndarray, polygon_request: np.ndarray, req_w: int, req_h: int) -> Optional[int]:
+    """
+    Citește numărul camerei desenat pe 09_interior în regiunea poligonului (centroid).
+    img_09 = imaginea 09_interior (dimensiune originală); polygon_request = poligon în spațiul request.
+    Returnează int (0, 1, 2, ...) sau None dacă OCR eșuează.
+    """
+    if img_09 is None or img_09.size == 0 or polygon_request is None or len(polygon_request) < 3:
+        return None
+    h_orig, w_orig = img_09.shape[:2]
+    if req_w <= 0 or req_h <= 0:
+        return None
+    M = cv2.moments(np.asarray(polygon_request, dtype=np.float32))
+    if not M["m00"] or M["m00"] <= 0:
+        return None
+    cx_req = M["m10"] / M["m00"]
+    cy_req = M["m01"] / M["m00"]
+    cx = int(cx_req * w_orig / req_w)
+    cy = int(cy_req * h_orig / req_h)
+    # Patch mai mare ca să cuprindă numărul (negru + text alb); centrat pe centroid unde e desenat numărul
+    side = max(100, min(200, w_orig // 8))
+    x1 = max(0, cx - side // 2)
+    y1 = max(0, cy - side // 2)
+    x2 = min(w_orig, x1 + side)
+    y2 = min(h_orig, y1 + side)
+    patch = img_09[y1:y2, x1:x2]
+    if patch.size == 0:
+        return None
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+
+    def _parse_digit(s: str) -> Optional[int]:
+        s = (s or "").strip().replace(" ", "")
+        for part in s.split():
+            digits = "".join(c for c in part if c.isdigit())
+            if digits:
+                return int(digits)
+        if s.isdigit():
+            return int(s)
+        return None
+
+    # Preprocesare: gri, threshold (text alb pe fundal negru → alb), inversat pentru Tesseract (negru pe alb)
+    try:
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        _, bin_inv = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(bin_inv, config="--psm 10 -c tessedit_char_whitelist=0123456789")
+        v = _parse_digit(text)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    try:
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        _, bin_inv = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(bin_inv, config="--psm 6 -c tessedit_char_whitelist=0123456789")
+        v = _parse_digit(text)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    try:
+        text = pytesseract.image_to_string(patch, config="--psm 6 -c tessedit_char_whitelist=0123456789")
+        v = _parse_digit(text)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def _extract_room_polygons_from_09_interior(
+    raster_dir: Path,
+    request_w: int,
+    request_h: int,
+) -> List[np.ndarray]:
+    """
+    Extrage din 09_interior.png fiecare fill (zonă portocalie) ca poligon, scalează la request size.
+    Folosim EXACT aceeași logică ca în raster_processing (culori, connectivity, excludere margine)
+    ca ordinea poligoanelor să coincidă 1:1 cu room_scales (Gemini): polygon[idx] = room_scales[idx].
+    """
+    interior_path = raster_dir.parent / "raster_processing" / "walls_from_coords" / "09_interior.png"
+    if not interior_path.exists():
+        print(f"      [detections_review] 09_interior.png lipsește: {interior_path}")
+        return []
+    try:
+        img = cv2.imread(str(interior_path), cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"      [detections_review] Nu s-a putut citi 09_interior.png")
+            return []
+        h_orig, w_orig = img.shape[:2]
+        if w_orig < 2 or h_orig < 2:
+            return []
+        # Același interval ca în raster_processing (linia 3174-3175) ca să obținem aceleași componente în aceeași ordine
+        low = np.array([0, 140, 240], dtype=np.uint8)
+        high = np.array([40, 200, 255], dtype=np.uint8)
+        orange_mask = cv2.inRange(img, low, high)
+        orange_count = int(np.count_nonzero(orange_mask))
+        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(orange_mask, connectivity=4)
+        total_px = h_orig * w_orig
+        scale_x = request_w / w_orig
+        scale_y = request_h / h_orig
+        polygons_request: List[np.ndarray] = []
+
+        for label_id in range(1, num_labels):
+            comp_mask = (labels == label_id).astype(np.uint8) * 255
+            if _touches_image_border(comp_mask, h_orig, w_orig):
+                continue
+            area = np.count_nonzero(comp_mask)
+            if area < 100:
+                continue
+            if total_px > 0 and area >= 0.95 * total_px:
+                continue
+            contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            largest = max(contours, key=cv2.contourArea)
+            if len(largest) < 3:
+                continue
+            pts = largest.astype(np.float32)
+            pts[:, 0, 0] *= scale_x
+            pts[:, 0, 1] *= scale_y
+            polygons_request.append(pts.astype(np.int32))
+        if polygons_request:
+            print(f"      [detections_review] 09_interior.png: {len(polygons_request)} camere (orange px={orange_count}, labels={num_labels - 1})")
+        else:
+            print(f"      [detections_review] 09_interior.png: 0 camere (orange px={orange_count}, labels={num_labels - 1}) – verificați culoarea/intervalul")
+        return polygons_request
+    except Exception as e:
+        print(f"      [detections_review] Eroare la extragere 09_interior: {e}")
+        return []
+
+
+def _room_color_bgr(i: int) -> Tuple[int, int, int]:
+    import colorsys
+    n = 48
+    h = (i * 137) % n / n
+    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+    return (int(b * 255), int(g * 255), int(r * 255))
+
+
+def _draw_room_polygons_only(
+    base_img: np.ndarray,
+    polygons_request: Sequence[np.ndarray],
+    out_path: Path,
+) -> bool:
+    """Desenează doar poligoanele de camere (culori distincte, fill transparent), fără pereți/uși."""
+    overlay = base_img.copy()
+    for i, pts_np in enumerate(polygons_request):
+        if pts_np is None or len(pts_np) < 3:
+            continue
+        color = _room_color_bgr(i)
+        fill_layer = overlay.copy()
+        cv2.fillPoly(fill_layer, [pts_np], color)
+        overlay = cv2.addWeighted(fill_layer, _FILL_ALPHA, overlay, 1.0 - _FILL_ALPHA, 0).astype(np.uint8)
+        cv2.polylines(overlay, [pts_np], True, color, 2)
+        if len(pts_np) > 0:
+            M = cv2.moments(pts_np)
+            if M["m00"] and M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    return cv2.imwrite(str(out_path), overlay)
+
+
+def save_detections_review_image(raster_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    """
+    Pentru editorul de verificare UI: salvează imaginea de bază (fără poligoane), plus imagini cu
+    overlay-uri pentru compatibilitate. UI folosește doar imaginea de bază și desenează poligoanele
+    din detections_review_data.json pe canvas.
+    Returnează (path_base, path_rooms, path_doors); doar path_base este trimis la UI (unul per plan).
+    """
+    try:
+        base_img = _load_review_base_image(raster_dir)
+        if base_img is None:
+            return (None, None, None)
+        req_h, req_w = base_img.shape[:2]
+        path_base = raster_dir / "detections_review_base.png"
+        cv2.imwrite(str(path_base), base_img)
+        # Fără mască albastră în editor (fără linii de pereți); offset pentru uși când există translation
+        config_path = raster_dir / "brute_steps" / "translation_only_config.json"
+        offset_xy = (0, 0)
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    pos = json.load(f).get("position")
+                if pos and len(pos) == 2:
+                    offset_xy = (int(pos[0]), int(pos[1]))
+            except Exception:
+                pass
+        path_rooms = raster_dir / "detections_review_rooms.png"
+        path_doors = raster_dir / "detections_review_doors.png"
+        # Poligoane pentru editor din 09_interior; fallback la response.json (rooms)
+        polygons_09 = _extract_room_polygons_from_09_interior(raster_dir, req_w, req_h)
+        if not polygons_09:
+            polygons_09 = _get_room_polygons_from_response(raster_dir, offset_xy, req_w, req_h)
+            if polygons_09:
+                print(f"      [detections_review] Fallback la rooms din response.json: {len(polygons_09)} camere")
+        if polygons_09:
+            ok_r = _draw_room_polygons_only(base_img, polygons_09, path_rooms)
+        else:
+            ok_r = _draw_response_overlay(
+                base_img, raster_dir, path_rooms,
+                draw_rooms=True, draw_doors=False, draw_walls=False,
+                offset_xy=offset_xy,
+            )
+        # Uși/geamuri din response.json, fără pereți
+        ok_d = _draw_response_overlay(
+            base_img, raster_dir, path_doors,
+            draw_rooms=False, draw_doors=True, draw_walls=False,
+            offset_xy=offset_xy,
+        )
+        # Date vectoriale pentru editor: camere (poligoane din 09_interior) + uși (bbox cu offset)
+        _save_detections_review_data(raster_dir, polygons_09, offset_xy, req_w, req_h)
+        return (
+            path_base if path_base.exists() else None,
+            path_rooms if ok_r and path_rooms.exists() else None,
+            path_doors if ok_d and path_doors.exists() else None,
+        )
+    except Exception as e:
+        print(f"      ⚠️ detections_review: {e}")
+        return (None, None, None)
+
+
+def _save_detections_review_data(
+    raster_dir: Path,
+    polygons_09: List[np.ndarray],
+    offset_xy: Tuple[int, int],
+    req_w: int,
+    req_h: int,
+) -> None:
+    """Salvează detections_review_data.json: rooms (poligoane + roomType) + doors.
+    Asociere etichete: după INDEX – poligoanele din 09_interior și room_scales provin din aceeași
+    sursă (connectedComponents pe 09_interior), deci polygon[i] = room_scales[i]. Când key i lipsește
+    (ex. cameră skip-uită la overlap), folosim 'Raum'. Fallback pe arie doar dacă nu avem room_scales.
+    """
+    out_path = raster_dir / "detections_review_data.json"
+    try:
+        rooms: List[dict] = []
+        room_types_by_index: List[str] = []
+        room_names_by_index: List[str] = []
+        room_types_path = raster_dir / "room_types.json"
+        if room_types_path.exists():
+            try:
+                with open(room_types_path, "r", encoding="utf-8") as f:
+                    room_types_by_index = json.load(f)
+                if not isinstance(room_types_by_index, list):
+                    room_types_by_index = []
+            except Exception:
+                pass
+        if not room_types_by_index:
+            room_scales_path = raster_dir.parent / "raster_processing" / "walls_from_coords" / "room_scales.json"
+            rs: dict = {}
+            if room_scales_path.exists():
+                try:
+                    with open(room_scales_path, "r", encoding="utf-8") as f:
+                        data_rs = json.load(f)
+                    rs = data_rs.get("room_scales") or data_rs.get("rooms") or {}
+                except Exception:
+                    pass
+            if rs and polygons_09:
+                # Mapă room_number (desenat pe 09_interior și returnat de Gemini) -> room_type și room_name
+                rn_to_type: Dict[int, str] = {}
+                rn_to_name: Dict[int, str] = {}
+                if isinstance(rs, dict):
+                    for k, v in rs.items():
+                        ent = v if isinstance(v, dict) else {}
+                        rn = ent.get("room_number")
+                        if rn is None and isinstance(k, int):
+                            rn = k
+                        if rn is None and isinstance(k, str) and k.isdigit():
+                            rn = int(k)
+                        if rn is not None:
+                            rn_to_type[int(rn)] = (ent.get("room_type") or "Raum").strip() or "Raum"
+                            rn_to_name[int(rn)] = (ent.get("room_name") or "Raum").strip() or "Raum"
+                elif isinstance(rs, list):
+                    for i, v in enumerate(rs):
+                        ent = v if isinstance(v, dict) else {}
+                        rn = ent.get("room_number", i)
+                        rn_to_type[int(rn)] = (ent.get("room_type") or "Raum").strip() or "Raum"
+                        rn_to_name[int(rn)] = (ent.get("room_name") or "Raum").strip() or "Raum"
+                # OCR pe 09_interior_annotated.png (cifrele); poligoanele vin din 09_interior.png (curat)
+                interior_annotated_path = raster_dir.parent / "raster_processing" / "walls_from_coords" / "09_interior_annotated.png"
+                img_09 = None
+                if interior_annotated_path.exists():
+                    try:
+                        img_09 = cv2.imread(str(interior_annotated_path), cv2.IMREAD_COLOR)
+                    except Exception:
+                        pass
+                room_types_by_index = []
+                room_names_by_index = []
+                if img_09 is not None and rn_to_type:
+                    ocr_ok_count = 0
+                    for i in range(len(polygons_09)):
+                        room_num = _read_room_number_ocr(img_09, polygons_09[i], req_w, req_h)
+                        if room_num is not None:
+                            ocr_ok_count += 1
+                        rt = rn_to_type.get(room_num, "Raum") if room_num is not None else "Raum"
+                        rn_name = rn_to_name.get(room_num, "Raum") if room_num is not None else "Raum"
+                        room_types_by_index.append(rt)
+                        room_names_by_index.append(rn_name)
+                    if ocr_ok_count == 0:
+                        room_types_by_index = []
+                        room_names_by_index = []
+                if not room_types_by_index:
+                    # Fallback: asociere după INDEX (poligoane în aceeași ordine ca room_scales)
+                    for i in range(len(polygons_09)):
+                        r = rs.get(str(i)) or rs.get(i)
+                        rt = (r or {}).get("room_type") or "Raum"
+                        rn_name = (r or {}).get("room_name") or "Raum"
+                        room_types_by_index.append(rt.strip() if isinstance(rt, str) else "Raum")
+                        room_names_by_index.append(rn_name.strip() if isinstance(rn_name, str) else "Raum")
+                if not room_types_by_index:
+                    max_i = max((int(k) for k in rs.keys() if str(k).isdigit()), default=-1) + 1
+                    room_types_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_type", "Raum") for i in range(max_i)]
+                    room_names_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_name", "Raum") for i in range(max_i)]
+            else:
+                if rs:
+                    max_i = max((int(k) for k in rs.keys() if str(k).isdigit()), default=-1) + 1
+                    room_types_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_type", "Raum") for i in range(max_i)]
+                    room_names_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_name", "Raum") for i in range(max_i)]
+        for idx, pts_np in enumerate(polygons_09):
+            if pts_np is None or len(pts_np) < 3:
+                continue
+            pts = [[int(pts_np[i][0][0]), int(pts_np[i][0][1])] for i in range(len(pts_np))]
+            room_type = room_types_by_index[idx] if idx < len(room_types_by_index) else "Raum"
+            room_name = room_names_by_index[idx] if idx < len(room_names_by_index) else "Raum"
+            if not isinstance(room_type, str) or not room_type.strip():
+                room_type = "Raum"
+            if not isinstance(room_name, str) or not room_name.strip():
+                room_name = "Raum"
+            rooms.append({"points": pts, "roomType": room_type.strip() or "Raum", "roomName": room_name.strip() or "Raum"})
+        doors: List[dict] = []
+        response_path = raster_dir / "response.json"
+        doors_types_path = raster_dir / "doors_types.json"
+        data: dict = {}
+        if response_path.exists():
+            with open(response_path, "r", encoding="utf-8") as f:
+                data = json.load(f).get("data", {})
+        ox, oy = offset_xy
+        if not rooms and data.get("rooms"):
+            if not room_types_by_index:
+                room_scales_path = raster_dir.parent / "raster_processing" / "walls_from_coords" / "room_scales.json"
+                if room_scales_path.exists():
+                    try:
+                        with open(room_scales_path, "r", encoding="utf-8") as f:
+                            data_rs = json.load(f)
+                        rs = data_rs.get("room_scales") or data_rs.get("rooms") or {}
+                        if rs:
+                            max_i = max((int(k) for k in rs.keys() if str(k).isdigit()), default=-1) + 1
+                            room_types_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_type", "Raum") for i in range(max_i)]
+                            room_names_by_index = [(rs.get(str(i)) or rs.get(i) or {}).get("room_name", "Raum") for i in range(max_i)]
+                    except Exception:
+                        pass
+            for idx, room in enumerate(data["rooms"]):
+                pts = []
+                for p in room:
+                    if isinstance(p, dict) and "x" in p and "y" in p:
+                        pts.append([int(p["x"]) + ox, int(p["y"]) + oy])
+                if len(pts) >= 3:
+                    room_type = room_types_by_index[idx] if idx < len(room_types_by_index) else "Raum"
+                    room_name = room_names_by_index[idx] if idx < len(room_names_by_index) else "Raum"
+                    if not isinstance(room_type, str):
+                        room_type = "Raum"
+                    if not isinstance(room_name, str):
+                        room_name = "Raum"
+                    rooms.append({"points": pts, "roomType": room_type, "roomName": room_name})
+        doors_types_list: List[dict] = []
+        if doors_types_path.exists():
+            try:
+                with open(doors_types_path, "r", encoding="utf-8") as f:
+                    doors_types_list = json.load(f)
+            except Exception:
+                pass
+        for idx, door in enumerate(data.get("doors") or []):
+            if "bbox" not in door or len(door["bbox"]) != 4:
+                continue
+            x1, y1, x2, y2 = door["bbox"]
+            x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+            # Prioritate: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed/count_objects)
+            type_str = _door_type_from_response_or_fallback(door, idx, doors_types_list)
+            if type_str == "door":
+                width = abs(x2 - x1)
+                height = abs(y2 - y1)
+                if height > 0:
+                    aspect = width / height
+                    if aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT):
+                        type_str = "window"
+            doors.append({"bbox": [int(x1), int(y1), int(x2), int(y2)], "type": type_str})
+        payload = {"imageWidth": req_w, "imageHeight": req_h, "rooms": rooms, "doors": doors}
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"      ⚠️ detections_review_data.json: {e}")
+
+
+def apply_detections_edited(raster_dir: Path) -> bool:
+    """
+    Aplică modificările din editor (detections_edited.json) în response.json și doors_types.json.
+    Coordonatele din editor sunt în același spațiu ca imaginea de review (request space).
+    După aplicare, trebuie re-rulat phase 2 (Cubicasa) pentru a regenera room_scales și openings.
+    Phase 2 folosește cache-ul brute_force_best_config.json – nu se rerulează brute force-ul.
+    Returnează True dacă s-a aplicat ceva, False dacă nu există detections_edited.json.
+    """
+    edited_path = raster_dir / "detections_edited.json"
+    if not edited_path.exists():
+        return False
+    response_path = raster_dir / "response.json"
+    if not response_path.exists():
+        print(f"      ⚠️ apply_detections_edited: response.json lipsește în {raster_dir}")
+        return False
+    try:
+        with open(edited_path, "r", encoding="utf-8") as f:
+            edited = json.load(f)
+        rooms_raw = edited.get("rooms") or []
+        doors_raw = edited.get("doors") or []
+
+        with open(response_path, "r", encoding="utf-8") as f:
+            response = json.load(f)
+        data = response.get("data") or response
+        if not isinstance(data, dict):
+            data = {}
+
+        # Format response.json: rooms = list of list of {x, y}; doors = list of {bbox}
+        data["rooms"] = []
+        for room in rooms_raw:
+            pts = room.get("points") or []
+            if len(pts) >= 3:
+                data["rooms"].append([{"x": int(p[0]), "y": int(p[1])} for p in pts])
+
+        data["doors"] = []
+        for d in doors_raw:
+            bbox = d.get("bbox")
+            if bbox and len(bbox) == 4:
+                data["doors"].append({"bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]})
+
+        if "data" not in response:
+            response = {"data": data}
+        else:
+            response["data"] = data
+        with open(response_path, "w", encoding="utf-8") as f:
+            json.dump(response, f, indent=2)
+        print(f"      💾 Aplicat detections_edited: {len(data['rooms'])} camere, {len(data['doors'])} uși/geamuri → response.json")
+
+        room_types_list = [str(r.get("roomType") or "Raum").strip() or "Raum" for r in rooms_raw]
+        if room_types_list:
+            room_types_path = raster_dir / "room_types.json"
+            with open(room_types_path, "w", encoding="utf-8") as f:
+                json.dump(room_types_list, f, ensure_ascii=False)
+
+        types_path = raster_dir / "doors_types.json"
+        types_list = [{"type": str(d.get("type", "door")).lower()} for d in doors_raw]
+        if types_list:
+            with open(types_path, "w", encoding="utf-8") as f:
+                json.dump(types_list, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"      ⚠️ apply_detections_edited: {e}")
+        return False
+
+
+# Alpha pentru fill transparent (camere, uși, geamuri)
+_FILL_ALPHA = 0.35
+# Culori BGR: uși vs geamuri (contur + fill deschis)
+_COLOR_DOOR_BORDER = (0, 160, 0)   # verde
+_COLOR_DOOR_FILL = (100, 220, 100)
+_COLOR_WINDOW_BORDER = (255, 140, 0)  # albastru
+_COLOR_WINDOW_FILL = (200, 200, 255)
+
+
+def _draw_response_overlay(
+    base_img: np.ndarray,
+    raster_dir: Path,
+    out_path: Path,
+    *,
+    draw_rooms: bool = True,
+    draw_doors: bool = True,
+    draw_walls: bool = True,
+    offset_xy: Tuple[int, int] = (0, 0),
+) -> bool:
+    """Desenează rooms/doors/walls din response.json pe base_img (fill transparent, contur).
+    offset_xy: (tx, ty) adăugat la toate coordonatele (pentru aliniere cu masca Raster la translația brute force).
+    """
+    response_path = raster_dir / "response.json"
+    if not response_path.exists():
+        return False
+    with open(response_path, "r", encoding="utf-8") as f:
+        result = json.load(f)
+    data = result.get("data", result)
+    # Tipuri uși/geamuri: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed)
+    doors_types_list = []
+    doors_types_path = raster_dir / "doors_types.json"
+    if doors_types_path.exists():
+        try:
+            with open(doors_types_path, "r", encoding="utf-8") as f:
+                doors_types_list = json.load(f)
+        except Exception:
+            pass
+    overlay = base_img.copy()
+    h, w = overlay.shape[:2]
+    ox, oy = offset_xy
+
+    def pt(x: float, y: float):
+        return (int(round(x + ox)), int(round(y + oy)))
+
+    # Culoare distinctă per cameră (BGR) din HSV
+    def _room_color(i: int):
+        import colorsys
+        n = 48
+        h = (i * 137) % n / n
+        r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+        return (int(b * 255), int(g * 255), int(r * 255))
+
+    if draw_walls and "walls" in data and data["walls"]:
+        for wall in data["walls"]:
+            pos = wall.get("position")
+            if pos and len(pos) >= 2:
+                p1, p2 = pos[0], pos[1]
+                x1, y1 = (p1["x"], p1["y"]) if isinstance(p1, dict) else (p1[0], p1[1])
+                x2, y2 = (p2["x"], p2["y"]) if isinstance(p2, dict) else (p2[0], p2[1])
+                cv2.line(overlay, pt(x1, y1), pt(x2, y2), (0, 255, 0), 3)
+
+    if draw_rooms and "rooms" in data and data["rooms"]:
+        for i, room in enumerate(data["rooms"]):
+            pts = []
+            for point in room:
+                if "x" in point and "y" in point:
+                    pts.append(pt(point["x"], point["y"]))
+            if len(pts) >= 3:
+                pts_np = np.array(pts, dtype=np.int32)
+                color = _room_color(i)
+                fill_layer = overlay.copy()
+                cv2.fillPoly(fill_layer, [pts_np], color)
+                overlay = cv2.addWeighted(fill_layer, _FILL_ALPHA, overlay, 1.0 - _FILL_ALPHA, 0).astype(np.uint8)
+                cv2.polylines(overlay, [pts_np], True, color, 2)
+                if pts:
+                    cx = sum(p[0] for p in pts) // len(pts)
+                    cy = sum(p[1] for p in pts) // len(pts)
+                    cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    if draw_doors and "doors" in data and data["doors"]:
+        for door_idx, door in enumerate(data["doors"]):
+            if "bbox" in door and len(door["bbox"]) != 4:
+                continue
+            x1, y1, x2, y2 = map(int, door["bbox"])
+            x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+            if x2 <= x1 or y2 <= y1:
+                continue
+            # Prioritate: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed/count_objects)
+            type_str = _door_type_from_response_or_fallback(door, door_idx, doors_types_list)
+            is_window = type_str == "window"
+            if not is_window and type_str == "door":
+                width = x2 - x1
+                height = y2 - y1
+                aspect = width / max(1, height)
+                if aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT):
+                    is_window = True
+            if is_window:
+                border_color = _COLOR_WINDOW_BORDER
+                fill_color = _COLOR_WINDOW_FILL
+                label = "W"
+            else:
+                border_color = _COLOR_DOOR_BORDER
+                fill_color = _COLOR_DOOR_FILL
+                label = "D"
+            fill_layer = overlay.copy()
+            cv2.rectangle(fill_layer, (x1, y1), (x2, y2), fill_color, -1)
+            overlay = cv2.addWeighted(fill_layer, _FILL_ALPHA, overlay, 1.0 - _FILL_ALPHA, 0).astype(np.uint8)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), border_color, 2)
+            cv2.putText(overlay, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, border_color, 1)
+
+    return cv2.imwrite(str(out_path), overlay)
+
+
 def save_overlay_on_request_image(raster_dir: Path) -> bool:
     """
     Desenează pereți, camere și uși din response.json pe imaginea cu scale-down care se trimite la Raster.
@@ -371,59 +1056,7 @@ def save_overlay_on_request_image(raster_dir: Path) -> bool:
             request_img = cv2.imread(str(raster_dir / "input_resized.jpg"))
         if request_img is None:
             return False
-        response_path = raster_dir / "response.json"
-        if not response_path.exists():
-            return False
-        with open(response_path, "r", encoding="utf-8") as f:
-            result = json.load(f)
-        data = result.get("data", result)
-        h_req, w_req = request_img.shape[:2]
-        overlay = request_img.copy()
-
-        def pt(x: float, y: float):
-            return (int(round(x)), int(round(y)))
-
-        colors_rooms = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-
-        # Pereți (segmente) – desenați primii, sub camere
-        if "walls" in data and data["walls"]:
-            for wall in data["walls"]:
-                pos = wall.get("position")
-                if pos and len(pos) >= 2:
-                    p1 = pos[0]
-                    p2 = pos[1]
-                    x1, y1 = (p1["x"], p1["y"]) if isinstance(p1, dict) else (p1[0], p1[1])
-                    x2, y2 = (p2["x"], p2["y"]) if isinstance(p2, dict) else (p2[0], p2[1])
-                    cv2.line(overlay, pt(x1, y1), pt(x2, y2), (0, 255, 0), 3)
-
-        # Camere (poligoane)
-        if "rooms" in data and data["rooms"]:
-            for i, room in enumerate(data["rooms"]):
-                pts = []
-                for point in room:
-                    if "x" in point and "y" in point:
-                        pts.append(pt(point["x"], point["y"]))
-                if len(pts) >= 3:
-                    pts_np = np.array(pts, dtype=np.int32)
-                    color = colors_rooms[i % len(colors_rooms)]
-                    cv2.polylines(overlay, [pts_np], True, color, 2)
-                    if pts:
-                        cx = sum(p[0] for p in pts) // len(pts)
-                        cy = sum(p[1] for p in pts) // len(pts)
-                        cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-        # Uși (bbox)
-        if "doors" in data and data["doors"]:
-            for door in data["doors"]:
-                if "bbox" in door and len(door["bbox"]) == 4:
-                    x1, y1, x2, y2 = map(int, door["bbox"])
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 165, 255), 2)
-                    cv2.putText(overlay, "D", (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1)
-
-        out_path = raster_dir / "overlay_on_request.png"
-        if not cv2.imwrite(str(out_path), overlay):
-            return False
-        return True
+        return _draw_response_overlay(request_img, raster_dir, raster_dir / "overlay_on_request.png")
     except Exception as e:
         print(f"      ⚠️ overlay_on_request: {e}")
         return False
@@ -699,12 +1332,77 @@ def build_aligned_api_walls_1px_original(
         return None
 
 
+# Tipuri considerate fereastră (Raster / Gemini / editor) – aceeași logică ca în count_objects (detections_all: type = door/window)
+_DOOR_TYPE_WINDOW = ("window", "fenster", "geam")
+_DOOR_TYPE_OTHER = ("garage_door", "stairs")
+
+# Euristică aspect pentru Raster (când nu avem type din API sau Gemini): bandă lată sau îngustă → fereastră (ca în raster_processing)
+_ASPECT_WINDOW_MIN = 2.5   # aspect > 2.5 → window
+_ASPECT_BAND_WIDTH, _ASPECT_BAND_HEIGHT = 60, 30  # width > 60 and height < 30 → window
+
+
+def _door_type_from_response_or_fallback(
+    door: dict,
+    door_idx: int,
+    doors_types_list: List[dict],
+) -> str:
+    """
+    Ordine prioritate: 1) Raster JSON (door.type/class), 2) doors_types.json (Gemini), 3) "door".
+    Euristica aspect (bandă lată/îngustă → window) se aplică la caller.
+    """
+    # 1) Răspunsul de la Raster – dacă API-ul trimite type/class în JSON
+    from_api = str(door.get("type") or door.get("class") or "").strip().lower()
+    if from_api in ("door", "window", "fenster", "geam", "garage_door", "stairs"):
+        return "window" if from_api in _DOOR_TYPE_WINDOW else from_api
+    # 2) doors_types.json (Gemini)
+    if door_idx < len(doors_types_list) and isinstance(doors_types_list[door_idx], dict):
+        t = str(doors_types_list[door_idx].get("type", "door")).strip().lower()
+        if t in ("door", "window", "fenster", "geam", "garage_door", "stairs"):
+            return "window" if t in _DOOR_TYPE_WINDOW else t
+    return "door"
+
+
+def _get_door_types_for_drawing(raster_dir: Path, data: dict) -> List[bool]:
+    """
+    Returnează o listă is_window[i] pentru fiecare door din data['doors'].
+    Prioritate: 1) Raster JSON (type/class), 2) doors_types.json (Gemini), 3) euristică aspect (ca în count_objects / livefeed).
+    """
+    doors = data.get("doors") or []
+    if not doors:
+        return []
+    doors_types_list: List[dict] = []
+    doors_types_path = raster_dir / "doors_types.json"
+    if doors_types_path.exists():
+        try:
+            with open(doors_types_path, "r", encoding="utf-8") as f:
+                doors_types_list = json.load(f)
+        except Exception:
+            pass
+    result: List[bool] = []
+    for idx, door in enumerate(doors):
+        if "bbox" not in door or len(door["bbox"]) != 4:
+            result.append(False)
+            continue
+        x1, y1, x2, y2 = door["bbox"]
+        width = abs(x2 - x1)
+        height = abs(y2 - y1)
+        type_str = _door_type_from_response_or_fallback(door, idx, doors_types_list)
+        is_window = type_str == "window"
+        if not is_window and type_str == "door":
+            aspect = width / max(1, height)
+            if aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT):
+                is_window = True
+        result.append(is_window)
+    return result
+
+
 def save_overlay_on_original_from_response(
     raster_dir: Path,
     original_img: np.ndarray,
 ) -> bool:
     """
     Desenează camere și uși din response.json pe imaginea originală (full size) și salvează overlay_on_original.png.
+    Folosește doors_types.json (Gemini) când există pentru diferențiere ușă/geam; altfel euristică aspect.
     Coordonatele din JSON sunt în spațiul imaginii trimise la API; le scalăm la dimensiunea originală
     folosind raster_request_info.json (fără brute force / aliniere).
 
@@ -759,24 +1457,104 @@ def save_overlay_on_original_from_response(
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3,
                         )
 
+        door_is_window_list = _get_door_types_for_drawing(raster_dir, data)
         if "doors" in data and data["doors"]:
-            for door in data["doors"]:
+            for door_idx, door in enumerate(data["doors"]):
                 if "bbox" in door and len(door["bbox"]) == 4:
                     x1, y1, x2, y2 = door["bbox"]
                     ox1, oy1 = to_orig(x1, y1)
                     ox2, oy2 = to_orig(x2, y2)
                     ox1, ox2 = max(0, min(ox1, w_orig)), max(0, min(ox2, w_orig))
                     oy1, oy2 = max(0, min(oy1, h_orig)), max(0, min(oy2, h_orig))
-                    cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), (0, 165, 255), 3)
+                    is_window = door_idx < len(door_is_window_list) and door_is_window_list[door_idx]
+                    if is_window:
+                        color = (255, 120, 0)  # BGR albastru
+                        label = "Window"
+                    else:
+                        color = (0, 165, 255)  # BGR portocaliu
+                        label = "Door"
+                    cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), color, 3)
                     cv2.putText(
-                        overlay, "Door", (ox1, oy1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2,
+                        overlay, label, (ox1, oy1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
                     )
 
         out_path = raster_dir / "overlay_on_original.png"
         cv2.imwrite(str(out_path), overlay)
         return True
     except Exception:
+        return False
+
+
+def regenerate_doors_and_overlay_from_doors_types(raster_dir: Path, original_img: np.ndarray) -> bool:
+    """
+    După ce raster_processing a scris doors_types.json (Gemini), regenerează doors.png și
+    overlay_on_original.png folosind tipurile din Gemini + euristică. Apelat din raster_processing
+    la sfârșitul pasului de deschideri.
+    Returns True dacă s-au regenerat fișierele.
+    """
+    try:
+        response_path = raster_dir / "response.json"
+        request_info_path = raster_dir / "raster_request_info.json"
+        doors_types_path = raster_dir / "doors_types.json"
+        if not response_path.exists() or not request_info_path.exists() or not doors_types_path.exists():
+            return False
+        with open(response_path, "r", encoding="utf-8") as f:
+            result = json.load(f)
+        with open(request_info_path, "r", encoding="utf-8") as f:
+            ri = json.load(f)
+        data = result.get("data", result)
+        doors = data.get("doors") or []
+        if not doors:
+            return False
+        req_w = int(ri.get("request_w") or 1)
+        req_h = int(ri.get("request_h") or 1)
+        orig_h, orig_w = original_img.shape[:2]
+        scale_x = orig_w / max(1, req_w)
+        scale_y = orig_h / max(1, req_h)
+
+        door_is_window_list = _get_door_types_for_drawing(raster_dir, data)
+
+        # doors.png în spațiul request (req_w x req_h)
+        doors_img = np.zeros((req_h, req_w, 3), dtype=np.uint8)
+        doors_img.fill(255)
+        for idx, door in enumerate(doors):
+            if "bbox" not in door or len(door["bbox"]) != 4:
+                continue
+            x1, y1, x2, y2 = map(int, door["bbox"])
+            is_window = door_is_window_list[idx] if idx < len(door_is_window_list) else False
+            if is_window:
+                color_fill, color_border = (200, 220, 255), (150, 180, 220)
+                label = "Window"
+            else:
+                color_fill, color_border = (0, 150, 255), (0, 100, 200)
+                label = "Door"
+            cv2.rectangle(doors_img, (x1, y1), (x2, y2), color_fill, -1)
+            cv2.rectangle(doors_img, (x1, y1), (x2, y2), color_border, 2)
+            cv2.putText(doors_img, label, (x1, y1 - 5 if y1 > 20 else y2 + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 150), 1)
+        cv2.imwrite(str(raster_dir / "doors.png"), doors_img)
+
+        # overlay_on_original.png
+        overlay = original_img.copy()
+        for idx, door in enumerate(doors):
+            if "bbox" not in door or len(door["bbox"]) != 4:
+                continue
+            x1, y1, x2, y2 = door["bbox"]
+            ox1 = int(round(x1 * scale_x))
+            oy1 = int(round(y1 * scale_y))
+            ox2 = int(round(x2 * scale_x))
+            oy2 = int(round(y2 * scale_y))
+            is_window = door_is_window_list[idx] if idx < len(door_is_window_list) else False
+            color = (255, 120, 0) if is_window else (0, 165, 255)
+            label = "Window" if is_window else "Door"
+            cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), color, 3)
+            cv2.putText(overlay, label, (ox1, oy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.imwrite(str(raster_dir / "overlay_on_original.png"), overlay)
+        print(f"      📄 Regenerat doors.png și overlay_on_original.png (tipuri din Gemini)")
+        return True
+    except Exception as e:
+        print(f"      ⚠️ regenerate_doors_and_overlay_from_doors_types: {e}")
         return False
 
 
@@ -862,7 +1640,8 @@ def generate_raster_images(api_result: Dict[str, Any], original_img: np.ndarray,
         cv2.imwrite(str(rooms_path), rooms_img)
         print(f"      📄 Salvat: {rooms_path.name} ({len(data['rooms'])} camere)")
     
-    # 3. Imagine cu deschiderile (uși/ferestre)
+    # 3. Imagine cu deschiderile (uși/ferestre) – folosim doors_types.json (Gemini) când există
+    door_is_window_list = _get_door_types_for_drawing(raster_dir, data)
     if 'doors' in data and data['doors']:
         doors_img = np.zeros((raster_h, raster_w, 3), dtype=np.uint8)
         doors_img.fill(255)
@@ -872,9 +1651,13 @@ def generate_raster_images(api_result: Dict[str, Any], original_img: np.ndarray,
                 x1, y1, x2, y2 = map(int, door['bbox'])
                 width = x2 - x1
                 height = y2 - y1
-                
-                aspect = width / max(1, height)
-                if aspect > 2.5 or (width > 60 and height < 30):
+                is_window = False
+                if door_is_window_list and idx < len(door_is_window_list):
+                    is_window = door_is_window_list[idx]
+                else:
+                    aspect = width / max(1, height)
+                    is_window = aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT)
+                if is_window:
                     label = "Window"
                     color_fill = (200, 220, 255)
                     color_border = (150, 180, 220)
@@ -967,22 +1750,25 @@ def generate_raster_images(api_result: Dict[str, Any], original_img: np.ndarray,
                 cv2.polylines(overlay_img, [pts], True, (0, 0, 255), 2)
     
     if 'doors' in data and data['doors']:
-        for door in data['doors']:
+        for door_idx, door in enumerate(data['doors']):
             if 'bbox' in door and len(door['bbox']) == 4:
                 x1, y1, x2, y2 = door['bbox']
                 ox1, oy1 = scale_coord(x1, y1, for_original=True)
                 ox2, oy2 = scale_coord(x2, y2, for_original=True)
-                
                 width = abs(ox2 - ox1)
                 height = abs(oy2 - oy1)
-                aspect = width / max(1, height)
-                if aspect > 2.5 or (width > 60 and height < 30):
+                is_window = False
+                if door_is_window_list and door_idx < len(door_is_window_list):
+                    is_window = door_is_window_list[door_idx]
+                else:
+                    aspect = width / max(1, height)
+                    is_window = aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT)
+                if is_window:
                     label = "Win"
                     color = (220, 180, 0)
                 else:
                     label = "Door"
                     color = (255, 100, 0)
-                
                 cv2.rectangle(overlay_img, (ox1, oy1), (ox2, oy2), color, 2)
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 cv2.putText(overlay_img, label, (ox1, oy1 - 5 if oy1 > 20 else oy2 + 15),

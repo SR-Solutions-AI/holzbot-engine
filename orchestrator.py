@@ -37,6 +37,7 @@ from segmenter.jobs import run_segmentation_for_documents, get_all_classificatio
 from floor_classifier import run_floor_classification, FloorClassificationResult
 from detections.jobs import run_detections_for_run
 from cubicasa_detector.jobs import run_cubicasa_phase1, run_cubicasa_phase2
+from cubicasa_detector.raster_api import save_detections_review_image, apply_detections_edited
 from scale import run_scale_detection_for_run
 from count_objects import run_count_objects_for_run
 from roof.jobs import run_roof_for_run
@@ -60,6 +61,41 @@ def notify_ui(stage_tag: str, image_path: Path | str | None = None):
             print(f"⚠️ [UI] Image path not found: {abs_path}", flush=True)
     print(msg, flush=True)
     sys.stdout.flush()
+
+
+def notify_ui_batch(stage_tag: str, image_paths: list):
+    """Trimite un singur eveniment cu toate imaginile (pentru afișare în LiveFeed doar când toate planurile sunt gata)."""
+    if not image_paths:
+        return
+    msg = f">>> UI:STAGE:{stage_tag}"
+    for p in image_paths:
+        abs_path = Path(p).resolve()
+        if abs_path.exists():
+            msg += f"|IMG:{str(abs_path)}"
+        else:
+            print(f"⚠️ [UI] Image path not found: {abs_path}", flush=True)
+    print(msg, flush=True)
+    sys.stdout.flush()
+
+
+DETECTIONS_REVIEW_FLAG = "detections_review_approved.flag"
+DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC = 3600
+DETECTIONS_REVIEW_POLL_INTERVAL_SEC = 1.5
+
+
+def _wait_detections_review_approval(job_root: Path) -> None:
+    """Blochează până când API-ul scrie flag-ul de aprobare (utilizatorul a confirmat detecțiile) sau timeout."""
+    flag_path = job_root / DETECTIONS_REVIEW_FLAG
+    if flag_path.exists():
+        return
+    print(f"⏸️ [Pipeline] Aștept confirmarea detecțiilor în UI (max {DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC}s)...", flush=True)
+    deadline = time.time() + DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC
+    while time.time() < deadline:
+        if flag_path.exists():
+            print(f"✅ [Pipeline] Detecții confirmate, continuăm.", flush=True)
+            return
+        time.sleep(DETECTIONS_REVIEW_POLL_INTERVAL_SEC)
+    print(f"⚠️ [Pipeline] Timeout așteptare confirmare detecții; continuăm fără confirmare.", flush=True)
 
 
 def notify_progress(percent: int):
@@ -544,6 +580,72 @@ def run_segmentation_and_classification_for_document(
                 if not raster_scan_failed:
                     for plan in plans:
                         _notify_all_cubicasa_images_for_plan(plan)
+                    # Editor verificare: imagine de bază per plan (fără poligoane); UI desenează poligoanele din API
+                    base_paths: List[Path] = []
+                    def _save_review(plan):
+                        raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                        return save_detections_review_image(raster_dir)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(_save_review, plan) for plan in plans]
+                        for future in futures:
+                            path_base, _path_rooms, _path_doors = future.result()
+                            if path_base:
+                                base_paths.append(path_base)
+                    review_paths = base_paths
+                    if review_paths:
+                        # Etichete etaje (Beci, Parter, Etaj 1, ...) pentru tab-uri în UI
+                        run_dir = get_run_dir(run_id)
+                        order_from_bottom = None
+                        basement_plan_index = None
+                        if (run_dir / "floor_order.json").exists():
+                            try:
+                                fo = json.loads((run_dir / "floor_order.json").read_text(encoding="utf-8"))
+                                order_from_bottom = fo.get("order_from_bottom")
+                            except Exception:
+                                pass
+                        if (run_dir / "basement_plan_id.json").exists():
+                            try:
+                                bp = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+                                basement_plan_index = bp.get("basement_plan_index")
+                            except Exception:
+                                pass
+                        n_plans = len(plans)
+                        if order_from_bottom is not None and len(order_from_bottom) == n_plans:
+                            labels_from_bottom = []
+                            if basement_plan_index is not None:
+                                labels_from_bottom.append("Keller")
+                            labels_from_bottom.append("Erdgeschoss")
+                            for k in range(1, n_plans - (1 if basement_plan_index is not None else 0)):
+                                labels_from_bottom.append(f"{k}. Obergeschoss")
+                            plan_index_to_label = {order_from_bottom[pos]: labels_from_bottom[pos] for pos in range(n_plans)}
+                            floor_labels = [plan_index_to_label[i] for i in range(n_plans)]
+                            try:
+                                (job_root / "detections_review_floor_labels.json").write_text(
+                                    json.dumps(floor_labels, ensure_ascii=False), encoding="utf-8"
+                                )
+                                print(f"   💾 Etichete etaje pentru UI: {floor_labels}")
+                            except Exception as e:
+                                print(f"   ⚠️ Nu s-a putut scrie detections_review_floor_labels.json: {e}")
+                        notify_ui_batch("detections_review", review_paths)
+                        # Oprește calculele până când utilizatorul confirmă detecțiile în UI (sau timeout)
+                        _wait_detections_review_approval(job_root)
+                        # Aplicăm modificările din editor (camere / uși-ferestre) și re-rulăm Cubicasa phase 2 pentru planurile editate
+                        for plan in plans:
+                            raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                            if apply_detections_edited(raster_dir):
+                                print(f"   🔄 Re-rulare Cubicasa phase 2 pentru {plan.plan_id} (cu camere/uși editate)...", flush=True)
+                                try:
+                                    run_cubicasa_phase2(
+                                        plan.stage_work_dir,
+                                        raster_timings=raster_timings,
+                                        progress_callback=lambda *a: on_raster_tick(),
+                                    )
+                                except Exception as e:
+                                    print(f"   ❌ Eroare la re-rularea phase 2 pentru {plan.plan_id}: {e}", flush=True)
+                                    import traceback
+                                    traceback.print_exc()
+                                    raster_scan_failed = True
+                    # Nu mai trimitem scale_flood, detections, exterior_doors în LiveFeed – doar editorul de verificare
             
             raster_ok, failed_plan_ids = _check_raster_complete(plans)
             if failed_plan_ids:

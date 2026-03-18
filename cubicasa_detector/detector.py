@@ -40,6 +40,7 @@ from .raster_api import (
     run_extra_alignment_methods,
     apply_alignment_and_generate_overlay,
     generate_crop_from_raster,
+    _draw_response_overlay,
 )
 from .wall_repair import (
     repair_house_walls_with_floodfill,
@@ -2229,6 +2230,20 @@ def run_cubicasa_detection(
                     raster_dir = Path(steps_dir) / "raster"
                     raster_dir.mkdir(parents=True, exist_ok=True)
             
+                    # Dimensiuni request (scale-down max 1000px) – pentru imagine fără filtru (editor UI)
+                    MAX_RASTER_SIDE = 1000
+                    h_orig, w_orig = img.shape[:2]
+                    scale_factor = 1.0
+                    if max(h_orig, w_orig) > MAX_RASTER_SIDE:
+                        scale_factor = MAX_RASTER_SIDE / max(h_orig, w_orig)
+                    new_w_api = max(1, int(w_orig * scale_factor))
+                    new_h_api = max(1, int(h_orig * scale_factor))
+                    img_resized_no_filter = cv2.resize(img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
+                    try:
+                        cv2.imwrite(str(raster_dir / "input_resized_no_filter.png"), img_resized_no_filter)
+                    except OSError:
+                        pass
+            
                     # ✅ PREPROCESARE: Ștergem liniile foarte subțiri înainte de trimitere la RasterScan
                     if DEBUG:
                         print(f"      🧹 Preprocesare imagine: eliminare linii subțiri...")
@@ -2266,19 +2281,12 @@ def run_cubicasa_detection(
                         if DEBUG:
                             print(f"      💾 Salvat: {preprocessed_path.name} (preprocesat)")
             
-                    # Scale-down doar pentru trimitere la Raster: max 1000px pe latura lungă
-                    MAX_RASTER_SIDE = 1000
+                    # Scale-down la aceleași dimensiuni ca input_resized_no_filter
                     h_api, w_api = api_img.shape[:2]
-                    scale_factor = 1.0
-                    if max(h_api, w_api) > MAX_RASTER_SIDE:
-                        scale_factor = MAX_RASTER_SIDE / max(h_api, w_api)
-                        new_w_api = max(1, int(w_api * scale_factor))
-                        new_h_api = max(1, int(h_api * scale_factor))
+                    if (w_api, h_api) != (new_w_api, new_h_api):
                         api_img = cv2.resize(api_img, (new_w_api, new_h_api), interpolation=cv2.INTER_AREA)
                         if DEBUG:
                             print(f"      📐 Scale-down pentru Raster (max {MAX_RASTER_SIDE}px): {w_api}x{h_api} -> {new_w_api}x{new_h_api}")
-                    else:
-                        new_w_api, new_h_api = w_api, h_api
 
                     # Salvăm dimensiunile request vs original ca să putem converti coordonatele din JSON (request space) în original
                     request_info_path = raster_dir / "raster_request_info.json"
@@ -2996,6 +3004,35 @@ def run_cubicasa_detection(
                                             overlay_req[y_dst:y_dst+h_c, x_dst:x_dst+w_c, 0] = api_bin[y_src:y_src+h_c, x_src:x_src+w_c]
                                             overlay_req[y_dst:y_dst+h_c, x_dst:x_dst+w_c, 1] = api_bin[y_src:y_src+h_c, x_src:x_src+w_c]
                                         cv2.imwrite(str(brute_steps_dir / "translation_only_overlay.png"), overlay_req)
+                                        # Poza originală (request space) cu skeletul de pereți (masca roșie) suprapus
+                                        base_req = cv2.imread(str(raster_dir / "input_resized_no_filter.png"))
+                                        if base_req is None:
+                                            base_req = cv2.imread(str(raster_dir / "input_resized.jpg"))
+                                        if base_req is None:
+                                            base_req = cv2.imread(str(raster_dir / "raster_request.png"))
+                                        if base_req is not None and base_req.shape[:2] == ref_bin.shape[:2]:
+                                            base_with_skeleton = base_req.copy()
+                                            base_with_skeleton[:, :, 2] = np.where(ref_bin > 0, 255, base_with_skeleton[:, :, 2])
+                                            base_with_skeleton[:, :, 0] = np.where(ref_bin > 0, 0, base_with_skeleton[:, :, 0])
+                                            base_with_skeleton[:, :, 1] = np.where(ref_bin > 0, 0, base_with_skeleton[:, :, 1])
+                                            cv2.imwrite(str(brute_steps_dir / "base_with_walls_skeleton.png"), base_with_skeleton)
+                                            # Plan + masca Raster în albastru la EXACT aceeași poziție ca în translation_only_overlay (tx, ty)
+                                            base_with_blue = base_req.copy()
+                                            if w_c > 0 and h_c > 0:
+                                                api_region = api_bin[y_src:y_src + h_c, x_src:x_src + w_c]
+                                                blue_mask = api_region > 0
+                                                base_with_blue[y_dst:y_dst + h_c, x_dst:x_dst + w_c][blue_mask] = [255, 0, 0]  # BGR blue
+                                            cv2.imwrite(str(brute_steps_dir / "base_with_blue_mask.png"), base_with_blue)
+                                            # Aceeași mască Raster albastră (la (tx,ty)) + poligoanele camerelor și uși/geamuri la aceeași translație
+                                            _draw_response_overlay(
+                                                base_with_blue,
+                                                raster_dir,
+                                                brute_steps_dir / "base_with_blue_and_rooms.png",
+                                                draw_rooms=True,
+                                                draw_doors=True,
+                                                draw_walls=False,
+                                                offset_xy=(tx, ty),
+                                            )
                                         print(f"      📐 Brute force doar translații: (tx, ty) = ({tx}, {ty}), score = {translation_only_config['score']:.2%}")
                 except Exception as e:
                     import traceback

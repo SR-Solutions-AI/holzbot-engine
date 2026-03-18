@@ -572,6 +572,7 @@ def generate_walls_from_room_coordinates(
     h_orig, w_orig = original_img.shape[:2]
     
     # Cale scurtă: mască 1px furnizată (translation-only), fără construire segmente din JSON
+    rooms_from_response = False  # True când camerele vin din response.json (ex.: după edit în UI)
     if initial_walls_mask_1px is not None:
         if initial_walls_mask_1px.shape[:2] != (h_orig, w_orig):
             initial_walls_mask_1px = cv2.resize(
@@ -626,9 +627,29 @@ def generate_walls_from_room_coordinates(
             y_m = (y + ty) * scale_y
             return int(x_m), int(y_m)
 
-        # Construim rooms_polygons din data['rooms'] ca la pasul „metri per pixel” să avem camere de cropat și trimis la Gemini
+        def _touches_border_skip(mask: np.ndarray) -> bool:
+            h_f, w_f = mask.shape[:2]
+            if np.any(mask[0, :] > 0) or np.any(mask[h_f - 1, :] > 0):
+                return True
+            if np.any(mask[:, 0] > 0) or np.any(mask[:, w_f - 1] > 0):
+                return True
+            return False
+
+        # Încarcă response.json în skip path (pentru a detecta camere editate în UI → refacem pereții din ele)
+        response_json_path = raster_dir / "response.json"
+        if response_json_path.exists():
+            try:
+                with open(response_json_path, "r", encoding="utf-8") as f:
+                    result_data = json.load(f)
+                data = result_data.get("data", result_data)
+            except Exception:
+                data = {}
+        else:
+            data = {}
+
         rooms_polygons = []
-        if "rooms" in data and data["rooms"]:
+        # După edit în UI: preferăm camerele din response.json ca să refacem 01_walls_from_coords din noile forme
+        if data.get("rooms"):
             for i, room in enumerate(data["rooms"]):
                 pts_raw = []
                 for point in room:
@@ -640,9 +661,31 @@ def generate_walls_from_room_coordinates(
                 if len(pts_raw) >= 3:
                     rooms_polygons.append(np.array(pts_raw, dtype=np.int32))
             if rooms_polygons:
-                _log(f"      📐 [skip path] {len(rooms_polygons)} camere din Raster response.json pentru room_scales / Gemini")
+                rooms_from_response = True
+                _log(f"      📐 [skip path] {len(rooms_polygons)} camere din response.json (după edit) → refacem pereți + 09_interior")
+        if not rooms_polygons:
+            # Prima dată (fără edit): camere din pereții raster (spațiu liber)
+            free_space = (255 - (initial_walls_mask_1px > 0).astype(np.uint8) * 255).astype(np.uint8)
+            num_labels, labels, _, _ = cv2.connectedComponentsWithStats(free_space, connectivity=4)
+            total_px = h_orig * w_orig
+            for label_id in range(1, num_labels):
+                comp_mask = (labels == label_id).astype(np.uint8) * 255
+                if _touches_border_skip(comp_mask):
+                    continue
+                area = np.count_nonzero(comp_mask)
+                if area < 100:
+                    continue
+                if total_px > 0 and area >= 0.95 * total_px:
+                    continue
+                contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    if len(largest) >= 3:
+                        rooms_polygons.append(largest)
+            if rooms_polygons:
+                _log(f"      📐 [skip path] {len(rooms_polygons)} camere din pereții raster (spațiu liber) → room_scales / Gemini")
             else:
-                _log(f"      ⚠️ [skip path] Raster response nu conține 'rooms' valide sau poligoane cu ≥3 puncte → lista camere goale (crop mai strâns la segmentare poate ajuta)")
+                _log(f"      ⚠️ [skip path] Nici camere din raster, nici din response → lista camere goale")
 
         # Sărim direct la crearea folderului garage (același cod ca mai jos)
         _skip_to_garage = True
@@ -658,11 +701,44 @@ def generate_walls_from_room_coordinates(
             cv2.polylines(rooms_img_skip, [rp], True, (0, 0, 0), 2)
         cv2.imwrite(str(raster_dir / "rooms.png"), rooms_img_skip)
         _log(f"      💾 Salvat: rooms.png ({len(rooms_polygons)} camere, skip path)")
+        # 09_interior.png din aceleași poligoane (spațiu liber raster) ca ordinea să coincidă cu Gemini și editorul
+        if rooms_polygons:
+            interior_img_skip = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+            for rp in rooms_polygons:
+                cv2.fillPoly(interior_img_skip, [rp], [0, 165, 255])
+            cv2.imwrite(str(output_dir / "09_interior.png"), interior_img_skip)
+            _log(f"      💾 Salvat: 09_interior.png (skip path, aceleași camere ca pentru Gemini)")
+        # Poligoanele sunt cele de la rooms (boss); după modificări le folosim pentru walls_from_coords
+        if rooms_from_response and len(rooms_polygons) > 0:
+            # Aceleași poligoane ca în rooms.png (sursă: rooms boss)
+            walls_from_rooms = np.zeros((h_orig, w_orig), dtype=np.uint8)
+            for rp in rooms_polygons:
+                cv2.polylines(walls_from_rooms, [rp], isClosed=True, color=255, thickness=2)
+            _, walls_from_rooms = cv2.threshold(walls_from_rooms, 127, 255, cv2.THRESH_BINARY)
+            # Unim pereții la distanță ≤ 1% (din dim. imagine): dilatare 1% apoi skeleton → un singur perete 1px
+            k = max(3, int(min(h_orig, w_orig) * 0.01))
+            if k % 2 == 0:
+                k += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            walls_from_rooms = cv2.dilate(walls_from_rooms, kernel)
+            from skimage.morphology import skeletonize
+            walls_from_rooms = (skeletonize((walls_from_rooms > 0).astype(bool)).astype(np.uint8)) * 255
+            accepted_wall_segments_mask = walls_from_rooms.copy()
+            walls_mask_validated = walls_from_rooms.copy()
+            walls_overlay_mask = walls_from_rooms.copy()
+            mask_for_coverage = walls_from_rooms.copy()
+            _log(f"      🔄 Mască pereți (01_walls_from_coords) din rooms boss, pereți uniți (1px)")
+            segments_path_skip = output_dir / "01_walls_from_coords.png"
+            cv2.imwrite(str(segments_path_skip), walls_from_rooms)
+            _log(f"      💾 Salvat: 01_walls_from_coords.png (skip path, din camere editate)")
     else:
         _skip_to_garage = False
         _input_is_1px = False
         walls_overlay_path = output_dir / "walls_overlay_on_crop.png"
-    
+
+    if not _skip_to_garage:
+        rooms_from_response = False
+
     if not _skip_to_garage and not walls_overlay_path.exists():
         api_walls_mask_path = raster_dir / "api_walls_mask.png"
         if api_walls_mask_path.exists() and original_img is not None:
@@ -2748,11 +2824,7 @@ def generate_walls_from_room_coordinates(
     _log(f"      💾 Salvat: 10_flood_structure.png")
     _tick()
     
-    # ✅ Notificăm UI cu imaginea de flood fill într-un stage SEPARAT (fără alte imagini),
-    # dar încadrat în aceeași etapă logică de scale.
-    if flood_structure_path.exists():
-        notify_ui("scale_flood", flood_structure_path)
-        _log(f"      📢 Notificat UI pentru 10_flood_structure.png")
+    # ✅ Notificarea UI pentru scale_flood se face în batch din orchestrator după ce toate planurile sunt gata.
     
     # 11. Structura pereților interiori (pixelii albi care nu au vecini cu flood fill) -> 11_interior_structure.png
     _log(f"      🏗️ Generez structura pereților interiori...")
@@ -2778,7 +2850,9 @@ def generate_walls_from_room_coordinates(
     _log(f"      🚪 Procesez deschideri (doors) din RasterScan...")
     openings_dir = output_dir.parent / "openings"
     openings_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # (Filtru flood-fill dezactivat: păstrăm toate ușile/ferestrele din RasterScan.)
+
     # Prompt pentru clasificarea doors - îmbunătățit cu exemple clare
     DOOR_CLASSIFICATION_PROMPT = """Analyze this architectural floor plan image showing a door or window opening.
 
@@ -2851,6 +2925,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             batch_types = call_gemini_doors_batch(paths, gemini_api_key)
 
         for pos, (idx, temp_crop_path, room_name, door_crop, x_min, y_min, x_max, y_max, door_crop_small) in enumerate(door_items):
+            bbox_w = x_max - x_min
+            bbox_h = y_max - y_min
+            aspect = (bbox_w / bbox_h) if bbox_h else 1.0
             door_type = "door"
             if batch_types and pos < len(batch_types):
                 door_type = batch_types[pos]
@@ -2869,6 +2946,10 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                     _log(f"         ⚠️ Eroare clasificare door {idx}: {e}")
             if door_type not in ['door', 'window', 'garage_door', 'stairs']:
                 door_type = 'door'
+            # Euristică: deschideri foarte înguste (bandă) sunt de obicei ferestre
+            if door_type == 'door' and bbox_w > 0 and bbox_h > 0:
+                if aspect < 0.35 or aspect > 2.85:
+                    door_type = 'window'
 
             if Path(temp_crop_path).exists():
                 Path(temp_crop_path).unlink()
@@ -2895,6 +2976,29 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                 'bbox': (x_min, y_min, x_max, y_max),
                 'center': ((x_min + x_max) // 2, (y_min + y_max) // 2)
             })
+    
+    # Salvare tipuri uși/geamuri pentru detections_review – index = poziția în data['doors'] (obligatoriu 1:1)
+    num_doors = len(data.get("doors") or [])
+    if num_doors > 0:
+        doors_types_path = raster_dir / "doors_types.json"
+        try:
+            types_list = [{"type": "door"} for _ in range(num_doors)]
+            for op in openings_list:
+                idx = op.get("idx", -1)
+                if 0 <= idx < num_doors:
+                    types_list[idx] = {"type": op["type"]}
+            with open(doors_types_path, "w", encoding="utf-8") as f:
+                json.dump(types_list, f, indent=2)
+            _log(f"      💾 Salvat: {doors_types_path.name} ({num_doors} deschideri, pentru review UI)")
+            # Regenerăm doors.png și overlay_on_original.png cu tipurile Gemini
+            try:
+                from .raster_api import regenerate_doors_and_overlay_from_doors_types
+                if regenerate_doors_and_overlay_from_doors_types(raster_dir, original_img):
+                    _log(f"      📄 Regenerat doors.png și overlay_on_original.png (tipuri Gemini)")
+            except Exception as e:
+                _log(f"      ⚠️ Regenerare doors/overlay: {e}")
+        except Exception as e:
+            _log(f"      ⚠️ Nu s-a putut scrie {doors_types_path.name}: {e}")
     
     # Generăm 01_openings.png - planul cu toate openings-urile colorate
     if openings_list:
@@ -2924,9 +3028,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         cv2.imwrite(str(openings_img_path), openings_img)
         _log(f"         💾 Salvat: 01_openings.png")
         
-        # Notificare UI pentru detections
-        if openings_img_path.exists():
-            notify_ui("detections", openings_img_path)
+        # Notificarea UI pentru detections se face în batch din orchestrator după ce toate planurile sunt gata.
         
         # Generăm 02_exterior_doors.png - ușile interioare (verde) și exterioare (roșu)
         _log(f"      🎨 Generez 02_exterior_doors.png...")
@@ -2985,9 +3087,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         cv2.imwrite(str(exterior_doors_img_path), exterior_doors_img)
         _log(f"         💾 Salvat: 02_exterior_doors.png")
         
-        # Notificare UI pentru exterior doors
-        if exterior_doors_img_path.exists():
-            notify_ui("exterior_doors", exterior_doors_img_path)
+        # Notificarea UI pentru exterior_doors se face în batch din orchestrator după ce toate planurile sunt gata.
     
     # 14. Suprapunem rooms cu casa și calculăm metri per pixel (păstrăm doar pozele legate de room)
     _log(f"      📏 Calculez metri per pixel pentru fiecare cameră...")
@@ -3072,6 +3172,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         return result_data
     
     # ✅ Regiuni pentru crop + Gemini: folosim 09_interior.png – fiecare zonă portocalie = o cameră.
+    # Mapare etichete: rooms_polygons[i] = camera i → trimitem room_i_crop la Gemini → răspunsul batch[pos]
+    # corespunde aceluiași i (valid_entries conține (idx, (i, ...)) în ordine). Eticheta Gemini se aplică
+    # la room_scales[i]['room_type']. Ordinea trebuie identică: 09_interior, rooms_polygons, batch, room_scales.
     # Încărcăm fișierul 09_interior.png și extragem toate componentele portocalii (exact ce vede utilizatorul).
     def _touches_image_border(comp_mask: np.ndarray, h_f: int, w_f: int) -> bool:
         if np.any(comp_mask[0, :] > 0) or np.any(comp_mask[h_f - 1, :] > 0):
@@ -3082,7 +3185,8 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
 
     room_region_polygons = []
     interior_png_path = output_dir / "09_interior.png"
-    if interior_png_path.exists():
+    # Când camerele vin din response.json (ex. după edit în UI), nu suprascriem cu 09_interior.png vechi
+    if not rooms_from_response and interior_png_path.exists():
         try:
             img_09 = cv2.imread(str(interior_png_path), cv2.IMREAD_COLOR)
             if img_09 is not None and img_09.shape[:2] == (h_orig, w_orig):
@@ -3114,8 +3218,8 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         except Exception as e:
             _log(f"      ⚠️ [09_interior.png] Eroare la citire/componente: {e}, încerc fallback interior_mask")
     
-    # Fallback: masca interior din memorie (interior_mask) – aceeași logică ca înainte
-    if not room_region_polygons:
+    # Fallback: masca interior din memorie (interior_mask) – aceeași logică ca înainte (nu când avem camere din response)
+    if not rooms_from_response and not room_region_polygons:
         try:
             im = interior_mask
             if im is not None and im.ndim >= 2:
@@ -3146,7 +3250,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         except Exception as e:
             _log(f"      ⚠️ [09_interior fallback] Eroare: {e}")
 
-    if not room_region_polygons and accepted_wall_segments_mask is not None:
+    if not rooms_from_response and not room_region_polygons and accepted_wall_segments_mask is not None:
         wall_for_free = accepted_wall_segments_mask
         if wall_for_free.ndim == 3:
             wall_for_free = cv2.cvtColor(wall_for_free, cv2.COLOR_BGR2GRAY)
@@ -3172,6 +3276,35 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         if room_region_polygons:
             rooms_polygons = room_region_polygons
             _log(f"      📐 [flood-fill regiuni] {len(rooms_polygons)} zone închise (nu ating marginea) → crop + Gemini")
+
+    # Numerotare camere pe o COPIE 09_interior_annotated.png (09_interior rămâne curat pentru extragere poligoane)
+    if len(rooms_polygons) > 0 and interior_png_path.exists():
+        try:
+            img_09_clean = cv2.imread(str(interior_png_path), cv2.IMREAD_COLOR)
+            if img_09_clean is not None and img_09_clean.shape[:2] == (h_orig, w_orig):
+                img_09_annotated = img_09_clean.copy()
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                for idx, poly in enumerate(rooms_polygons):
+                    M = cv2.moments(np.asarray(poly, dtype=np.float32))
+                    if M["m00"] and M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        label = str(idx)
+                        scale = max(1.2, min(3.0, h_orig / 400))
+                        thick = max(2, int(scale * 2))
+                        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+                        x1 = max(0, cx - tw // 2 - 8)
+                        y1 = max(0, cy - th // 2 - 8)
+                        x2 = min(w_orig, cx + tw // 2 + 8)
+                        y2 = min(h_orig, cy + th // 2 + 8)
+                        cv2.rectangle(img_09_annotated, (x1, y1), (x2, y2), (0, 0, 0), -1)
+                        cv2.rectangle(img_09_annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                        cv2.putText(img_09_annotated, label, (x1 + 4, y2 - 4), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+                interior_annotated_path = output_dir / "09_interior_annotated.png"
+                cv2.imwrite(str(interior_annotated_path), img_09_annotated)
+                _log(f"      🔢 Numerotat 09_interior_annotated.png: {len(rooms_polygons)} camere (0..{len(rooms_polygons)-1}); 09_interior.png rămâne curat")
+        except Exception as e:
+            _log(f"      ⚠️ Numerotare 09_interior_annotated: {e}")
 
     # Procesăm camerele în paralel (mereu din rooms_polygons = regiuni flood-fill când avem mască)
     room_tasks = []
@@ -3254,14 +3387,28 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
 
         valid_entries = [(idx, t) for idx, t in enumerate(ordered_crop_results) if t is not None]
         paths = [t[4] for _, t in valid_entries]
-        # Copii redimensionate (max 512px) pentru batch Gemini – payload mai mic, răspuns mai rapid
+        # Copii cu area_px desenat în colț (pentru asociere label după răspuns Gemini), apoi redimensionate (max 512px) pentru batch
         paths_for_batch = []
         MAX_BATCH_CROP_PX = 512
         for (idx, t) in valid_entries:
             i, room_area_px, room_mask_crop, room_crop, crop_path = t
             img = cv2.imread(str(crop_path))
             if img is not None:
+                # area_px + room_no (același număr ca pe 09_interior) – Gemini returnează room_number pentru asociere OCR
+                label1 = f"area_px:{int(room_area_px)}"
+                label2 = f"room_no:{i}"
                 h_c, w_c = img.shape[:2]
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = max(0.4, min(1.2, w_c / 400))
+                thick = max(1, int(scale * 2))
+                (tw1, th1), _ = cv2.getTextSize(label1, font, scale, thick)
+                (tw2, th2), _ = cv2.getTextSize(label2, font, scale, thick)
+                x0, y0 = 8, 20 + th1
+                cv2.rectangle(img, (x0 - 2, y0 - th1 - 2), (x0 + max(tw1, tw2) + 2, y0 + 2), (0, 0, 0), -1)
+                cv2.putText(img, label1, (x0, y0), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+                y0 += th1 + 4
+                cv2.rectangle(img, (x0 - 2, y0 - th2 - 2), (x0 + tw2 + 2, y0 + 2), (0, 0, 0), -1)
+                cv2.putText(img, label2, (x0, y0), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
                 if max(h_c, w_c) > MAX_BATCH_CROP_PX:
                     scale_b = MAX_BATCH_CROP_PX / max(h_c, w_c)
                     w_b = max(1, int(round(w_c * scale_b)))
@@ -3300,13 +3447,33 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                         area_m2 = 0.0
                     if area_m2 > 0:
                         room_name = r.get('room_name') or f'Room_{i}'
+                        room_type = r.get('room_type') or 'Raum'
+                        room_number = r.get('room_number')
+                        if room_number is not None:
+                            try:
+                                room_number = int(room_number)
+                            except (TypeError, ValueError):
+                                room_number = i
+                        else:
+                            room_number = i
+                        # area_px din răspunsul Gemini (numărul din colț) pentru asociere; room_number pentru match OCR pe 09_interior
+                        area_px_from_gemini = r.get('area_px')
+                        if area_px_from_gemini is not None:
+                            try:
+                                area_px_stored = int(area_px_from_gemini)
+                            except (TypeError, ValueError):
+                                area_px_stored = int(room_area_px)
+                        else:
+                            area_px_stored = int(room_area_px)
                         cv2.imwrite(str(output_dir / f"room_{i}_crop.png"), room_crop)
                         cv2.imwrite(str(output_dir / f"room_{i}_mask.png"), room_mask_crop)
                         m_px_room = float(np.sqrt(area_m2 / room_area_px)) if room_area_px > 0 else None
                         room_scales[i] = {
+                            'room_number': room_number,
                             'room_name': room_name,
+                            'room_type': room_type,
                             'area_m2': area_m2,
-                            'area_px': int(room_area_px),
+                            'area_px': area_px_stored,
                             'm_px': m_px_room,
                             'crop_image': f'room_{i}_crop.png',
                         }
@@ -3318,7 +3485,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                 batch_failed_entries.append((i, room_area_px, room_mask_crop, room_crop, crop_path))
                 area_px_est = int(room_area_px) if room_area_px else (int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0)
                 room_scales[i] = {
+                    'room_number': i,
                     'room_name': f'Room_{i} (gemini_failed)',
+                    'room_type': 'Raum',
                     'area_m2': 0.0,
                     'area_px': area_px_est,
                     'm_px': None,
@@ -3340,7 +3509,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                         ar_m2, ar_px = result['area_m2'], result['area_px']
                         m_px_room = float(np.sqrt(ar_m2 / ar_px)) if ar_px > 0 else None
                         room_scales[i] = {
+                            'room_number': int(result.get('room_number', i)),
                             'room_name': result['room_name'],
+                            'room_type': result.get('room_type') or 'Raum',
                             'area_m2': ar_m2,
                             'area_px': int(ar_px),
                             'm_px': m_px_room,
@@ -3362,7 +3533,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             if ordered_crop_results[idx] is None and i not in room_scales:
                 area_px_est = int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0
                 room_scales[i] = {
+                    'room_number': i,
                     'room_name': f'Room_{i} (crop_failed - nu trimis la Gemini)',
+                    'room_type': 'Raum',
                     'area_m2': 0.0,
                     'area_px': area_px_est,
                     'm_px': None,
@@ -3373,7 +3546,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
 
         for i in sorted(overlap_skipped_indices):
             room_scales[i] = {
+                'room_number': i,
                 'room_name': f'Room_{i} (skipped - overlap >70%)',
+                'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': 0,
                 'm_px': None,
@@ -3382,7 +3557,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
 
         for i in sorted(flood_fill_skipped_indices):
             room_scales[i] = {
+                'room_number': i,
                 'room_name': f'Room_{i} (skipped - flood fill failed, room too large)',
+                'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': 0,
                 'm_px': None,
@@ -3396,7 +3573,9 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             # Pentru transparență, păstrăm aria în pixeli (nu intră în total_area_*).
             area_px_est = int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0
             room_scales[i] = {
+                'room_number': i,
                 'room_name': f'Room_{i} (gemini_failed)',
+                'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': area_px_est,
                 'm_px': None,
