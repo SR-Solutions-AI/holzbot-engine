@@ -13,7 +13,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .scale_detection import call_gemini, GEMINI_PROMPT_CROP, call_gemini_zone_labels, call_gemini_blacklist, call_gemini_rooms_batch, call_gemini_doors_batch, is_informational_total_result
+from .scale_detection import call_gemini, GEMINI_PROMPT_CROP, call_gemini_zone_labels, call_gemini_blacklist, call_gemini_rooms_per_crop, call_gemini_doors_batch, is_informational_total_result
 from .ocr_room_filling import (
     run_ocr_on_zones,
     run_ocr_scan_regions,
@@ -59,6 +59,20 @@ except ImportError:
                 msg += f"|IMG:{str(abs_path)}"
         print(msg, flush=True)
         sys.stdout.flush()
+
+
+# Euristică aspect pentru window vs door (orizontal + vertical)
+_ASPECT_WINDOW_MIN = 2.5   # aspect > 2.5 → horizontal window
+_ASPECT_BAND_WIDTH, _ASPECT_BAND_HEIGHT = 60, 30  # band dimensions → window
+_ASPECT_WINDOW_MAX_VERTICAL = 0.35  # aspect < 0.35 → vertical window (height >> width)
+
+
+def _is_window_by_aspect(width: float, height: float) -> bool:
+    """Unified heuristic: horizontal or vertical window band → window; else door."""
+    aspect = width / max(1, height)
+    is_horizontal_window = aspect > _ASPECT_WINDOW_MIN or (width > _ASPECT_BAND_WIDTH and height < _ASPECT_BAND_HEIGHT)
+    is_vertical_window = aspect < _ASPECT_WINDOW_MAX_VERTICAL or (height > _ASPECT_BAND_WIDTH and width < _ASPECT_BAND_HEIGHT)
+    return is_horizontal_window or is_vertical_window
 
 
 def generate_raster_walls_overlay(
@@ -2853,29 +2867,42 @@ def generate_walls_from_room_coordinates(
 
     # (Filtru flood-fill dezactivat: păstrăm toate ușile/ferestrele din RasterScan.)
 
-    # Prompt pentru clasificarea doors - îmbunătățit cu exemple clare
-    DOOR_CLASSIFICATION_PROMPT = """Analyze this architectural floor plan image showing a door or window opening.
+    # Prompt pentru clasificarea doors – ferestre (inclusiv verticale), scări, garaj
+    DOOR_CLASSIFICATION_PROMPT = """Analyze this floor plan crop. Classify the opening as exactly ONE type. Do NOT default to "door".
 
-CRITICAL DISTINCTIONS:
-- "window" - Has glass panes (usually shown as parallel lines or grid pattern), typically narrower than doors, often near exterior walls. May have a sill or frame detail.
-- "door" - Single or double opening for passage, usually wider than windows, may show door swing arc or simple opening. Interior doors connect rooms, exterior doors lead outside.
-- "garage_door" - Very wide opening (typically 2-3x wider than regular doors), usually at ground level, often shows multiple panels or tracks. Located near driveway or exterior.
-- "stairs" - Shows steps pattern (parallel lines going up/down), usually in a rectangular or L-shaped opening, connects floors.
+- "window" = Any glass/fenestration: parallel lines, grid, or strip (horizontal OR vertical). Narrow vertical strip = window. Horizontal strip = window. Use "window" whenever you see typical window depiction (Fenster, geam).
+- "door" = Passage for people (single/double leaf, swing arc). Use "door" for normal doors and for very wide openings (garage) – user sets garage in the app.
+- "stairs" = Staircase (Treppe): visible step pattern (parallel lines up/down). If you see steps, answer "stairs".
 
-VISUAL CLUES:
-- Windows: Thin opening with lines/grid inside, often rectangular, smaller than doors
-- Doors: Wider opening, may show arc (door swing), connects spaces
-- Garage doors: Very wide (often 3-4m), multiple horizontal panels visible
-- Stairs: Distinct step pattern visible, usually in corner or central area
+Rule: Lines/grid or strip shape → "window". Steps visible → "stairs". Otherwise → "door". Do NOT use garage_door.
+Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stairs"}"""
 
-Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "garage_door"} or {"type": "stairs"}"""
+    # Verificare Gemini pentru deschideri rămase "door" (evită scări/geamuri trecute ca uși). Fără garage – îl pune userul.
+    DOOR_VERIFY_PROMPT = """This opening was classified as a door. Look again: could it be a window (glass/strip/lines) or stairs (step pattern)? Reply ONLY with JSON: {"type": "door"} or {"type": "window"} or {"type": "stairs"}."""
 
     # Stocăm toate openings-urile pentru generarea imaginilor
     openings_list = []
-    
+
+    def _bbox_iou(a, b):
+        """IoU între două bbox (x_min, y_min, x_max, y_max)."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
     if 'doors' in data and data['doors']:
         _log(f"      📐 Procesez {len(data['doors'])} deschideri...")
         door_items = []  # list of (idx, temp_path, room_name, door_crop, x_min, y_min, x_max, y_max, door_crop_small)
+        kept_bboxes = []  # fără suprapuneri: excludem deschideri care se suprapun peste altele
         for idx, door in enumerate(data['doors']):
             if 'bbox' not in door or len(door['bbox']) != 4:
                 continue
@@ -2912,6 +2939,13 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                             else:
                                 room_name = 'Unknown'
                         break
+            # Fără suprapuneri: excludem deschideri care se suprapun peste altele (IoU > 15%)
+            bbox = (x_min, y_min, x_max, y_max)
+            if any(_bbox_iou(bbox, k) > 0.15 for k in kept_bboxes):
+                _log(f"         ⏭️ Deschidere {idx} ignorată (suprapunere cu altă deschidere)")
+                continue
+            kept_bboxes.append(bbox)
+
             temp_crop_path = openings_dir / f"door_{idx}_temp.png"
             cv2.imwrite(str(temp_crop_path), door_crop)
             door_crop_small = original_img[y_min:y_max, x_min:x_max]
@@ -2927,10 +2961,11 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         for pos, (idx, temp_crop_path, room_name, door_crop, x_min, y_min, x_max, y_max, door_crop_small) in enumerate(door_items):
             bbox_w = x_max - x_min
             bbox_h = y_max - y_min
-            aspect = (bbox_w / bbox_h) if bbox_h else 1.0
             door_type = "door"
             if batch_types and pos < len(batch_types):
                 door_type = batch_types[pos]
+                if door_type == "garage_door":
+                    door_type = "door"  # nu detectăm garaj – îl pune userul în editor
             elif gemini_api_key:
                 try:
                     from .scale_detection import call_gemini as gemini_classify
@@ -2940,16 +2975,34 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                     result = gemini_classify(temp_crop_path, context_prompt, gemini_api_key)
                     if result and isinstance(result, dict) and 'type' in result:
                         door_type = result['type'].lower().strip()
+                    if door_type == "garage_door":
+                        door_type = "door"  # nu detectăm garaj – îl pune userul
                     if door_type not in ['door', 'window', 'garage_door', 'stairs']:
                         door_type = 'door'
                 except Exception as e:
                     _log(f"         ⚠️ Eroare clasificare door {idx}: {e}")
             if door_type not in ['door', 'window', 'garage_door', 'stairs']:
                 door_type = 'door'
-            # Euristică: deschideri foarte înguste (bandă) sunt de obicei ferestre
+            if door_type == "garage_door":
+                door_type = "door"  # garaj doar din editor
+            # Euristică: bandă orizontală sau verticală (ferestre) → window
             if door_type == 'door' and bbox_w > 0 and bbox_h > 0:
-                if aspect < 0.35 or aspect > 2.85:
+                if _is_window_by_aspect(float(bbox_w), float(bbox_h)):
                     door_type = 'window'
+
+            # Verificare Gemini: deschideri rămase "door" pot fi de fapt geamuri/scări/garaj
+            if door_type == 'door' and gemini_api_key and Path(temp_crop_path).exists():
+                try:
+                    from .scale_detection import call_gemini as gemini_verify
+                    result = gemini_verify(temp_crop_path, DOOR_VERIFY_PROMPT, gemini_api_key)
+                    if result and isinstance(result, dict) and result.get('type'):
+                        t = str(result['type']).lower().strip()
+                        if t in ('door', 'window', 'garage_door', 'stairs'):
+                            door_type = t
+                        if door_type == "garage_door":
+                            door_type = "door"  # nu detectăm garaj – îl pune userul
+                except Exception as e:
+                    _log(f"         ⚠️ Verificare Gemini door {idx}: {e}")
 
             if Path(temp_crop_path).exists():
                 Path(temp_crop_path).unlink()
@@ -3427,73 +3480,55 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         if not_sent_room_indices:
             _log(f"         ⚠️ Camere neincluse în batch (crop eșuat / prea mici): {not_sent_room_indices}")
         if sent_room_indices:
-            _log(f"         📤 Trimise la Gemini batch: {len(sent_room_indices)} camere (indici: {sent_room_indices})")
+            _log(f"         📤 Trimise la Gemini per crop: {len(sent_room_indices)} camere (indici: {sent_room_indices})")
         _tick()
         batch_results = None
         if gemini_api_key and paths_for_batch and len(paths_for_batch) == len(valid_entries):
-            batch_results = call_gemini_rooms_batch(paths_for_batch, gemini_api_key)
+            batch_results = call_gemini_rooms_per_crop([str(p) for p in paths_for_batch], gemini_api_key)
         _tick()
         if batch_results is None or len(batch_results) != len(paths_for_batch):
             batch_results = None
 
         if batch_results is not None:
-            batch_failed_entries = []  # list of (i, room_area_px, room_mask_crop, room_crop, crop_path) for retry
             for (pos, (idx, (i, room_area_px, room_mask_crop, room_crop, crop_path))) in enumerate(valid_entries):
                 r = batch_results[pos] if pos < len(batch_results) else None
-                if r and not is_informational_total_result(r) and r.get('area_m2') is not None:
+                room_name = (r.get('room_name') or f'Room_{i}').strip() if r else f'Room_{i}'
+                room_type = (r.get('room_type') or 'Raum').strip() if r else 'Raum'
+                area_m2 = None
+                if r and r.get('area_m2') is not None:
                     try:
                         area_m2 = float(r['area_m2'])
                     except (TypeError, ValueError):
                         area_m2 = 0.0
-                    if area_m2 > 0:
-                        room_name = r.get('room_name') or f'Room_{i}'
-                        room_type = r.get('room_type') or 'Raum'
-                        room_number = r.get('room_number')
-                        if room_number is not None:
-                            try:
-                                room_number = int(room_number)
-                            except (TypeError, ValueError):
-                                room_number = i
-                        else:
-                            room_number = i
-                        # area_px din răspunsul Gemini (numărul din colț) pentru asociere; room_number pentru match OCR pe 09_interior
-                        area_px_from_gemini = r.get('area_px')
-                        if area_px_from_gemini is not None:
-                            try:
-                                area_px_stored = int(area_px_from_gemini)
-                            except (TypeError, ValueError):
-                                area_px_stored = int(room_area_px)
-                        else:
-                            area_px_stored = int(room_area_px)
-                        cv2.imwrite(str(output_dir / f"room_{i}_crop.png"), room_crop)
-                        cv2.imwrite(str(output_dir / f"room_{i}_mask.png"), room_mask_crop)
-                        m_px_room = float(np.sqrt(area_m2 / room_area_px)) if room_area_px > 0 else None
-                        room_scales[i] = {
-                            'room_number': room_number,
-                            'room_name': room_name,
-                            'room_type': room_type,
-                            'area_m2': area_m2,
-                            'area_px': area_px_stored,
-                            'm_px': m_px_room,
-                            'crop_image': f'room_{i}_crop.png',
-                        }
-                        total_area_m2 += area_m2
-                        total_area_px += room_area_px
-                        _log(f"         Camera {i} ({room_name}): {area_m2:.2f} m², {room_area_px} px → {m_px_room:.9f} m/px")
-                        continue
-                # batch per-room failed or invalid -> nu mai facem retry Gemini (economie timp)
-                batch_failed_entries.append((i, room_area_px, room_mask_crop, room_crop, crop_path))
-                area_px_est = int(room_area_px) if room_area_px else (int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0)
-                room_scales[i] = {
-                    'room_number': i,
-                    'room_name': f'Room_{i} (gemini_failed)',
-                    'room_type': 'Raum',
-                    'area_m2': 0.0,
-                    'area_px': area_px_est,
-                    'm_px': None,
-                    'crop_image': f'room_{i}_temp_for_gemini.png',
-                }
-                _log(f"         ⚠️ Camera {i}: Gemini batch invalid -> nu retry (folosim doar batch)")
+                if area_m2 is not None and area_m2 > 0 and not is_informational_total_result(dict(room_name=room_name, area_m2=area_m2)):
+                    area_px_stored = int(room_area_px)
+                    cv2.imwrite(str(output_dir / f"room_{i}_crop.png"), room_crop)
+                    cv2.imwrite(str(output_dir / f"room_{i}_mask.png"), room_mask_crop)
+                    m_px_room = float(np.sqrt(area_m2 / room_area_px)) if room_area_px > 0 else None
+                    room_scales[i] = {
+                        'room_number': i,
+                        'room_name': room_name,
+                        'room_type': room_type,
+                        'area_m2': area_m2,
+                        'area_px': area_px_stored,
+                        'm_px': m_px_room,
+                        'crop_image': f'room_{i}_crop.png',
+                    }
+                    total_area_m2 += area_m2
+                    total_area_px += room_area_px
+                    _log(f"         Camera {i} ({room_name}): {area_m2:.2f} m², {room_area_px} px → {m_px_room:.9f} m/px")
+                else:
+                    area_px_est = int(room_area_px) if room_area_px else (int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0)
+                    room_scales[i] = {
+                        'room_number': i,
+                        'room_name': (room_name if (r and room_name and room_name != f'Room_{i}') else 'Raum'),
+                        'room_type': (room_type if (r and room_type and room_type != 'Raum') else 'Raum'),
+                        'area_m2': 0.0,
+                        'area_px': area_px_est,
+                        'm_px': None,
+                        'crop_image': f'room_{i}_temp_for_gemini.png',
+                    }
+                    _log(f"         ⚠️ Camera {i}: fără area_m2 valid -> etichetă 'Raum'")
             # Fără retry Gemini pentru camere eșuate (cerere utilizator)
         else:
             # Fallback: apel Gemini per cameră (crop-urile sunt deja pe disk)
@@ -3534,7 +3569,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                 area_px_est = int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0
                 room_scales[i] = {
                     'room_number': i,
-                    'room_name': f'Room_{i} (crop_failed - nu trimis la Gemini)',
+                    'room_name': 'Raum',
                     'room_type': 'Raum',
                     'area_m2': 0.0,
                     'area_px': area_px_est,
@@ -3542,12 +3577,12 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
                     'crop_image': None,
                 }
                 gemini_failed_indices.add(i)
-                _log(f"         ⚠️ Camera {i}: crop eșuat (prea mică sau invalidă) -> nu a fost trimisă la Gemini (area_px={area_px_est})")
+                _log(f"         ⚠️ Camera {i}: crop eșuat (prea mică sau invalidă) -> nu trimis la Gemini, etichetă 'Raum'")
 
         for i in sorted(overlap_skipped_indices):
             room_scales[i] = {
                 'room_number': i,
-                'room_name': f'Room_{i} (skipped - overlap >70%)',
+                'room_name': 'Raum',
                 'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': 0,
@@ -3558,7 +3593,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
         for i in sorted(flood_fill_skipped_indices):
             room_scales[i] = {
                 'room_number': i,
-                'room_name': f'Room_{i} (skipped - flood fill failed, room too large)',
+                'room_name': 'Raum',
                 'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': 0,
@@ -3570,18 +3605,17 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "gara
             # Nu suprascriem camerele deja marcate ca crop_failed (nu au fost trimise)
             if room_scales.get(i, {}).get('crop_image') is None:
                 continue
-            # Pentru transparență, păstrăm aria în pixeli (nu intră în total_area_*).
             area_px_est = int(np.count_nonzero(room_masks.get(i))) if i in room_masks else 0
             room_scales[i] = {
                 'room_number': i,
-                'room_name': f'Room_{i} (gemini_failed)',
+                'room_name': 'Raum',
                 'room_type': 'Raum',
                 'area_m2': 0.0,
                 'area_px': area_px_est,
                 'm_px': None,
                 'crop_image': f'room_{i}_temp_for_gemini.png',
             }
-            _log(f"         ⚠️ Camera {i}: Gemini a eșuat (trimisă dar răspuns invalid) -> nu este folosită la scală (area_px={area_px_est})")
+            _log(f"         ⚠️ Camera {i}: Gemini invalid -> etichetă 'Raum', nu intră la scală")
     
     # Calculăm metri per pixel global doar din camere pentru care avem area_m2 de la Gemini (nu includem arii de pixeli fără m_px)
     m_px = None

@@ -55,6 +55,7 @@ from .raster_processing import (
     calculate_scale_per_room,
     generate_walls_interior_exterior,
     generate_interior_structure_walls,
+    _is_window_by_aspect,
 )
 from .interior_exterior import detect_interior_exterior_zones
 from .scale_detection import detect_scale_from_room_labels, call_gemini
@@ -2461,11 +2462,8 @@ def run_cubicasa_detection(
                                             x1, y1, x2, y2 = map(int, door['bbox'])
                                             width = x2 - x1
                                             height = y2 - y1
-                                        
-                                            # Încercăm să determinăm tipul bazat pe dimensiuni
-                                            # Ferestrele tind să fie mai late și mai puțin înalte
-                                            aspect = width / max(1, height)
-                                            if aspect > 2.5 or (width > 60 and height < 30):
+                                            is_window = _is_window_by_aspect(float(width), float(height))
+                                            if is_window:
                                                 label = "Window"
                                                 color_fill = (200, 220, 255)  # Albastru deschis pentru ferestre
                                                 color_border = (150, 180, 220)
@@ -2575,11 +2573,10 @@ def run_cubicasa_detection(
                                             ox1, oy1 = scale_coord(x1, y1, for_original=True)
                                             ox2, oy2 = scale_coord(x2, y2, for_original=True)
                                         
-                                            # Determinăm tipul bazat pe dimensiuni
                                             width = abs(ox2 - ox1)
                                             height = abs(oy2 - oy1)
-                                            aspect = width / max(1, height)
-                                            if aspect > 2.5 or (width > 60 and height < 30):
+                                            is_window = _is_window_by_aspect(float(width), float(height))
+                                            if is_window:
                                                 label = "Win"
                                                 color = (220, 180, 0)  # Cyan pentru ferestre
                                             else:

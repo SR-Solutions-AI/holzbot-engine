@@ -63,8 +63,21 @@ def main():
         gemini_api_key=os.environ.get("GEMINI_API_KEY"),
         initial_walls_mask_1px=walls_mask,
     )
-    print("Done.", "result=", "ok" if result else "None")
-    return 0 if result else 1
+    if not result:
+        print("Done. result=None")
+        return 1
+    # Regenerează detections_review_data.json (și overlay-urile) ca în editor să apară corect tipurile (window/stairs/garage_door)
+    try:
+        from cubicasa_detector.raster_api import save_detections_review_image
+        path_base, _path_rooms, _path_doors = save_detections_review_image(raster_dir)
+        if path_base:
+            print("Regenerat detections_review_data.json + detections_review_*.png (tipuri pentru editor).")
+        else:
+            print("Avertisment: save_detections_review_image nu a returnat imagine (09_interior/brute_steps pot lipsi).")
+    except Exception as e:
+        print(f"Avertisment: regenerare detections_review: {e}")
+    print("Done. result=ok")
+    return 0
 
 
 if __name__ == "__main__":

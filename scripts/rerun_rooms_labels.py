@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Reapelează Gemini rooms batch (cu promptul actual) pe crop-urile existente,
+Reapelează Gemini rooms per crop (1 apel / imagine, fără batch) pe crop-urile existente,
 actualizează room_scales.json, regenerează detections_review_data și imaginea cu labels.
+Pipeline: Gemini (strict OCR) → validare → fallback "Raum".
 
   cd holzbot-engine
   .venv/bin/python scripts/rerun_rooms_labels.py [path]
@@ -80,12 +81,12 @@ def main() -> int:
         print("Setează GEMINI_API_KEY")
         return 1
 
-    from cubicasa_detector.scale_detection import call_gemini_rooms_batch
+    from cubicasa_detector.scale_detection import call_gemini_rooms_per_crop
 
-    print(f"Apel Gemini rooms batch pentru {len(paths)} camere...")
-    batch_results = call_gemini_rooms_batch([str(p) for p in paths], api_key)
-    if not batch_results or len(batch_results) != len(paths):
-        print(f"Gemini a returnat {len(batch_results) if batch_results else 0} (așteptat {len(paths)})")
+    print(f"Apel Gemini per crop pentru {len(paths)} camere (1 apel / imagine)...")
+    per_crop_results = call_gemini_rooms_per_crop([str(p) for p in paths], api_key)
+    if not per_crop_results or len(per_crop_results) != len(paths):
+        print(f"Gemini a returnat {len(per_crop_results) if per_crop_results else 0} (așteptat {len(paths)})")
         return 1
 
     rs_path = walls_from_coords / "room_scales.json"
@@ -93,7 +94,7 @@ def main() -> int:
         data = json.load(f)
     rooms = data.get("rooms") or {}
     room_scales = data.get("room_scales") or {}
-    for i, res in enumerate(batch_results):
+    for i, res in enumerate(per_crop_results):
         key = str(i)
         rn = (res.get("room_name") or "").strip() or f"Room_{i}"
         rt = (res.get("room_type") or "Raum").strip() or "Raum"

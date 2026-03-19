@@ -20,64 +20,90 @@ from typing import Callable
 from .config import GEMINI_MODEL
 
 
+# Prompt folosit și în scale detection (per segment) și în rerun rooms — strict OCR, fără traducere.
 GEMINI_PROMPT_CROP = """
-Analizează această imagine de plan de casă și identifică:
-1. Numele camerei/camerelor (ex: "Living Room", "Bedroom", "Kitchen", "Terrasse", etc.)
-2. Suprafața camerei/camerelor în metri pătrați (m²) - DOAR dacă este explicit indicată PENTRU O CAMERĂ CONCRETĂ
+You are STRICT OCR. Read ONLY the text that labels the room in this floor plan crop.
 
-REGULI STRICTE PENTRU EXTRAGEREA SUPRAFEȚEI:
+The room label is usually centered and larger than other text. Ignore dimensions, numbers, and technical annotations.
 
-⚠️ CRITICAL: Extrage DOAR valori care sunt EXPLICIT etichetate ca metri pătrați (m²) ȘI sunt asociate cu O CAMERĂ CONCRETĂ (ex: "Terrasse 62,82 m²", "Küche 15 m²").
+Rules:
+- Copy EXACT characters from the image. Same spelling, same language.
+- DO NOT translate. If you translate the text, the answer is WRONG.
+- DO NOT interpret. DO NOT guess meaning. Treat this like OCR — only copy visible text.
+- If multiple labels or unclear → return "Raum". If no room name readable → "Raum".
+- For area_m2: use the number only when a surface in m² is clearly indicated for this room (e.g. "F= X m²"); otherwise null. Ignore NNF, Nutzfläche, totals.
 
-❌ IGNORĂ COMPLET – NU extrage și NU aduna:
-   - Texte informativ de tip TOTAL / SUPRAFAȚĂ UTILIZABILĂ pentru ÎNTREGUL NIVEL, nu pentru o cameră:
-     • "NNF = ca. X m²", "NNF=ca. 200 m²", "NNF ca. X m²"
-     • "Nutzfläche ca. X m²", "Gesamtnutzfläche", "Hausfläche ca. X m²"
-     • "net floor area", "suprafață utilizabilă", "total usable area", "ca. X m²" (fără nume de cameră lângă)
-   - Acestea sunt TOTALURI pentru etaj/nivel, NU suprafețe ale unei camere. Nu le include în room_name sau area_m2.
-   - Numere din scale (ex: "1:100", "1:50"), dimensiuni (ex: "3.5 x 4.2"), coordonate sau adrese.
-
-✅ Extrage DOAR: nume de cameră + suprafața în m² când sunt ÎMPREUNĂ (ex: "Terrasse Feinsteinzeug 62,82 m²" → room_name: "Terrasse", area_m2: 62.82).
-
-IMPORTANT:
-- Zonele negre din imagine NU fac parte din cameră.
-- Dacă singura suprafață în m² din imagine este un total (NNF / Nutzfläche / ca. X m² fără nume de cameră), returnează null pentru area_m2.
-- Dacă sunt mai multe camere cu suprafețe în crop, adună DOAR suprafețele care aparțin unor camere concrete (nu totalul de nivel).
-
-Returnează JSON:
-{
-  "room_name": "numele camerei sau 'Multiple rooms' dacă sunt mai multe",
-  "area_m2": 15.5
-}
-Dacă nu găsești o suprafață asociată unei cameri concrete (doar total NNF/Nutzfläche etc.), returnează null pentru area_m2.
+Return ONLY this JSON, nothing else:
+{"room_name": "<exact text from plan>", "area_m2": number or null}
 """
 
-# Prompt pentru batch de camere (N imagini → un singur răspuns JSON cu array)
-# room_number = numărul desenat pe imagine (room_no:N) – pentru asociere cu poligoanele din 09_interior (OCR)
-# room_name și room_type = EXACT textul de pe plan, aceeași limbă (fără traducere). Planurile sunt adesea în germană.
+# Etichete tipice returnate de Gemini când interpretează în loc să copieze — le tratăm ca halucinații și le înlocuim cu "Raum".
+ROOM_LABEL_HALLUCINATIONS = frozenset({
+    "living room", "bedroom", "bathroom", "hallway", "kitchen", "dining room",
+    "office", "storage", "common", "private", "technical room", "dining",
+    "guest room", "master bedroom", "walk-in closet", "utility room", "laundry room",
+})
+
+def is_hallucinated_room_label(room_name: str) -> bool:
+    """True dacă room_name e o etichetă tipică inferată/tradusă de Gemini, nu text copiat de pe plan."""
+    if not room_name or not isinstance(room_name, str):
+        return False
+    key = room_name.strip().lower()
+    return key in ROOM_LABEL_HALLUCINATIONS
+
+
+def is_valid_room_label(text: str) -> bool:
+    """
+    True dacă textul arată ca o etichetă reală de cameră (cuvânt/cuvinte), nu OCR garbage.
+    Folosit pentru Tesseract și pentru output Gemini — doar label-uri valide trec.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    text = text.strip()
+    if len(text) < 2:
+        return False
+    if len(text) > 40:
+        return False
+    # trebuie să conțină litere (inclusiv umlaut)
+    if not re.search(r"[a-zA-ZäöüÄÖÜß]", text):
+        return False
+    # nu trebuie să fie mostly simboluri
+    non_letter = len(re.sub(r"[a-zA-ZäöüÄÖÜß\s]", "", text))
+    if non_letter > len(text) * 0.4:
+        return False
+    # blacklist OCR garbage patterns
+    if re.search(r"[=\|\[\]{}<>]", text):
+        return False
+    # maxim 2–3 cuvinte (room labels reale: "Living Room", "Technikraum", "WC")
+    if len(text.split()) > 3:
+        return False
+    return True
+
+
+def is_invalid_room_label(room_name: str) -> bool:
+    """True dacă room_name nu e valid (garbage sau invalid). Înlocuim cu Raum."""
+    return not is_valid_room_label(room_name or "")
+
+
+
+# System instruction pentru apeluri single-crop (opțional, folosit la call_gemini_room_single).
+GEMINI_SYSTEM_INSTRUCTION_ROOMS = (
+    "You are STRICT OCR. Copy room labels exactly as written. Do NOT translate. If you translate, the answer is WRONG."
+)
+
+# Batch (deprecated pentru rooms — preferați call_gemini_rooms_per_crop): prompt lung, instabil cu N imagini.
 GEMINI_PROMPT_ROOMS_BATCH = """
-You receive {n} images of floor plan room crops (in order: Image 1, Image 2, ... Image {n}).
-Each image has in the TOP-LEFT corner two labels: "area_px:NNNNN" and "room_no:N" (N = room number 0, 1, 2, ...). READ both numbers.
+You are an architect or specialist in reading floor plans. You receive {n} images of room crops from a plan (Image 1, 2, ... Image {n}). In the top-left corner of each image there are two technical labels: "area_px:NNNNN" and "room_no:N". Read those two numbers for each image; they are required for matching.
 
-CRITICAL – room_number and EXACT text from plan:
-- room_number = the integer you see in "room_no:N" on that image. Return it exactly (required for matching).
-- room_name and room_type = copy the EXACT word(s) written ON THE PLAN for that room. Same language as the plan. DO NOT translate. If the plan is in German you get German (Küche, Bad, Flur, Wohnzimmer, Schlafzimmer, Abstellraum, etc.). If the plan is in English you get English. Copy character for character. Use "Raum" only if no readable label or multiple labels in one crop.
+CRITICAL — Do not translate: The plans are often in German (or another language). For room_name and room_type you MUST return the exact characters written on the plan. Example: if you see "Technikraum" write "Technikraum", not "Technical room". If you see "Speis" write "Speis", not "Dining". If you see "WC" write "WC", not "Bathroom". Same language, same spelling. You are transcribing, not translating.
 
-For EACH image in order, extract:
-1. room_number – integer from "room_no:N" in the corner. Required.
-2. area_px – integer from "area_px:NNNNN". Required.
-3. room_name – EXACT text from the plan (same language, no translation). "Mehrere Räume" only if several room names in crop and plan is German; otherwise "Multiple rooms" etc. as on plan.
-4. area_m2 – number only if m² is explicitly written for that room; ignore NNF/Nutzfläche totals.
-5. room_type – EXACT room label as written on the plan. Do not translate.
+Your task is to extract, for each crop, the room label that appears on the plan. Transcribe it exactly as written. If in one crop you see several room names or overlapping labels and you cannot assign a single clear room name, use "Raum" (or "Mehrere Räume" if the plan is in German and the crop clearly shows multiple rooms). If no room name is readable, use "Raum". For area_m2, use the number only when a surface in m² is explicitly given for that room (e.g. "F= X m²"); otherwise null. Ignore plan totals like NNF or Nutzfläche. Black areas are not part of the room.
 
-RULES:
-- room_number and area_px = copy from corner labels.
-- room_name and room_type = copy EXACTLY from plan, same language.
-- Black areas are not part of the room.
+For each of the {n} images, return: room_number (from "room_no:N"), area_px (from "area_px:NNNNN"), room_name (exact text from the plan, same language as the plan), room_type (same as room_name), area_m2 (number or null).
 
-Return ONLY this JSON (no markdown):
-{{"rooms": [{{"room_number": 0, "area_px": 33060, "room_name": "<exact from plan>", "area_m2": 12.5, "room_type": "<exact from plan>"}}, ...]}}
-with exactly {n} objects. Every object MUST have room_number (int), area_px (int), room_name (string), and room_type (string).
+Return only valid JSON, no markdown:
+{{"rooms": [{{"room_number": 0, "area_px": 12345, "room_name": "<exact from plan>", "area_m2": 12.5, "room_type": "<exact from plan>"}}, ...]}}
+with exactly {n} objects. room_type must be identical to room_name; both must be the exact string visible on the plan — never in another language.
 """
 
 
@@ -664,9 +690,85 @@ def _parse_rooms_batch_text(text: str, n: int):
     return out, None
 
 
+def call_gemini_room_single(image_path: str | Path, api_key: str, max_retries: int = 2) -> dict | None:
+    """
+    Un singur crop → un apel Gemini (strict OCR prompt). Validare + fallback "Raum" la caller.
+    Returnează {"room_name": str, "area_m2": float|None} sau None.
+    """
+    image_path = Path(image_path)
+    if not image_path.exists() or not api_key:
+        return None
+    try:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+    except OSError:
+        return None
+    ext = image_path.suffix.lower()
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    mime_type = mime_map.get(ext, "image/png")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    gen_config = {"temperature": 0.0, "maxOutputTokens": 512, "responseMimeType": "application/json"}
+    system_instruction = {"parts": [{"text": GEMINI_SYSTEM_INSTRUCTION_ROOMS}]}
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": image_data}},
+                {"text": GEMINI_PROMPT_CROP + "\n\nReturn ONLY valid JSON. No markdown."},
+            ]
+        }],
+        "generationConfig": gen_config,
+        "system_instruction": system_instruction,
+    }
+    headers = {"Content-Type": "application/json"}
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+            if response.status_code != 200:
+                continue
+            result = response.json()
+            if "candidates" not in result or not result["candidates"]:
+                continue
+            text = (result["candidates"][0]["content"]["parts"][0].get("text") or "").strip()
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start == -1 or end <= start:
+                continue
+            data = json.loads(text[start:end])
+            if isinstance(data, dict) and "room_name" in data:
+                return {"room_name": str(data.get("room_name", "")).strip() or "Raum", "area_m2": data.get("area_m2")}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        except Exception as e:
+            if attempt >= max_retries:
+                print(f"⚠️  Gemini room single error: {e}")
+    return None
+
+
+def call_gemini_rooms_per_crop(image_paths: list, api_key: str) -> list[dict] | None:
+    """
+    Un apel Gemini per crop (recomandat față de batch). Acuratețe mai bună, fără amestec între imagini.
+    Returnează list[dict] în ordinea imaginilor: room_name, room_type (=room_name), area_m2.
+    Aplică filtru anti-halucinații: etichete tipice traduse (Living Room, Kitchen etc.) → "Raum".
+    """
+    if not image_paths or not api_key:
+        return None
+    out = []
+    for i, path in enumerate(image_paths):
+        res = call_gemini_room_single(path, api_key)
+        if res is None:
+            out.append({"room_name": "Raum", "room_type": "Raum", "area_m2": None})
+            continue
+        rn = (res.get("room_name") or "").strip() or "Raum"
+        # Validare semantică: doar label-uri care arată ca cuvinte reale; altfel "Raum"
+        if not is_valid_room_label(rn) or is_hallucinated_room_label(rn):
+            rn = "Raum"
+        out.append({"room_name": rn, "room_type": rn, "area_m2": res.get("area_m2")})
+    return out
+
+
 def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 2):
     """
     Trimite toate crop-urile de camere într-un singur apel Gemini.
+    Deprecated: prefer call_gemini_rooms_per_crop pentru acuratețe.
     Returnează list[dict] în aceeași ordine (fiecare dict: room_name, area_m2, room_type, area_px) sau None la eșec.
     """
     if not image_paths or not api_key:
@@ -686,7 +788,12 @@ def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     gen_config = {"temperature": 0.0, "maxOutputTokens": 2048, "responseMimeType": "application/json"}
-    payload = {"contents": [{"parts": parts}], "generationConfig": gen_config}
+    system_instruction = {"parts": [{"text": GEMINI_SYSTEM_INSTRUCTION_ROOMS}]}
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": gen_config,
+        "system_instruction": system_instruction,
+    }
     headers = {"Content-Type": "application/json"}
 
     for attempt in range(max_retries + 1):
@@ -733,18 +840,21 @@ def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 
     return None
 
 # Batch clasificare uși/ferestre (N imagini → un JSON cu array de tipuri)
-GEMINI_PROMPT_DOORS_BATCH = """You receive {n} images of floor plan openings. For each image in order (Image 1, 2, ... {n}), classify as exactly ONE type. You MUST use both "door" and "window" where appropriate – do NOT return "door" for all.
+GEMINI_PROMPT_DOORS_BATCH = """You receive {n} images of floor plan openings. For EACH image in order (Image 1, Image 2, ... Image {n}), classify as exactly ONE type. You MUST distinguish correctly – do NOT default to "door".
 
-CRITICAL – when to use "window":
-- "window" = glass opening: parallel lines or grid inside, usually narrower than doors, often horizontal or vertical strip. Use "window" for any opening that clearly shows glass/fenestration. Many images will be windows.
-- "door" = passage for people: single or double leaf, may show swing arc, typically wider than windows.
-- "garage_door" = very wide (2-3x a normal door), multiple panels, ground level.
-- "stairs" = visible step pattern (parallel lines), connects floors.
+USE "window" for:
+- Any glass/fenestration: parallel lines, grid, or strip (horizontal OR vertical). Narrow vertical strips = window. Wide horizontal strips = window. If it looks like a window/fenster/geam, it is "window".
+- Many openings in floor plans are windows; use "window" whenever you see typical window depiction.
 
-Rule: If the opening looks like a window (narrow, lines/grid, glass) → "window". If it looks like a door (passage, swing) → "door". Vary your answers.
+USE "door" for:
+- Passage openings for people (single/double leaf, may show swing arc). Also use "door" for very wide openings (e.g. garage) – user will set garage manually in the app.
 
-Return ONLY this JSON (no markdown): {{"types": ["door", "window", "garage_door", "stairs", ...]}}
-with exactly {n} strings, one per image in order.
+USE "stairs" for:
+- Staircase / Treppe: visible step pattern (parallel lines going up or down), L-shape or rectangular opening connecting floors. If you see steps, it is "stairs" not "door".
+
+Rule: When in doubt between door and window, prefer "window" if there are lines/grid or strip shape. When you see steps, always "stairs". Return exactly {n} types. Only use: "door", "window", "stairs" (no garage_door).
+
+Return ONLY this JSON (no markdown): {{"types": ["door", "window", "stairs", ...]}}
 """
 
 
@@ -784,6 +894,8 @@ def _parse_doors_batch_text(text: str, n: int):
     out = []
     for t in types_raw:
         s = (t if isinstance(t, str) else str(t)).lower().strip()
+        if s == 'garage_door':
+            s = 'door'  # nu detectăm garaj – îl pune userul
         out.append(s if s in valid_types else 'door')
     return out, None
 
