@@ -915,8 +915,13 @@ def apply_detections_edited(raster_dir: Path) -> bool:
     try:
         with open(edited_path, "r", encoding="utf-8") as f:
             edited = json.load(f)
-        rooms_raw = edited.get("rooms") or []
-        doors_raw = edited.get("doors") or []
+        if isinstance(edited, dict):
+            rooms_raw = edited.get("rooms") or []
+            doors_raw = edited.get("doors") or []
+        else:
+            # Format invalid/neașteptat - nu blocăm pipeline-ul
+            print(f"      ⚠️ apply_detections_edited: detections_edited.json invalid (type={type(edited).__name__})")
+            return False
 
         with open(response_path, "r", encoding="utf-8") as f:
             response = json.load(f)
@@ -925,17 +930,47 @@ def apply_detections_edited(raster_dir: Path) -> bool:
             data = {}
 
         # Format response.json: rooms = list of list of {x, y}; doors = list of {bbox}
-        data["rooms"] = []
+        old_rooms_count = len(data.get("rooms") or []) if isinstance(data, dict) else 0
+        old_doors_count = len(data.get("doors") or []) if isinstance(data, dict) else 0
+        new_rooms = []
         for room in rooms_raw:
-            pts = room.get("points") or []
-            if len(pts) >= 3:
-                data["rooms"].append([{"x": int(p[0]), "y": int(p[1])} for p in pts])
+            # Acceptăm room ca object {points:[...]} sau direct listă de puncte [[x,y], ...]
+            if isinstance(room, dict):
+                pts = room.get("points") or []
+            elif isinstance(room, list):
+                pts = room
+            else:
+                pts = []
+            if isinstance(pts, list) and len(pts) >= 3:
+                norm_pts = []
+                for p in pts:
+                    if isinstance(p, (list, tuple)) and len(p) >= 2:
+                        norm_pts.append({"x": int(p[0]), "y": int(p[1])})
+                    elif isinstance(p, dict) and ("x" in p) and ("y" in p):
+                        norm_pts.append({"x": int(p["x"]), "y": int(p["y"])})
+                if len(norm_pts) >= 3:
+                    new_rooms.append(norm_pts)
 
-        data["doors"] = []
+        new_doors = []
         for d in doors_raw:
-            bbox = d.get("bbox")
+            if isinstance(d, dict):
+                bbox = d.get("bbox")
+            elif isinstance(d, list):
+                bbox = d
+            else:
+                bbox = None
             if bbox and len(bbox) == 4:
-                data["doors"].append({"bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]})
+                new_doors.append({"bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]})
+
+        # Guard rail: dacă payload-ul editat e invalid (ex. liste goale) nu suprascriem cu 0 camere/uși
+        if (len(rooms_raw) > 0 and len(new_rooms) == 0 and old_rooms_count > 0) or (
+            len(doors_raw) > 0 and len(new_doors) == 0 and old_doors_count > 0
+        ):
+            print("      ⚠️ apply_detections_edited: payload invalid (rooms/doors goale) - ignor modificările pentru a evita pierdere date")
+            return False
+
+        data["rooms"] = new_rooms
+        data["doors"] = new_doors
 
         if "data" not in response:
             response = {"data": data}
@@ -945,14 +980,14 @@ def apply_detections_edited(raster_dir: Path) -> bool:
             json.dump(response, f, indent=2)
         print(f"      💾 Aplicat detections_edited: {len(data['rooms'])} camere, {len(data['doors'])} uși/geamuri → response.json")
 
-        room_types_list = [str(r.get("roomType") or "Raum").strip() or "Raum" for r in rooms_raw]
+        room_types_list = [str(r.get("roomType") or "Raum").strip() or "Raum" for r in rooms_raw if isinstance(r, dict)]
         if room_types_list:
             room_types_path = raster_dir / "room_types.json"
             with open(room_types_path, "w", encoding="utf-8") as f:
                 json.dump(room_types_list, f, ensure_ascii=False)
 
         types_path = raster_dir / "doors_types.json"
-        types_list = [{"type": str(d.get("type", "door")).lower()} for d in doors_raw]
+        types_list = [{"type": str(d.get("type", "door")).lower()} for d in doors_raw if isinstance(d, dict)]
         if types_list:
             with open(types_path, "w", encoding="utf-8") as f:
                 json.dump(types_list, f, indent=2)

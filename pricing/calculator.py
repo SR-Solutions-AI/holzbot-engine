@@ -50,8 +50,10 @@ def calculate_pricing_for_plan(
                                                                     walls_data.get("interior", {}).get("net_area_m2", 0.0)))
     # Pentru finisaje: folosim net_area_m2 pentru interior
     w_int_net_finish = float(walls_data.get("interior", {}).get("net_area_m2", 0.0))
-    # Exterior: același pentru structură și finisaje
-    w_ext_net = float(walls_data.get("exterior", {}).get("net_area_m2", 0.0))
+    # Exterior: separăm structură vs finisaje
+    w_ext_net_structure = float(walls_data.get("exterior", {}).get("net_area_m2_structure",
+                                                                    walls_data.get("exterior", {}).get("net_area_m2", 0.0)))
+    w_ext_net_finish = float(walls_data.get("exterior", {}).get("net_area_m2", 0.0))
     
     surfaces = area_data.get("surfaces", {})
     foundation_area = float(surfaces.get("foundation_m2") or 0.0)
@@ -147,12 +149,12 @@ def calculate_pricing_for_plan(
         # Structură pereți exteriori beci (fără finisaje exterioare)
         if _wb_coeffs and _wb_beci_aussen:
             _p_beci_aussen = float(_wb_coeffs.get("aussen", {}).get(_wb_beci_aussen, 280))
-            _cost_b_ext = w_ext_net * _p_beci_aussen
-            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({_wb_beci_aussen})", "area_m2": round(w_ext_net, 2), "unit_price": round(_p_beci_aussen, 2), "cost": round(_cost_b_ext, 2)})
-        elif w_ext_net > 0:
+            _cost_b_ext = w_ext_net_structure * _p_beci_aussen
+            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({_wb_beci_aussen})", "area_m2": round(w_ext_net_structure, 2), "unit_price": round(_p_beci_aussen, 2), "cost": round(_cost_b_ext, 2)})
+        elif w_ext_net_structure > 0:
             _p_ext = float(system_coeffs.get("base_unit_prices", {}).get(system_constructie, {}).get("exterior", 280))
-            _cost_b_ext = w_ext_net * _p_ext
-            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net, 2), "unit_price": round(_p_ext, 2), "cost": round(_cost_b_ext, 2)})
+            _cost_b_ext = w_ext_net_structure * _p_ext
+            items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net_structure, 2), "unit_price": round(_p_ext, 2), "cost": round(_cost_b_ext, 2)})
         cost_walls_b = {"total_cost": round(_cost_b_int + _cost_b_ext, 2), "detailed_items": items_walls_b}
         cost_finishes_b = calculate_finishes_details(
             finish_coeffs, w_int_net_finish, 0.0,
@@ -338,22 +340,22 @@ def calculate_pricing_for_plan(
         price_aussen = float(aussen_map.get(sel_aussen, 280))
         price_innen = float(innen_map.get(sel_innen, 280))
         cost_int = w_int_net_structure * price_innen
-        cost_ext = w_ext_net * price_aussen
+        cost_ext = w_ext_net_structure * price_aussen
         cost_walls = {
             "total_cost": round(cost_int + cost_ext, 2),
             "detailed_items": [
                 {"category": "walls_structure_int", "name": f"Pereți Interiori ({sel_innen or 'Wandaufbau'})", "material": sel_innen or "Wandaufbau", "construction_mode": "Wandaufbau", "area_m2": round(w_int_net_structure, 2), "unit_price": round(price_innen, 2), "cost": round(cost_int, 2)},
-                {"category": "walls_structure_ext", "name": f"Pereți Exteriori ({sel_aussen or 'Wandaufbau'})", "material": sel_aussen or "Wandaufbau", "construction_mode": "Wandaufbau", "area_m2": round(w_ext_net, 2), "unit_price": round(price_aussen, 2), "cost": round(cost_ext, 2)},
+                {"category": "walls_structure_ext", "name": f"Pereți Exteriori ({sel_aussen or 'Wandaufbau'})", "material": sel_aussen or "Wandaufbau", "construction_mode": "Wandaufbau", "area_m2": round(w_ext_net_structure, 2), "unit_price": round(price_aussen, 2), "cost": round(cost_ext, 2)},
             ]
         }
     else:
         cost_walls = calculate_walls_details(
-            system_coeffs, w_int_net_structure, w_ext_net,
+            system_coeffs, w_int_net_structure, w_ext_net_structure,
             system=system_constructie
         )
     
     cost_finishes = calculate_finishes_details(
-        finish_coeffs, w_int_net_finish, w_ext_net,
+        finish_coeffs, w_int_net_finish, w_ext_net_finish,
         type_int=finish_int, type_ext=finish_ext,
         floor_label=floor_label
     )
@@ -566,7 +568,7 @@ def calculate_pricing_for_plan(
         # Pereți interiori + exteriori pentru basement (structură); finisaje doar interior
         _wb_innen = (wandaufbau_data.get("innenwandeBeci") or "").strip()
         _wb_aussen = (wandaufbau_data.get("außenwandeBeci") or "").strip()
-        w_ext_net_basement = w_ext_net * coeff_walls
+        w_ext_net_basement = w_ext_net_structure * coeff_walls
         if use_wandaufbau and _wb_innen:
             _p_innen = float(wandaufbau_coeffs.get("innen", {}).get(_wb_innen, 280))
             _c_int_b = w_int_net_structure_basement * _p_innen

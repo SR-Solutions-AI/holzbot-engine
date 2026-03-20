@@ -406,13 +406,16 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
     # Extragem valorile pentru arii
     int_gross_finish = safe_get(interior_data, "gross_area_m2", default=0.0)
     int_gross_structure = safe_get(interior_data, "gross_area_m2_structure", default=int_gross_finish)
-    int_openings = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_openings_finish = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_openings_structure = safe_get(interior_data, "openings_area_m2_structure", default=int_openings_finish)
     int_area_finish = safe_get(interior_data, "net_area_m2", default=0.0)
     int_area_structure = safe_get(interior_data, "net_area_m2_structure", default=int_area_finish)
     
     ext_gross = safe_get(exterior_data, "gross_area_m2", default=0.0)
-    ext_openings = safe_get(exterior_data, "openings_area_m2", default=0.0)
-    ext_area = safe_get(exterior_data, "net_area_m2", default=0.0)
+    ext_openings_finish = safe_get(exterior_data, "openings_area_m2", default=0.0)
+    ext_openings_structure = safe_get(exterior_data, "openings_area_m2_structure", default=ext_openings_finish)
+    ext_area_finish = safe_get(exterior_data, "net_area_m2", default=0.0)
+    ext_area_structure = safe_get(exterior_data, "net_area_m2_structure", default=ext_area_finish)
     
     # Presupunem înălțimea pereților pentru calcul (din wall_height_m dacă e disponibil)
     wall_height = safe_get(plan_data, "wall_height_m", default=2.7)
@@ -434,8 +437,8 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P("Struktur", "Cell"),  # Direct translation for wall measurements context
         P(format_length(ext_length), "Cell"),
         P(format_area(ext_gross), "Cell"),
-        P(format_area(ext_openings), "Cell"),
-        P(format_area(ext_area), "CellBold"),
+        P(format_area(ext_openings_structure), "Cell"),
+        P(format_area(ext_area_structure), "CellBold"),
     ])
     
     # Finisaje pereți exteriori
@@ -444,8 +447,8 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P("Ausbau & Oberflächen", "Cell"),  # Direct translation for wall measurements context
         P(format_length(ext_length), "Cell"),
         P(format_area(ext_gross), "Cell"),
-        P(format_area(ext_openings), "Cell"),
-        P(format_area(ext_area), "CellBold"),
+        P(format_area(ext_openings_finish), "Cell"),
+        P(format_area(ext_area_finish), "CellBold"),
     ])
     
     # Structură pereți interiori (din skeleton)
@@ -454,7 +457,7 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P(enforcer.get("Structură (Skeleton)"), "Cell"),
         P(format_length(int_length_structure), "Cell"),
         P(format_area(int_gross_structure), "Cell"),
-        P(format_area(int_openings), "Cell"),
+        P(format_area(int_openings_structure), "Cell"),
         P(format_area(int_area_structure), "CellBold"),
     ])
     
@@ -464,7 +467,7 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P(enforcer.get("Finisaje (Outline)"), "Cell"),
         P(format_length(int_length_finish), "Cell"),
         P(format_area(int_gross_finish), "Cell"),
-        P(format_area(int_openings), "Cell"),
+        P(format_area(int_openings_finish), "Cell"),
         P(format_area(int_area_finish), "CellBold"),
     ])
     
@@ -498,13 +501,16 @@ def create_wall_measurements_table_english(plan_data: dict) -> Table:
 
     int_gross_finish = safe_get(interior_data, "gross_area_m2", default=0.0)
     int_gross_structure = safe_get(interior_data, "gross_area_m2_structure", default=int_gross_finish)
-    int_openings = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_openings_finish = safe_get(interior_data, "openings_area_m2", default=0.0)
+    int_openings_structure = safe_get(interior_data, "openings_area_m2_structure", default=int_openings_finish)
     int_area_finish = safe_get(interior_data, "net_area_m2", default=0.0)
     int_area_structure = safe_get(interior_data, "net_area_m2_structure", default=int_area_finish)
 
     ext_gross = safe_get(exterior_data, "gross_area_m2", default=0.0)
-    ext_openings = safe_get(exterior_data, "openings_area_m2", default=0.0)
-    ext_area = safe_get(exterior_data, "net_area_m2", default=0.0)
+    ext_openings_finish = safe_get(exterior_data, "openings_area_m2", default=0.0)
+    ext_openings_structure = safe_get(exterior_data, "openings_area_m2_structure", default=ext_openings_finish)
+    ext_area_finish = safe_get(exterior_data, "net_area_m2", default=0.0)
+    ext_area_structure = safe_get(exterior_data, "net_area_m2_structure", default=ext_area_finish)
 
     head = [
         P("Wall Type", "CellBold"),
@@ -515,10 +521,10 @@ def create_wall_measurements_table_english(plan_data: dict) -> Table:
         P("Net Area (m²)", "CellBold"),
     ]
     data = []
-    data.append([P("Exterior Walls", "Cell"), P("Structure", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings), "Cell"), P(format_area(ext_area), "CellBold")])
-    data.append([P("Exterior Walls", "Cell"), P("Finishes", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings), "Cell"), P(format_area(ext_area), "CellBold")])
-    data.append([P("Interior Walls", "Cell"), P("Structure (skeleton)", "Cell"), P(format_length(int_length_structure), "Cell"), P(format_area(int_gross_structure), "Cell"), P(format_area(int_openings), "Cell"), P(format_area(int_area_structure), "CellBold")])
-    data.append([P("Interior Walls", "Cell"), P("Finishes (outline)", "Cell"), P(format_length(int_length_finish), "Cell"), P(format_area(int_gross_finish), "Cell"), P(format_area(int_openings), "Cell"), P(format_area(int_area_finish), "CellBold")])
+    data.append([P("Exterior Walls", "Cell"), P("Structure", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings_structure), "Cell"), P(format_area(ext_area_structure), "CellBold")])
+    data.append([P("Exterior Walls", "Cell"), P("Finishes", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings_finish), "Cell"), P(format_area(ext_area_finish), "CellBold")])
+    data.append([P("Interior Walls", "Cell"), P("Structure (skeleton)", "Cell"), P(format_length(int_length_structure), "Cell"), P(format_area(int_gross_structure), "Cell"), P(format_area(int_openings_structure), "Cell"), P(format_area(int_area_structure), "CellBold")])
+    data.append([P("Interior Walls", "Cell"), P("Finishes (outline)", "Cell"), P(format_length(int_length_finish), "Cell"), P(format_area(int_gross_finish), "Cell"), P(format_area(int_openings_finish), "Cell"), P(format_area(int_area_finish), "CellBold")])
 
     tbl = Table([head] + data, colWidths=[40*mm, 38*mm, 32*mm, 32*mm, 32*mm, 32*mm])
     tbl.setStyle(TableStyle([

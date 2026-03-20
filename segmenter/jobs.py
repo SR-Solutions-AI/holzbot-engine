@@ -20,6 +20,8 @@ from .pdf_utils import convert_pdf_to_png
 from .gemini_crop import get_gemini_boxes_for_page, crop_and_save
 from .classifier import ClassificationResult
 
+GEMINI_CROP_MAX_RETRIES_ON_ZERO_BLUEPRINTS = 1
+
 
 @dataclass
 class SegmentationJobResult:
@@ -59,12 +61,37 @@ def _segment_single_page(
         except Exception:
             pass
 
-        boxes = get_gemini_boxes_for_page(page_path)
-        print(f"  [Gemini Crop] {doc_id}: {len(boxes)} zone (etaje + side views)", flush=True)
-        classification_results, _ = crop_and_save(page_path, work_dir, boxes)
-        n_bp = len([r for r in classification_results if r.label == "house_blueprint"])
-        n_sv = len([r for r in classification_results if r.label == "side_view"])
-        print(f"  [Gemini Crop] {doc_id} → blueprints: {n_bp}, side_views: {n_sv}", flush=True)
+        classification_results: List[ClassificationResult] = []
+        boxes = []
+        n_bp = 0
+        n_sv = 0
+
+        def _reset_classified_outputs() -> None:
+            classified_dir = work_dir / "classified"
+            for rel in ("blueprints", "side_views", "siteplan", "text"):
+                target = classified_dir / rel
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                target.mkdir(parents=True, exist_ok=True)
+
+        for attempt in range(GEMINI_CROP_MAX_RETRIES_ON_ZERO_BLUEPRINTS + 1):
+            if attempt > 0:
+                print(
+                    f"  [Gemini Crop] {doc_id}: retry {attempt}/{GEMINI_CROP_MAX_RETRIES_ON_ZERO_BLUEPRINTS} "
+                    f"(motiv: 0 blueprints detectate)",
+                    flush=True,
+                )
+                _reset_classified_outputs()
+
+            boxes = get_gemini_boxes_for_page(page_path)
+            print(f"  [Gemini Crop] {doc_id}: {len(boxes)} zone (etaje + side views)", flush=True)
+            classification_results, _ = crop_and_save(page_path, work_dir, boxes)
+            n_bp = len([r for r in classification_results if r.label == "house_blueprint"])
+            n_sv = len([r for r in classification_results if r.label == "side_view"])
+            print(f"  [Gemini Crop] {doc_id} → blueprints: {n_bp}, side_views: {n_sv}", flush=True)
+
+            if n_bp > 0 or attempt == GEMINI_CROP_MAX_RETRIES_ON_ZERO_BLUEPRINTS:
+                break
 
         return SegmentationJobResult(
             doc_id=doc_id,

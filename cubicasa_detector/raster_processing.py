@@ -2502,7 +2502,7 @@ def generate_walls_from_room_coordinates(
     _log(f"      🔲 Margine neagră {border_px}px suplimentară (poza mărită la {W}x{H})")
     _log(f"      💾 Salvat: {segments_path.name} (același conținut ca 00_flood_test, 1px)")
     cv2.imwrite(str(segments_path), segments_img_with_border)
-    
+
     # ✅ Recalculăm walls_barrier din segmentele acceptate DUPĂ eliminare; dacă inputul e 1px (api_walls_from_json_1px), păstrăm 1px
     if _input_is_1px:
         wall_thickness_barrier = 1

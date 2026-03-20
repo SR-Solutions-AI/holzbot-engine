@@ -12,6 +12,8 @@ from .config import (
     WALL_THICKNESS_INTERIOR_M
 )
 
+STRUCTURE_OPENING_AREA_THRESHOLD_M2 = 2.50
+
 
 def calculate_areas_for_plan(
     plan_id: str,
@@ -81,6 +83,9 @@ def calculate_areas_for_plan(
     area_windows_m2 = 0.0
     area_doors_interior_m2 = 0.0
     area_doors_exterior_m2 = 0.0
+    area_windows_structure_m2 = 0.0
+    area_doors_interior_structure_m2 = 0.0
+    area_doors_exterior_structure_m2 = 0.0
     counts = {"windows": 0, "doors_interior": 0, "doors_exterior": 0}
     
     # Determinăm înălțimile din formular
@@ -112,27 +117,36 @@ def calculate_areas_for_plan(
         if "window" in obj_type:
             area = width_m * window_height_m
             area_windows_m2 += area
+            if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
+                area_windows_structure_m2 += area
             counts["windows"] += 1
         elif "door" in obj_type:
             area = width_m * door_height_m
             status = opening.get("status", "").lower()
             if status == "exterior":
                 area_doors_exterior_m2 += area
+                if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
+                    area_doors_exterior_structure_m2 += area
                 counts["doors_exterior"] += 1
             else:
                 area_doors_interior_m2 += area
+                if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
+                    area_doors_interior_structure_m2 += area
                 counts["doors_interior"] += 1
 
     # Arii pereți nete (Vertical)
     # Pentru exterior: folosim outline (pentru finisaje și structură)
-    exterior_walls_net_m2 = max(0.0, exterior_walls_gross_m2 - area_windows_m2 - area_doors_exterior_m2)
+    exterior_openings_m2_finish = area_windows_m2 + area_doors_exterior_m2
+    exterior_openings_m2_structure = area_windows_structure_m2 + area_doors_exterior_structure_m2
+    exterior_walls_net_m2 = max(0.0, exterior_walls_gross_m2 - exterior_openings_m2_finish)
     
     # Pentru interior finisaje: folosim outline verde
     interior_walls_net_m2_finish = max(0.0, interior_walls_gross_m2_finish - area_doors_interior_m2)
     
     # Pentru interior structură: folosim skeleton (nu scădem deschiderile pentru structură)
     # Structura pereților interiori se calculează pe baza skeleton-ului, fără să scădem deschiderile
-    interior_walls_net_m2_structure = max(0.0, interior_walls_gross_m2_structure - area_doors_interior_m2)
+    interior_walls_net_m2_structure = max(0.0, interior_walls_gross_m2_structure - area_doors_interior_structure_m2)
+    exterior_walls_net_m2_structure = max(0.0, exterior_walls_gross_m2 - exterior_openings_m2_structure)
     
     # ==========================================
     # 3. SUPRAFEȚE ORIZONTALE (Direct Assignment)
@@ -182,14 +196,17 @@ def calculate_areas_for_plan(
                 "gross_area_m2": round(interior_walls_gross_m2_finish, 2),  # Pentru finisaje
                 "gross_area_m2_structure": round(interior_walls_gross_m2_structure, 2),  # Pentru structură
                 "openings_area_m2": round(area_doors_interior_m2, 2),
+                "openings_area_m2_structure": round(area_doors_interior_structure_m2, 2),
                 "net_area_m2": round(interior_walls_net_m2_finish, 2),  # Pentru finisaje
                 "net_area_m2_structure": round(interior_walls_net_m2_structure, 2)  # Pentru structură
             },
             "exterior": {
                 "length_m": round(exterior_length_m, 2),
                 "gross_area_m2": round(exterior_walls_gross_m2, 2),
-                "openings_area_m2": round(area_windows_m2 + area_doors_exterior_m2, 2),
-                "net_area_m2": round(exterior_walls_net_m2, 2)
+                "openings_area_m2": round(exterior_openings_m2_finish, 2),
+                "openings_area_m2_structure": round(exterior_openings_m2_structure, 2),
+                "net_area_m2": round(exterior_walls_net_m2, 2),
+                "net_area_m2_structure": round(exterior_walls_net_m2_structure, 2)
             }
         },
         
