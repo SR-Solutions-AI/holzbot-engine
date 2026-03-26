@@ -723,7 +723,8 @@ def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: Li
 
 def resolve_plans_roof_order(run_id: str) -> tuple[List[PlanInfo], Path, List[PlanInfo]]:
     """
-    Aceeași ordine ca la clean_workflow (floor_0, floor_1, …) pentru mapare cu roof_rectangles_edited.json.
+    Ordine pentru roof rectangles: de sus în jos (top -> ... -> ground/basement).
+    floor_0 devine etajul cel mai de sus.
     Returnează (plans_roof, job_root, plans) — plans = ordinea din load_plan_infos (pentru run_roof_for_run).
     """
     plans = load_plan_infos(run_id, stage_name=STAGE_NAME)
@@ -761,13 +762,15 @@ def resolve_plans_roof_order(run_id: str) -> tuple[List[PlanInfo], Path, List[Pl
                 pass
 
     if order_from_bottom is not None:
-        plans_roof = [plans[i] for i in order_from_bottom]
+        # floor_order.json este "de jos în sus"; pentru roof rectangles cerința este "de sus în jos".
+        plans_roof = [plans[i] for i in reversed(order_from_bottom)]
     else:
 
         def _key(p):
             return _floor_sort_key(p, job_root, basement_plan_id, run_id, run_dir)
 
-        plans_roof = sorted(plans, key=_key)
+        # Sortarea de bază e de jos în sus; pentru rectangles inversăm în top->down.
+        plans_roof = list(reversed(sorted(plans, key=_key)))
 
     return plans_roof, job_root, plans
 
@@ -831,6 +834,15 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
                     basement_plan_id = plans[oi].plan_id
             except Exception:
                 pass
+        # Keep basement plan id available even when floor_order.json exists.
+        if (run_dir / "basement_plan_id.json").exists():
+            try:
+                data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+                oi = data.get("basement_plan_index")
+                if oi is not None and 0 <= oi < len(plans):
+                    basement_plan_id = plans[oi].plan_id
+            except Exception:
+                pass
 
     # Indexul beciului în lista sortată plans_roof.
     basement_idx: int | None = None
@@ -841,7 +853,9 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
             if raw_bidx is not None:
                 original_bidx = int(raw_bidx)
                 if original_bidx in order_from_bottom:
-                    basement_idx = order_from_bottom.index(original_bidx)
+                    # order_from_bottom is bottom->top, but plans_roof is top->down.
+                    bottom_idx = order_from_bottom.index(original_bidx)
+                    basement_idx = (len(order_from_bottom) - 1) - bottom_idx
                     print(
                         f"   [roof] Beci: plan original index {original_bidx} -> roof index {basement_idx} (din floor_order)",
                         flush=True,
@@ -876,6 +890,15 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
                 types_result, angles_result = classify_roof_types_per_floor(
                     gemini, side_views, num_floors_for_gemini
                 )
+                # Gemini classifier returns floor indices in "bottom-up" semantic order
+                # (parter, etaj_1, ...). Our roof rectangles order is now "top-down".
+                # Remap Gemini indices accordingly so floor_0 stays top floor.
+                if types_result:
+                    n = int(num_floors_for_gemini)
+                    types_result = {int(n - 1 - int(k)): v for k, v in types_result.items()}
+                if angles_result:
+                    n = int(num_floors_for_gemini)
+                    angles_result = {int(n - 1 - int(k)): v for k, v in angles_result.items()}
                 if types_result:
                     floor_roof_types = types_result
                     print(f"   [roof] FOLOSIM tipuri acoperiș de la Gemini: {floor_roof_types}", flush=True)
