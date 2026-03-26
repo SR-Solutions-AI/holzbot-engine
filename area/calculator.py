@@ -15,6 +15,20 @@ from .config import (
 STRUCTURE_OPENING_AREA_THRESHOLD_M2 = 2.50
 
 
+def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float:
+    """
+    Height heuristic used when no explicit height is available from editor/raster.
+    """
+    t = str(obj_type or "").lower()
+    if "double" in t:
+        return 2.0
+    if width_m >= 2.0:
+        return 2.0
+    if width_m >= 1.35:
+        return 1.5
+    return 1.0
+
+
 def calculate_areas_for_plan(
     plan_id: str,
     floor_type: str,
@@ -88,21 +102,13 @@ def calculate_areas_for_plan(
     area_doors_exterior_structure_m2 = 0.0
     counts = {"windows": 0, "doors_interior": 0, "doors_exterior": 0}
     
-    # Determinăm înălțimile din formular
-    window_height_m = STANDARD_WINDOW_HEIGHT_M  # Default 1.25m
+    # Determinăm înălțimile; pentru ferestre NU mai folosim bodentiefe din formular.
+    # Prioritate: height_m din detecție/editor, fallback pe euristică din lățime.
+    window_height_m_default = STANDARD_WINDOW_HEIGHT_M  # fallback final
     door_height_m = STANDARD_DOOR_HEIGHT_M  # Default 2.05m
     
     if frontend_data:
         ferestre_usi = frontend_data.get("ferestreUsi", {})
-        
-        # Înălțime ferestre bazată pe bodentiefeFenster
-        bodentiefe = ferestre_usi.get("bodentiefeFenster", "")
-        if bodentiefe == "Nein":
-            window_height_m = 1.0  # 1m pentru toate geamurile
-        elif bodentiefe == "Ja – einzelne":
-            window_height_m = 1.5  # 1.5m pentru fiecare geam
-        elif bodentiefe == "Ja – mehrere / große Glasflächen":
-            window_height_m = 2.0  # 2m pentru toate geamurile
         
         # Înălțime uși bazată pe turhohe
         turhohe = ferestre_usi.get("turhohe", "")
@@ -115,7 +121,12 @@ def calculate_areas_for_plan(
         if width_m <= 0: continue
         
         if "window" in obj_type:
-            area = width_m * window_height_m
+            explicit_h = opening.get("height_m")
+            if explicit_h is not None and float(explicit_h) > 0:
+                win_h = float(explicit_h)
+            else:
+                win_h = _infer_window_height_from_width(width_m, obj_type) or window_height_m_default
+            area = width_m * win_h
             area_windows_m2 += area
             if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
                 area_windows_structure_m2 += area

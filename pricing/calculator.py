@@ -71,6 +71,18 @@ def calculate_pricing_for_plan(
         v = values_by_tag.get(tag)
         return v if v is not None and v != "" else fallback
 
+    def _as_bool(v: any, default: bool = False) -> bool:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        s = str(v).strip().lower()
+        if s in {"true", "1", "yes", "ja", "on"}:
+            return True
+        if s in {"false", "0", "no", "nein", "off"}:
+            return False
+        return default
+
     # Debug: afișăm toate cheile de finisaje disponibile
     print(f"🔍 [PRICING] Available finish keys in mat_finisaj: {list(mat_finisaj.keys())}")
     for key in ["finisajInterior_ground", "fatada_ground", "finisajInterior_floor_1", "fatada_floor_1", 
@@ -169,17 +181,22 @@ def calculate_pricing_for_plan(
         energy_level = _fv("energy_level") or performanta.get("nivelEnergetic", "Standard")
         heating_type = _fv("heating_type") or performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or "Gaz"
         has_ventilation = _fv("ventilation") if _fv("ventilation") is not None and _fv("ventilation") != "" else performanta.get("ventilatie", False)
+        include_electricity = _as_bool(_fv("include_electricity"), True)
+        include_sewage = _as_bool(_fv("include_sewage"), True)
+        electricity_coeffs_eff = dict(electricity_coeffs)
+        if not include_electricity:
+            electricity_coeffs_eff["coefficient_electricity_per_m2"] = 0.0
         if has_basement_livable:
             cost_utilities_b = calculate_utilities_details(
-                electricity_coeffs, heating_coeffs, ventilation_coeffs, sewage_coeffs,
+                electricity_coeffs_eff, heating_coeffs, ventilation_coeffs, sewage_coeffs,
                 total_floor_area_m2=floor_area, energy_level=energy_level,
-                heating_type=heating_type, has_ventilation=has_ventilation, has_sewage=True
+                heating_type=heating_type, has_ventilation=has_ventilation, has_sewage=include_sewage
             )
         else:
-            elec_base = float(electricity_coeffs.get("coefficient_electricity_per_m2", 60.0))
-            elec_modifiers = electricity_coeffs.get("energy_performance_modifiers", {})
+            elec_base = float(electricity_coeffs_eff.get("coefficient_electricity_per_m2", 0.0))
+            elec_modifiers = electricity_coeffs_eff.get("energy_performance_modifiers", {})
             elec_modifier = float(elec_modifiers.get(energy_level, 1.0))
-            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0))
+            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0)) if include_sewage else 0.0
             cost_utilities_b = {
                 "total_cost": round(floor_area * (elec_base * elec_modifier + sewage_base), 2),
                 "detailed_items": [
@@ -438,8 +455,14 @@ def calculate_pricing_for_plan(
     else:
         cost_roof = {"total_cost": 0.0, "detailed_items": []}
     
+    include_electricity = _as_bool(_fv("include_electricity"), True)
+    include_sewage = _as_bool(_fv("include_sewage"), True)
+    electricity_coeffs_eff = dict(electricity_coeffs)
+    if not include_electricity:
+        electricity_coeffs_eff["coefficient_electricity_per_m2"] = 0.0
+
     cost_utilities = calculate_utilities_details(
-        electricity_coeffs,
+        electricity_coeffs_eff,
         heating_coeffs,
         ventilation_coeffs,
         sewage_coeffs,
@@ -447,11 +470,18 @@ def calculate_pricing_for_plan(
         energy_level=energy_level,
         heating_type=heating_type,
         has_ventilation=has_ventilation,
-        has_sewage=True 
+        has_sewage=include_sewage
     )
 
+    stairs_type_selected = str(_fv("stairs_type") or (frontend_input.get("ferestreUsi", {}) or {}).get("treppeTyp") or "Standard").strip()
+    stairs_floors_count = frontend_input.get("_stairs_floors_count")
     if is_ground_floor:
-        cost_stairs = calculate_stairs_details(stairs_coeffs, total_floors)
+        cost_stairs = calculate_stairs_details(
+            stairs_coeffs,
+            total_floors,
+            stairs_floors_count=stairs_floors_count if isinstance(stairs_floors_count, int) else None,
+            stair_type=stairs_type_selected,
+        )
     else:
         cost_stairs = {"total_cost": 0.0, "detailed_items": []}
     
@@ -617,8 +647,11 @@ def calculate_pricing_for_plan(
         if has_basement_livable:
             # Beci locuibil: toate utilitățile (curent + încălzire + ventilație + canalizare)
             # Folosim suprafața calculată cu coeficientul pentru beci
+            electricity_coeffs_eff_basement = dict(electricity_coeffs)
+            if not include_electricity:
+                electricity_coeffs_eff_basement["coefficient_electricity_per_m2"] = 0.0
             cost_utilities_basement = calculate_utilities_details(
-                electricity_coeffs,
+                electricity_coeffs_eff_basement,
                 heating_coeffs,
                 ventilation_coeffs,
                 sewage_coeffs,
@@ -626,17 +659,17 @@ def calculate_pricing_for_plan(
                 energy_level=energy_level,
                 heating_type=heating_type,
                 has_ventilation=has_ventilation,
-                has_sewage=True
+                has_sewage=include_sewage
             )
             print(f"      ✅ Utilități beci locuibil: {cost_utilities_basement['total_cost']:,.0f} EUR (arie: {floor_area_basement:.2f} m²)")
         else:
             # Beci nelocuibil: doar curent + canalizare (fără încălzire și ventilație)
-            elec_base = float(electricity_coeffs.get("coefficient_electricity_per_m2", 60.0))
+            elec_base = float(electricity_coeffs.get("coefficient_electricity_per_m2", 60.0)) if include_electricity else 0.0
             elec_modifiers = electricity_coeffs.get("energy_performance_modifiers", {})
             elec_modifier = float(elec_modifiers.get(energy_level, 1.0))
             elec_cost = floor_area_basement * elec_base * elec_modifier
             
-            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0))
+            sewage_base = float(sewage_coeffs.get("coefficient_sewage_per_m2", 45.0)) if include_sewage else 0.0
             sewage_cost = floor_area_basement * sewage_base
             
             cost_utilities_basement = {

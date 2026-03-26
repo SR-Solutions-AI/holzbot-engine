@@ -91,7 +91,7 @@ STATIC_TRANSLATIONS = {
     "Structură": "Rohbau / Konstruktion",
     "Arhitectura": "Architektur",
     "Instalatii": "Haustechnik",
-    "Finisaje": "Ausbau & Oberflächen",
+    "Finisaje": "Innenausbau",
     "Casă completă": "Schlüsselfertig",
     "La rosu": "Rohbau",
     
@@ -125,10 +125,10 @@ STATIC_TRANSLATIONS = {
     "Angebot für Ihr Chiemgauer Massivholzhaus": "Angebot für Ihr Holzhaus",
     "Angebot für Ihr Chiemgauer Holzhaus": "Angebot für Ihr Holzhaus",
     "Angebot für Ihr Holzhaus": "Angebot für Ihr Holzhaus",
-    "Sehr geehrte Damen und Herren,": "Liebe Kundschaft,", 
+    "Sehr geehrte Damen und Herren,": "Sehr geehrte Damen und Herren,", 
     "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.": "vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung.",
     "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.": "HINWEIS: Unverbindliche Kostenschätzung. Kein verbindliches Angebot.",
-    "Planungsebene": "Planungsebene",
+    "Planungsebene": "Planungsstand",
     "Gesamtkostenzusammenstellung": "Gesamtkostenzusammenstellung",
     "Baukosten (Konstruktion, Ausbau, Technik)": "Baukosten (Konstruktion, Ausbau, Technik)",
     "Baustelleneinrichtung, Logistik & Planung (10%)": "Baustelleneinrichtung, Logistik & Planung",
@@ -207,7 +207,7 @@ STATIC_TRANSLATIONS = {
     "Projektübersicht": "Projektübersicht",
     "Allgemeine Baudaten (Auszug):": "Allgemeine Baudaten (Auszug):",
     "Nutzfläche": "Nutzfläche",
-    "Anzahl der Ebenen": "Anzahl der Ebenen",
+    "Anzahl der Ebenen": "Anzahl der Stockwerke",
     "Anzahl der Stockwerke": "Anzahl der Stockwerke",
     "Bausystem": "Bausystem",
     "Dachtyp": "Dachtyp",
@@ -670,7 +670,17 @@ def _normalize_nivel_oferta(frontend_data: dict) -> str:
     return "Casă completă"
 
 
-def _get_offer_inclusions(nivel_oferta: str) -> dict:
+def _get_offer_inclusions(nivel_oferta: str, frontend_data: dict | None = None) -> dict:
+    if frontend_data and bool(frontend_data.get("roof_only_offer")):
+        return {
+            "foundation": False,
+            "structure_walls": False,
+            "roof": True,
+            "floors_ceilings": False,
+            "openings": False,
+            "finishes": False,
+            "utilities": False,
+        }
     INCLUSIONS = {
         "Structură": {
             "foundation": True, "structure_walls": True, "roof": True, "floors_ceilings": True,
@@ -891,6 +901,25 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
         "Dachstuhl-Typ",
         _fv("daemmungDachdeckung", "dachstuhlTyp", "—"),
         _price(roof_c.get(dachstuhl_key))
+    ))
+    df_im = dd.get("dachfensterImDach")
+    df_typ = (dd.get("dachfensterTyp") or "").strip()
+    df_price = None
+    if df_im and df_typ:
+        _df_map = {
+            "Standard": "dachfenster_stueck_standard",
+            "Velux": "dachfenster_stueck_velux",
+            "Roto": "dachfenster_stueck_roto",
+            "Fakro": "dachfenster_stueck_fakro",
+            "Sonstiges": "dachfenster_stueck_sonstiges",
+        }
+        _pk = _df_map.get(df_typ, "dachfenster_stueck_standard")
+        df_price = roof_c.get(_pk)
+    rows.append((
+        "Dach",
+        "Dachfenster (Stückpreis gewählte Ausführung)",
+        "Ja, " + df_typ if df_im and df_typ else ("Nein" if not df_im else "Ja"),
+        _price(df_price) if df_im and df_typ else "—",
     ))
 
     # --- Ferestre / uși ---
@@ -2111,12 +2140,24 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
             # Încarcă area_data pentru a obține pereți și acoperiș
             plan = entry.get("info")
             if plan:
+                measurements_plan_path = plan.stage_work_dir / "measurements_plan.json"
                 area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
-                if area_json_path.exists():
+                area_data = None
+                if measurements_plan_path.exists():
+                    try:
+                        with open(measurements_plan_path, "r", encoding="utf-8") as f:
+                            mp = json.load(f)
+                        area_data = (mp.get("areas") or {}) if isinstance(mp, dict) else None
+                    except Exception:
+                        area_data = None
+                if area_data is None and area_json_path.exists():
                     try:
                         with open(area_json_path, "r", encoding="utf-8") as f:
                             area_data = json.load(f)
-                        
+                    except Exception as e:
+                        print(f"⚠️ [PDF] Eroare la încărcarea area_data pentru {plan.plan_id}: {e}")
+                if area_data:
+                    try:
                         # Pereți interiori și exteriori
                         walls_data = area_data.get("walls", {})
                         interior_walls = walls_data.get("interior", {}).get("net_area_m2", 0.0)
@@ -2252,9 +2293,42 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                     fin_ext_de = enforcer.get(fin_ext) if fin_ext else "—"
                     overview_items.append(f"<b>{enforcer.get('Fațadă')} ({floor_label}):</b> <b>{fin_ext_de}</b>")
     
-    # Suprafețe acoperiș (finisajele interioare și exterioare au fost eliminate conform cerințelor)
-    if total_roof_area > 0:
+    # Suprafețe acoperiș: afișăm atât cu Überstand cât și Dämmzone (fără Überstand) dacă avem roof_pricing.json.
+    run_id = str(frontend_data.get("run_id") or "").strip()
+    nivel_oferta_local = _normalize_nivel_oferta(frontend_data)
+    inclusions = _get_offer_inclusions(nivel_oferta_local, frontend_data)
+    roof_pricing_path = None
+    roof_pricing = {}
+    if run_id:
+        for base in (OUTPUT_ROOT / run_id, JOBS_ROOT / run_id / "output", RUNNER_ROOT / "output" / run_id):
+            p = base / "roof" / "roof_3d" / "entire" / "mixed" / "roof_pricing.json"
+            if p.exists():
+                roof_pricing_path = p
+                break
+        if roof_pricing_path and roof_pricing_path.exists():
+            try:
+                with open(roof_pricing_path, encoding="utf-8") as f:
+                    roof_pricing = json.load(f)
+            except Exception:
+                roof_pricing = {}
+    roof_area_with_overhang = None
+    roof_area_without_overhang = None
+    if roof_pricing_path and roof_pricing_path.exists() and inclusions.get("roof", False):
+        try:
+            rm = (roof_pricing or {}).get("roof_measurements") or {}
+            roof_area_with_overhang = rm.get("roof_area_with_overhang_m2")
+            roof_area_without_overhang = rm.get("roof_area_without_overhang_m2")
+        except Exception:
+            roof_area_with_overhang = None
+            roof_area_without_overhang = None
+
+    if roof_area_with_overhang is not None and float(roof_area_with_overhang) > 0:
+        overview_items.append(f"<b>Dachfläche (mit Überstand):</b> <b>{float(roof_area_with_overhang):.1f} m²</b>")
+    elif total_roof_area > 0:
         overview_items.append(f"<b>{enforcer.get('Dachfläche')}:</b> <b>{total_roof_area:.1f} m²</b>")
+
+    if roof_area_without_overhang is not None and float(roof_area_without_overhang) > 0:
+        overview_items.append(f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
     
     # Număr de etaje (Stockwerke în loc de Ebenen)
     overview_items.append(f"<b>{enforcer.get('Anzahl der Stockwerke')}:</b> <b>{num_floors}</b>")
@@ -2453,6 +2527,69 @@ def _legal_disclaimer(story, styles, enforcer: GermanEnforcer):
         styles["Body"]
     ))
 
+
+def _roof_only_intro(story, styles, client: dict, enforcer: GermanEnforcer):
+    story.append(Paragraph("Schätzungsangebot Dachstuhl", styles["H2"]))
+    story.append(Paragraph(enforcer.get("Sehr geehrte Damen und Herren,"), styles["Body"]))
+    story.append(Paragraph(
+        "Nachfolgend erhalten Sie unsere Kostenschätzung ausschließlich für die Dachkonstruktion (Dachstuhl), "
+        "basierend auf den übermittelten Planunterlagen und Ihren Angaben.",
+        styles["Body"],
+    ))
+    story.append(Spacer(1, 6 * mm))
+
+
+def _roof_only_summary(story, styles, frontend_data: dict, enforcer: GermanEnforcer):
+    story.append(Paragraph("Projektübersicht – Dach", styles["H2"]))
+    story.append(Spacer(1, 2 * mm))
+    pd = frontend_data.get("projektdaten") or {}
+    dd = frontend_data.get("daemmungDachdeckung") or {}
+    lines: list[str] = []
+    if pd:
+        if pd.get("projektumfang"):
+            lines.append(f"<b>Projektumfang:</b> {pd.get('projektumfang')}")
+        if pd.get("nutzungDachraum"):
+            lines.append(f"<b>Nutzung Dachraum:</b> {pd.get('nutzungDachraum')}")
+        if pd.get("deckenInnenausbau"):
+            lines.append(f"<b>Decken-Innenausbau:</b> {pd.get('deckenInnenausbau')}")
+    if dd:
+        if dd.get("daemmung"):
+            lines.append(f"<b>Dämmung:</b> {dd.get('daemmung')}")
+        if dd.get("unterdach"):
+            lines.append(f"<b>Unterdach:</b> {dd.get('unterdach')}")
+        if dd.get("dachstuhlTyp"):
+            lines.append(f"<b>Dachstuhl:</b> {dd.get('dachstuhlTyp')}")
+        if dd.get("dachdeckung"):
+            lines.append(f"<b>Dachdeckung:</b> {dd.get('dachdeckung')}")
+        if dd.get("sichtdachstuhl") is not None:
+            lines.append(f"<b>Sichtdachstuhl:</b> {'Ja' if dd.get('sichtdachstuhl') else 'Nein'}")
+    if not lines:
+        lines.append("Angaben gemäß Formular (Dachstuhl).")
+    story.append(Paragraph("<br/>".join(lines), styles["Body"]))
+    story.append(Spacer(1, 4 * mm))
+
+
+def _legal_disclaimer_roof_only(story, styles, enforcer: GermanEnforcer):
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph(enforcer.get("Rechtlicher Hinweis / Haftungsausschluss"), styles["H1"]))
+    story.append(Spacer(1, 2 * mm))
+    story.append(Paragraph(
+        "Dieses Dokument ist eine unverbindliche Kostenschätzung zur Budgetorientierung "
+        "<b>nur für die Dachkonstruktion (Dachstuhl)</b> und ersetzt kein verbindliches Angebot.",
+        styles["Body"],
+    ))
+    story.append(Paragraph(
+        enforcer.get(
+            "Die dargestellten Werte basieren auf den vom Nutzer bereitgestellten Informationen und typischen Erfahrungswerten der jeweiligen Holzbaufirma."
+        ),
+        styles["Body"],
+    ))
+    story.append(Spacer(1, 2 * mm))
+    story.append(Paragraph(
+        "Abweichungen durch Planänderungen, Ausführungsdetails oder individuelle Wünsche sind möglich.",
+        styles["Body"],
+    ))
+
 # ---------- MAIN GENERATOR ----------
 def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, job_root: Path | None = None) -> Path:
     print(f"🚀 [PDF] START: {run_id}")
@@ -2540,7 +2677,8 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     print(f"🔍 [PDF] COMPANY after overrides: name={COMPANY.get('name')!r}, legal={COMPANY.get('legal')!r}, addr_lines={COMPANY.get('addr_lines')!r}, phone={COMPANY.get('phone')!r}, email={COMPANY.get('email')!r}", flush=True)
     client_data_untranslated = frontend_data.get("client", frontend_data)
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
-    inclusions = _get_offer_inclusions(nivel_oferta)
+    roof_only = bool(frontend_data.get("roof_only_offer")) if isinstance(frontend_data, dict) else False
+    inclusions = _get_offer_inclusions(nivel_oferta, frontend_data)
     
     try: 
         plan_infos = load_plan_infos(run_id, stage_name="pricing")
@@ -2702,17 +2840,48 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     styles = _styles()
     story = []
     
-    _header_block(story, styles, offer_no, client_data_untranslated, enforcer, assets=assets, tenant_slug=tenant_slug) 
-    _intro(story, styles, client_data_untranslated, enforcer, offer_title) 
-    
-    # Secțiunea 2: Prezentare generală proiect (doar informații comune)
-    frontend_data_with_run_id = {**frontend_data, "run_id": run_id}
-    _project_overview(story, styles, frontend_data_with_run_id, enforcer, plans_data)
+    _header_block(story, styles, offer_no, client_data_untranslated, enforcer, assets=assets, tenant_slug=tenant_slug)
+    if roof_only:
+        _roof_only_intro(story, styles, client_data_untranslated, enforcer)
+        _roof_only_summary(story, styles, frontend_data, enforcer)
+        # Roof-only offer: show chosen price positions (aggregated total), without measurements.
+        if roof_pricing_path and roof_pricing_path.exists():
+            try:
+                rp = roof_pricing or {}
+                rp_items = rp.get("detailed_items") or rp.get("items") or []
+                rp_items = [it for it in rp_items if float(it.get("cost", 0) or 0) > 0]
+                if rp_items:
+                    story.append(Paragraph("Preisaufstellung Dach (gesamt)", styles["H2"]))
+                    story.append(Spacer(1, 2 * mm))
+                    head = [P("Position", "CellBold"), P("Preis", "CellBold")]
+                    rows = []
+                    for it in rp_items:
+                        rows.append([
+                            P(str(it.get("name") or "Position"), "Cell"),
+                            P(_money(float(it.get("cost", 0) or 0)), "Cell"),
+                        ])
+                    rows.append([P("<b>Gesamtsumme Dach</b>", "CellBold"), P(_money(float(rp.get("total_cost", 0) or 0)), "CellBold")])
+                    tbl = Table([head] + rows, colWidths=[125 * mm, 45 * mm])
+                    tbl.setStyle(TableStyle([
+                        ("GRID", (0, 0), (-1, -1), 0.3, colors.black),
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F1E6D3")),
+                        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ]))
+                    story.append(tbl)
+                    story.append(Spacer(1, 3 * mm))
+            except Exception as _e:
+                pass
+    else:
+        _intro(story, styles, client_data_untranslated, enforcer, offer_title)
+        # Secțiunea 2: Prezentare generală proiect (doar informații comune)
+        frontend_data_with_run_id = {**frontend_data, "run_id": run_id}
+        _project_overview(story, styles, frontend_data_with_run_id, enforcer, plans_data)
     
     # Structură de cost simplificată (eliminată complet conform cerințelor)
     # _simplified_cost_structure(story, styles, plans_data, inclusions, enforcer)
     
-    # Calculează ferestre și uși la total pentru afișare la planuri
+    # Calculează ferestre și uși la total pentru afișare la planuri (nu pentru ofertă doar acoperiș)
     total_windows_global = 0
     total_doors_global = 0
     total_doors_interior = 0
@@ -2720,7 +2889,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     total_windows_area_global = 0.0
     total_doors_area_global = 0.0
     
-    if plans_data:
+    if plans_data and not roof_only:
         for entry in plans_data:
             pricing = entry.get("pricing", {})
             breakdown = pricing.get("breakdown", {})
@@ -2756,79 +2925,9 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         # Debug final
         print(f"🔍 [PDF] Final door counts: total={total_doors_global}, interior={total_doors_interior}, exterior={total_doors_exterior}")
     
-    # Planuri (side by side, doar imagini, fără tabele detaliate)
+    # Planuri (side by side) și ferestre/uși — omise pentru ofertă doar Dachstuhl
     if plans_data:
-        story.append(Spacer(1, 4*mm))
-        # Titlul "Planungsebenen" a fost eliminat conform cerințelor
-        
-        # Adăugăm informații despre ferestre și uși conform pozei
-        # Trebuie să citim datele din formular pentru Ausführung
-        ferestre_usi = frontend_data.get("ferestreUsi", {})
-        bodentiefe_fenster = ferestre_usi.get("bodentiefeFenster", "Nein")
-        turhohe = ferestre_usi.get("turhohe", "Standard")
-        
-        # Mapăm valorile din formular la textul german pentru ferestre
-        ausfuhrung_fenster_map = {
-            "Nein": "Standard",
-            "Ja – einzelne": "erhöhter Glasanteil",
-            "Ja – mehrere / große Glasflächen": "erhöhter Glasanteil"
-        }
-        ausfuhrung_fenster = ausfuhrung_fenster_map.get(bodentiefe_fenster, "Standard")
-        
-        # Mapăm valorile din formular la textul german pentru uși
-        ausfuhrung_tur_map = {
-            "Standard (2,0 m)": "Standard",
-            "Erhöht / Sondermaß (2,2+ m)": "Erhöht"
-        }
-        ausfuhrung_tur = ausfuhrung_tur_map.get(turhohe, "Standard")
-        
-        # Calculăm prețul total pentru ferestre și uși separat
-        windows_total_price = 0.0
-        doors_total_price = 0.0
-        for entry in plans_data:
-            pricing = entry.get("pricing", {})
-            breakdown = pricing.get("breakdown", {})
-            openings_bd = breakdown.get("openings", {})
-            openings_items = openings_bd.get("items", []) or openings_bd.get("detailed_items", [])
-            
-            for op in openings_items:
-                obj_type = str(op.get("type", "")).lower()
-                cost = float(op.get("total_cost", op.get("cost", 0.0)))
-                
-                if "window" in obj_type:
-                    windows_total_price += cost
-                elif "door" in obj_type:
-                    doors_total_price += cost
-        
-        # Afișăm informații despre ferestre (cu KeepTogether pentru a rămâne pe aceeași pagină)
-        if total_windows_global > 0:
-            fenster_content = [
-                Paragraph(f"<b>Fenster & Verglasung</b>", styles["H3"]),
-                Paragraph(f"Anzahl Fenster (laut Plan): {total_windows_global}", styles["Body"]),
-                Paragraph(f"Ausführung: {ausfuhrung_fenster}", styles["Body"])
-            ]
-            if windows_total_price > 0:
-                fenster_content.append(Paragraph(f"Gesamtpreis Fenster & Verglasung: {_money(windows_total_price)}", styles["Body"]))
-            fenster_content.append(Spacer(1, 2*mm))
-            story.append(KeepTogether(fenster_content))
-        
-        # Afișăm informații despre uși (cu KeepTogether pentru a rămâne pe aceeași pagină)
-        if total_doors_global > 0:
-            turen_content = [
-                Paragraph(f"<b>Türen</b>", styles["H3"]),
-                Paragraph(f"Anzahl Türen (laut Plan): {total_doors_global}", styles["Body"]),
-                Paragraph(f"Ausführung: {ausfuhrung_tur}", styles["Body"])
-            ]
-            if total_doors_interior > 0:
-                turen_content.append(Paragraph(f"Innentüren: {total_doors_interior}", styles["Body"]))
-            if total_doors_exterior > 0:
-                turen_content.append(Paragraph(f"Außentüren / Balkontüren: {total_doors_exterior}", styles["Body"]))
-            if doors_total_price > 0:
-                turen_content.append(Paragraph(f"Gesamtpreis Türen: {_money(doors_total_price)}", styles["Body"]))
-            turen_content.append(Spacer(1, 2*mm))
-            story.append(KeepTogether(turen_content))
-
-        # Dach / Dämmung & Dachdeckung – preț acoperiș din roof_pricing.json (workflow nou) sau fallback la plans_data
+        # Dach / Dämmung & Dachdeckung – preț acoperiș din roof_pricing.json sau fallback la plans_data
         roof_total_price = roof_pricing_total_eur if roof_pricing_total_eur is not None and roof_pricing_total_eur > 0 else 0.0
         if roof_total_price == 0:
             for entry in plans_data:
@@ -2841,94 +2940,136 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 Spacer(1, 2*mm),
             ]
             story.append(KeepTogether(dach_content))
-        
-        # Pregătim imagini pentru afișare side by side
-        plan_images = []
-        plan_labels = []
-        plan_info_texts = []
-        
-        for entry in plans_data:
-            plan = entry["info"]
-            pricing = entry["pricing"]
+
+        if not roof_only:
+            story.append(Spacer(1, 4*mm))
+            # Titlul "Planungsebenen" a fost eliminat conform cerințelor
             
-            # Titlurile de deasupra planurilor au fost eliminate conform cerințelor
-            plan_labels.append("")  # Nu mai afișăm titluri
+            # Adăugăm informații despre ferestre și uși conform pozei
+            ferestre_usi = frontend_data.get("ferestreUsi", {})
+            turhohe = ferestre_usi.get("turhohe", "Standard")
+            window_quality = ferestre_usi.get("windowQuality", "Standard")
             
-            # Pregătim textul cu informații specifice etajului (fără cost și fără suprafață)
-            info_text = []
-            # Nu mai afișăm suprafața la fiecare etaj conform cerințelor
-            plan_info_texts.append("<br/>".join(info_text) if info_text else "")
+            ausfuhrung_tur_map = {
+                "Standard (2,0 m)": "Standard",
+                "Erhöht / Sondermaß (2,2+ m)": "Erhöht"
+            }
+            ausfuhrung_tur = ausfuhrung_tur_map.get(turhohe, "Standard")
             
-            # Pregătim imaginea (din output pipeline: scale/raster, astfel apare în ofertă)
-            plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
-            if plan_img_path and plan_img_path.exists():
-                try:
-                    im = PILImage.open(plan_img_path).convert("L")
-                    im = ImageEnhance.Brightness(im).enhance(0.9)
-                    im = ImageOps.autocontrast(im)
-                    width, height = im.size
-                    aspect = width / height
-                    # Lățime pentru side by side (2 coloane)
-                    target_width = (A4[0]-36*mm-10*mm) / 2  # 10mm pentru spațiu între imagini
-                    if aspect < 1: 
-                        target_width = target_width * 0.9
-                    img_byte_arr = io.BytesIO()
-                    im.save(img_byte_arr, format='PNG')
-                    img_byte_arr.seek(0)
-                    rl_img = Image(img_byte_arr)
-                    rl_img._restrictSize(target_width, 100*mm)
-                    plan_images.append(rl_img)
-                except: 
+            windows_total_price = 0.0
+            doors_total_price = 0.0
+            for entry in plans_data:
+                pricing = entry.get("pricing", {})
+                breakdown = pricing.get("breakdown", {})
+                openings_bd = breakdown.get("openings", {})
+                openings_items = openings_bd.get("items", []) or openings_bd.get("detailed_items", [])
+                
+                for op in openings_items:
+                    obj_type = str(op.get("type", "")).lower()
+                    cost = float(op.get("total_cost", op.get("cost", 0.0)))
+                    
+                    if "window" in obj_type:
+                        windows_total_price += cost
+                    elif "door" in obj_type:
+                        doors_total_price += cost
+            
+            if total_windows_global > 0:
+                fenster_content = [
+                    Paragraph(f"<b>Fenster & Verglasung</b>", styles["H3"]),
+                    Paragraph(f"Anzahl Fenster (laut Plan): {total_windows_global}", styles["Body"]),
+                    Paragraph(f"Ausführung: {window_quality}", styles["Body"])
+                ]
+                if windows_total_price > 0:
+                    fenster_content.append(Paragraph(f"Gesamtpreis Fenster & Verglasung: {_money(windows_total_price)}", styles["Body"]))
+                fenster_content.append(Spacer(1, 2*mm))
+                story.append(KeepTogether(fenster_content))
+            
+            if total_doors_global > 0:
+                turen_content = [
+                    Paragraph(f"<b>Türen</b>", styles["H3"]),
+                    Paragraph(f"Anzahl Türen (laut Plan): {total_doors_global}", styles["Body"]),
+                    Paragraph(f"Ausführung: {ausfuhrung_tur}", styles["Body"])
+                ]
+                if total_doors_interior > 0:
+                    turen_content.append(Paragraph(f"Innentüren: {total_doors_interior}", styles["Body"]))
+                if total_doors_exterior > 0:
+                    turen_content.append(Paragraph(f"Außentüren / Balkontüren: {total_doors_exterior}", styles["Body"]))
+                if doors_total_price > 0:
+                    turen_content.append(Paragraph(f"Gesamtpreis Türen: {_money(doors_total_price)}", styles["Body"]))
+                turen_content.append(Spacer(1, 2*mm))
+                story.append(KeepTogether(turen_content))
+
+            plan_images = []
+            plan_labels = []
+            plan_info_texts = []
+            
+            for entry in plans_data:
+                plan = entry["info"]
+                pricing = entry["pricing"]
+                plan_labels.append("")
+                info_text = []
+                plan_info_texts.append("<br/>".join(info_text) if info_text else "")
+                plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+                if plan_img_path and plan_img_path.exists():
+                    try:
+                        im = PILImage.open(plan_img_path).convert("L")
+                        im = ImageEnhance.Brightness(im).enhance(0.9)
+                        im = ImageOps.autocontrast(im)
+                        width, height = im.size
+                        aspect = width / height
+                        target_width = (A4[0]-36*mm-10*mm) / 2
+                        if aspect < 1: 
+                            target_width = target_width * 0.9
+                        img_byte_arr = io.BytesIO()
+                        im.save(img_byte_arr, format='PNG')
+                        img_byte_arr.seek(0)
+                        rl_img = Image(img_byte_arr)
+                        rl_img._restrictSize(target_width, 100*mm)
+                        plan_images.append(rl_img)
+                    except: 
+                        plan_images.append(None)
+                else:
                     plan_images.append(None)
-            else:
-                plan_images.append(None)
-        
-        # Afișăm planurile side by side (2 per rând)
-        num_plans = len(plans_data)
-        for i in range(0, num_plans, 2):
-            row_images = []
-            row_labels = []
-            row_infos = []
             
-            # Primul plan din rând
-            if i < num_plans:
-                row_labels.append(plan_labels[i])
-                row_infos.append(plan_info_texts[i])
-                row_images.append(plan_images[i] if plan_images[i] else "")
-            
-            # Al doilea plan din rând (dacă există)
-            if i + 1 < num_plans:
-                row_labels.append(plan_labels[i + 1])
-                row_infos.append(plan_info_texts[i + 1])
-                row_images.append(plan_images[i + 1] if plan_images[i + 1] else "")
-            else:
-                # Dacă avem doar un plan, adăugăm celula goală
-                row_labels.append("")
-                row_infos.append("")
-                row_images.append("")
-            
-            # Creăm tabel cu 2 coloane pentru planuri side by side
-            col_width = (A4[0]-36*mm-10*mm) / 2
-            
-            # Rând cu imagini (titlurile au fost eliminate conform cerințelor)
-            img_row = [
-                row_images[0] if row_images[0] else P("", "Body"),
-                row_images[1] if row_images[1] else P("", "Body")
-            ]
-            
-            # Nu mai afișăm label-uri și info (au fost eliminate conform cerințelor)
-            table_data = [img_row]
-            tbl = Table(table_data, colWidths=[col_width, col_width])
-            tbl.setStyle(TableStyle([
-                ("VALIGN", (0,0), (-1,-1), "TOP"),
-                ("ALIGN", (0,0), (-1,-1), "CENTER"),
-                ("LEFTPADDING", (0,0), (-1,-1), 0),
-                ("RIGHTPADDING", (0,0), (-1,-1), 5*mm),
-            ]))
-            
-            story.append(tbl)
-            if i + 2 < num_plans:  # Dacă mai sunt planuri, adăugăm spațiu
-                story.append(Spacer(1, 6*mm))
+            num_plans = len(plans_data)
+            for i in range(0, num_plans, 2):
+                row_images = []
+                row_labels = []
+                row_infos = []
+                
+                if i < num_plans:
+                    row_labels.append(plan_labels[i])
+                    row_infos.append(plan_info_texts[i])
+                    row_images.append(plan_images[i] if plan_images[i] else "")
+                
+                if i + 1 < num_plans:
+                    row_labels.append(plan_labels[i + 1])
+                    row_infos.append(plan_info_texts[i + 1])
+                    row_images.append(plan_images[i + 1] if plan_images[i + 1] else "")
+                else:
+                    row_labels.append("")
+                    row_infos.append("")
+                    row_images.append("")
+                
+                col_width = (A4[0]-36*mm-10*mm) / 2
+                
+                img_row = [
+                    row_images[0] if row_images[0] else P("", "Body"),
+                    row_images[1] if row_images[1] else P("", "Body")
+                ]
+                
+                table_data = [img_row]
+                tbl = Table(table_data, colWidths=[col_width, col_width])
+                tbl.setStyle(TableStyle([
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 0),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 5*mm),
+                ]))
+                
+                story.append(tbl)
+                if i + 2 < num_plans:
+                    story.append(Spacer(1, 6*mm))
 
     # Nu mai afișăm tabele detaliate pentru openings și utilities - sunt în structura simplificată
 
@@ -2962,8 +3103,13 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         P(enforcer.get("Betrag"), "CellBold")
     ]
     
+    pos0_label = (
+        "Dachkosten (Dachstuhl)"
+        if roof_only
+        else enforcer.get("Baukosten (Konstruktion, Ausbau, Technik)")
+    )
     data = [
-        [P(enforcer.get("Baukosten (Konstruktion, Ausbau, Technik)")), P(_money(filtered_total))],
+        [P(pos0_label), P(_money(filtered_total))],
         [P(enforcer.get("Baustelleneinrichtung, Logistik & Planung")), P(_money(cost_margin_logistics))],
         [P(enforcer.get("Bauleitung & Koordination")), P(_money(cost_margin_oversight))],
         [P(f"<b>{enforcer.get('Nettosumme (exkl. MwSt.)')}</b>"), P(_money(net), "CellBold")],
@@ -2982,8 +3128,10 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     story.append(tbl)
     story.append(Spacer(1, 5*mm))
     
-    # Legal disclaimer
-    _legal_disclaimer(story, styles, enforcer)
+    if roof_only:
+        _legal_disclaimer_roof_only(story, styles, enforcer)
+    else:
+        _legal_disclaimer(story, styles, enforcer)
     
     doc.build(
         story, 
@@ -3027,6 +3175,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
 
     frontend_data = load_frontend_data_for_run(run_id, job_root)
     tenant_slug = frontend_data.get("tenant_slug") if isinstance(frontend_data, dict) else None
+    roof_only = bool(frontend_data.get("roof_only_offer")) if isinstance(frontend_data, dict) else False
 
     # Preisdatenbank (coefficienți preț) pentru tabelul Formular + Preise
     try:
@@ -3131,7 +3280,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
 
     # ADMIN: Folosim aceeași filtrare ca în user PDF pentru același preț
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
-    inclusions = _get_offer_inclusions(nivel_oferta)
+    inclusions = _get_offer_inclusions(nivel_oferta, frontend_data)
     
     for pos, p_data in enumerate(enriched_ordered):
         plan = p_data["plan"]
@@ -3165,8 +3314,8 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue
                 
-                # Wintergärten & Balkone: inclus în ADMIN PDF (tot ce intră în calcul)
-                if category_key == "wintergaerten_balkone":
+                # Wintergärten & Balkone: inclus în ADMIN PDF (tot ce intră în calcul) — nu pentru Dachstuhl-only
+                if category_key == "wintergaerten_balkone" and not roof_only:
                     filtered_breakdown[category_key] = category_data
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue
@@ -3226,41 +3375,45 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
     story.append(Paragraph(f"ADMIN OFFER - {offer_no}", styles["H1"]))
     story.append(Paragraph(f"<b>Mandant:</b> {tenant_slug or '—'}", styles["Cell"]))
     story.append(Spacer(1, 6*mm))
+    if roof_only:
+        story.append(Paragraph("<b>Dachstuhl-Schätzung</b> – nur Dachkosten (kein Formularpreis-Überblick für Vollhaus).", styles["Body"]))
+        story.append(Spacer(1, 4*mm))
 
     # ADMIN: Tabel Variablen & Preise (Formularauswahl + Preisdatenbank)
-    story.append(Spacer(1, 6*mm))
-    story.append(Paragraph("VARIABLEN & PREISE (FORMULARAUSWAHL UND PREISDATENBANK)", styles["H2"]))
-    story.append(Spacer(1, 2*mm))
-    try:
-        form_preis_rows = _build_form_preisdatenbank_rows(frontend_data, pricing_coeffs, enforcer)
-        if form_preis_rows:
-            head = [
-                P(enforcer.get("Kategorie") or "Kategorie", "CellBold"),
-                P(enforcer.get("Parameter") or "Parameter", "CellBold"),
-                P("Im Formular gewählt", "CellBold"),
-                P("Preis (Preisdatenbank)", "CellBold"),
-            ]
-            data = []
-            for cat, param, form_val, price_str in form_preis_rows:
-                data.append([P(cat, "CellSmall"), P(param, "CellSmall"), P(form_val or "—", "Cell"), P(price_str or "—", "Cell")])
-            tbl = Table([head] + data, colWidths=[35*mm, 48*mm, 52*mm, 42*mm])
-            tbl.setStyle(TableStyle([
-                ("GRID", (0,0), (-1,-1), 0.3, colors.black),
-                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F1E6D3")),
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                ("ALIGN", (3,0), (3,-1), "RIGHT"),
-                ("FONTSIZE", (0,0), (-1,-1), 8),
-                ("LEFTPADDING", (0,0), (-1,-1), 3),
-                ("RIGHTPADDING", (0,0), (-1,-1), 3),
-            ]))
-            story.append(tbl)
-        else:
-            story.append(Paragraph("Keine Preisdatenbank geladen oder keine Variablen.", styles["Small"]))
-    except Exception as e:
-        story.append(Paragraph(f"Tabelle konnte nicht erstellt werden: {e}", styles["Small"]))
+    if not roof_only:
+        story.append(Spacer(1, 6*mm))
+        story.append(Paragraph("VARIABLEN & PREISE (FORMULARAUSWAHL UND PREISDATENBANK)", styles["H2"]))
+        story.append(Spacer(1, 2*mm))
+        try:
+            form_preis_rows = _build_form_preisdatenbank_rows(frontend_data, pricing_coeffs, enforcer)
+            if form_preis_rows:
+                head = [
+                    P(enforcer.get("Kategorie") or "Kategorie", "CellBold"),
+                    P(enforcer.get("Parameter") or "Parameter", "CellBold"),
+                    P("Im Formular gewählt", "CellBold"),
+                    P("Preis (Preisdatenbank)", "CellBold"),
+                ]
+                data = []
+                for cat, param, form_val, price_str in form_preis_rows:
+                    data.append([P(cat, "CellSmall"), P(param, "CellSmall"), P(form_val or "—", "Cell"), P(price_str or "—", "Cell")])
+                tbl = Table([head] + data, colWidths=[35*mm, 48*mm, 52*mm, 42*mm])
+                tbl.setStyle(TableStyle([
+                    ("GRID", (0,0), (-1,-1), 0.3, colors.black),
+                    ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F1E6D3")),
+                    ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                    ("ALIGN", (3,0), (3,-1), "RIGHT"),
+                    ("FONTSIZE", (0,0), (-1,-1), 8),
+                    ("LEFTPADDING", (0,0), (-1,-1), 3),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 3),
+                ]))
+                story.append(tbl)
+            else:
+                story.append(Paragraph("Keine Preisdatenbank geladen oder keine Variablen.", styles["Small"]))
+        except Exception as e:
+            story.append(Paragraph(f"Tabelle konnte nicht erstellt werden: {e}", styles["Small"]))
 
     # ADMIN: Planuri cu imagini și date detaliate
-    story.append(Paragraph("DETALII PLANURI & KOSTEN", styles["H2"]))
+    story.append(Paragraph("DACH – KOSTEN (DETAIL)" if roof_only else "DETALII PLANURI & KOSTEN", styles["H2"]))
     story.append(Spacer(1, 3*mm))
     
     for entry in plans_data:
@@ -3277,29 +3430,30 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         story.append(Paragraph(f"Plan: {floor_label} ({plan.plan_id})", styles["H2"]))
         story.append(Spacer(1, 2*mm))
         
-        # ADMIN: Adaugă imaginea planului
-        plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
-        if plan_img_path and plan_img_path.exists():
-            try:
-                im = PILImage.open(plan_img_path).convert("L")
-                im = ImageEnhance.Brightness(im).enhance(0.9)
-                im = ImageOps.autocontrast(im)
-                width, height = im.size
-                aspect = width / height
-                target_width = A4[0]-36*mm
-                if aspect < 1: 
-                    target_width = (A4[0]-36*mm) * 0.65
-                img_byte_arr = io.BytesIO()
-                im.save(img_byte_arr, format='PNG')
-                img_byte_arr.seek(0)
-                rl_img = Image(img_byte_arr)
-                rl_img._restrictSize(target_width, 75*mm)
-                rl_img.hAlign = 'CENTER'
-                story.append(Spacer(1, 2*mm))
-                story.append(rl_img)
-                story.append(Spacer(1, 3*mm))
-            except Exception as e:
-                print(f"⚠️ [PDF ADMIN] Nu pot încărca imaginea planului: {e}")
+        # ADMIN: Adaugă imaginea planului (nicht bei reiner Dachstuhl-Schätzung)
+        if not roof_only:
+            plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+            if plan_img_path and plan_img_path.exists():
+                try:
+                    im = PILImage.open(plan_img_path).convert("L")
+                    im = ImageEnhance.Brightness(im).enhance(0.9)
+                    im = ImageOps.autocontrast(im)
+                    width, height = im.size
+                    aspect = width / height
+                    target_width = A4[0]-36*mm
+                    if aspect < 1: 
+                        target_width = (A4[0]-36*mm) * 0.65
+                    img_byte_arr = io.BytesIO()
+                    im.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    rl_img = Image(img_byte_arr)
+                    rl_img._restrictSize(target_width, 75*mm)
+                    rl_img.hAlign = 'CENTER'
+                    story.append(Spacer(1, 2*mm))
+                    story.append(rl_img)
+                    story.append(Spacer(1, 3*mm))
+                except Exception as e:
+                    print(f"⚠️ [PDF ADMIN] Nu pot încărca imaginea planului: {e}")
         
         bd = pricing.get("breakdown", {})
         
@@ -3363,8 +3517,9 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         P("Betrag", "CellBold")
     ]
     
+    admin_pos0 = "Dachkosten (Dachstuhl)" if roof_only else "Baukosten (Konstruktion, Ausbau, Technik)"
     data = [
-        [P("Baukosten (Konstruktion, Ausbau, Technik)"), P(_money(filtered_total))],
+        [P(admin_pos0), P(_money(filtered_total))],
         [P("Baustelleneinrichtung, Logistik & Planung"), P(_money(cost_margin_logistics))],
         [P("Bauleitung & Koordination"), P(_money(cost_margin_oversight))],
         [P("<b>Nettosumme (exkl. MwSt.)</b>"), P(_money(net), "CellBold")],
@@ -3384,7 +3539,10 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
     
     # ADMIN: Fără closing blocks verbose, doar o notă minimală
     story.append(Spacer(1, 8*mm))
-    story.append(Paragraph("ADMIN VERSION - Raw data, no branding", styles["Small"]))
+    story.append(Paragraph(
+        "ADMIN VERSION – nur Dachkosten (Dachstuhl)" if roof_only else "ADMIN VERSION - Raw data, no branding",
+        styles["Small"],
+    ))
     
     # ADMIN: Fără canvas fancy, doar PDF simplu
     doc.build(story)
@@ -3442,7 +3600,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
 
     # Load actual pricing data for each plan - folosim aceeași filtrare ca în user PDF
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
-    inclusions = _get_offer_inclusions(nivel_oferta)
+    inclusions = _get_offer_inclusions(nivel_oferta, frontend_data)
     
     plans_data = []
     for plan in plan_infos:
@@ -3620,7 +3778,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     tip_fundatie_beci = structura_cladirii.get("tipFundatieBeci")
     pilons = structura_cladirii.get("pilons")
     inaltime_etaje = structura_cladirii.get("inaltimeEtaje")
-    bodentiefe_fenster = ferestre_usi.get("bodentiefeFenster")
     window_quality = ferestre_usi.get("windowQuality")
     turhohe = ferestre_usi.get("turhohe")
     nivel_energetic = performanta.get("nivelEnergetic") or performanta_energetica.get("nivelEnergetic")
@@ -3649,7 +3806,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     story.append(Paragraph(f"Roof type: {_en(tip_acoperis)}", styles["Body"]))
     
     story.append(Paragraph("<b>Step – Windows &amp; Doors</b>", styles["H3"]))
-    story.append(Paragraph(f"Floor-to-ceiling windows / large glass: {_en(bodentiefe_fenster)}", styles["Body"]))
     story.append(Paragraph(f"Window quality: {_en(window_quality)}", styles["Body"]))
     story.append(Paragraph(f"Door height: {_en(turhohe)}", styles["Body"]))
     
@@ -3695,6 +3851,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             styles["Body"]
         ))
         scale_dir = plan.stage_work_dir.parent.parent / "scale" / plan.plan_id
+        measurements_plan_path = plan.stage_work_dir / "measurements_plan.json"
         room_scales_path = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
         area_json_path_foundation = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
         room_areas_list = []
@@ -3716,6 +3873,21 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             except Exception:
                 pass
         foundation_area = 0.0
+        surface_area_source = ""
+        surface_area_px = None
+        surface_area_mpp = None
+        if measurements_plan_path.exists():
+            try:
+                with open(measurements_plan_path, "r", encoding="utf-8") as f:
+                    mp = json.load(f)
+                areas_mp = (mp.get("areas") or {}) if isinstance(mp, dict) else {}
+                surfaces_mp = (areas_mp.get("surfaces") or {}) if isinstance(areas_mp, dict) else {}
+                foundation_area = float(surfaces_mp.get("foundation_m2") or 0.0) or foundation_area
+                surface_area_source = str(areas_mp.get("surface_area_source") or "")
+                surface_area_px = areas_mp.get("surface_area_from_09_interior_px")
+                surface_area_mpp = areas_mp.get("surface_area_from_09_interior_mpp")
+            except Exception:
+                pass
         items = foundation.get("detailed_items", [])
         for item in items:
             foundation_area = item.get("area_m2", 0) or foundation_area
@@ -3734,13 +3906,18 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 pass
         story.append(Paragraph("<b>House surface (foundation area for this plan):</b>", styles["Body"]))
         if room_areas_list:
-            story.append(Paragraph("Per-room areas (sum = foundation area):", styles["Body"]))
+            story.append(Paragraph("Per-room OCR areas (informative only):", styles["Body"]))
             for room_id, area_m2 in room_areas_list:
                 story.append(Paragraph(f"  • Room «{room_id}»: {area_m2:.2f} m²", styles["Small"]))
-            story.append(Paragraph(f"  <b>Sum of rooms: {total_from_rooms:.2f} m²</b>", styles["Body"]))
+            story.append(Paragraph(f"  Sum of OCR rooms: {total_from_rooms:.2f} m²", styles["Small"]))
             story.append(Paragraph(f"<b>Total house/foundation area used: {foundation_area:.2f} m²</b>", styles["Body"]))
         else:
             story.append(Paragraph(f"Total foundation area: <b>{foundation_area:.2f} m²</b>", styles["Body"]))
+        if surface_area_source == "09_interior_mask" and surface_area_px is not None and surface_area_mpp:
+            story.append(Paragraph(
+                f"Surface source: 09_interior mask, computed as {int(surface_area_px)} px × ({float(surface_area_mpp):.9f} m/px)^2.",
+                styles["Small"]
+            ))
         if foundation and foundation.get("total_cost", 0) > 0 and items:
             for item in items:
                 area = item.get("area_m2", 0) or foundation_area
@@ -3993,11 +4170,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
         story.append(Paragraph(
             "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m². "
-            "Area = width (m) × height (m). Heights from form (Bodentiefe, Türhöhe) are used only for area.",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"<b>Window height (Bodentiefe):</b> {_en(bodentiefe_fenster)} → used for area only.",
+            "Area = width (m) × height (m). Height comes from editor/raster when available (or width-based heuristic); Türhöhe remains form-based.",
             styles["Body"]
         ))
         story.append(Paragraph(

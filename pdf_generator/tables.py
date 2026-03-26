@@ -141,14 +141,14 @@ def create_plan_summary_table(plan_data: dict, plan_id: str, enforcer: GermanEnf
     # Traducem denumirile etajelor
     floor_names = {
         "ground_floor": enforcer.get("Parter (Ground Floor)"),
-        "top_floor": enforcer.get("Etaj (Top Floor)"),
-        "intermediate": enforcer.get("Etaj Intermediar"),
+        "top_floor": enforcer.get("Oberstes Stockwerk"),
+        "intermediate": enforcer.get("Mittleres Stockwerk"),
         "unknown": enforcer.get("Necunoscut"),
     }
 
     rows = [
         [P(enforcer.get("Plan ID"), "CellBold"), P(enforcer.get(plan_id), "Cell")],
-        [P(enforcer.get("Tip Etaj"), "CellBold"), P(floor_names.get(floor_type, enforcer.get(floor_type)), "Cell")],
+        [P(enforcer.get("Stockwerk"), "CellBold"), P(floor_names.get(floor_type, enforcer.get(floor_type)), "Cell")],
         [P(enforcer.get("Suprafață Totală"), "CellBold"), P(format_area(house_area), "Cell")],
     ]
     table = Table(rows, colWidths=[50*mm, 120*mm])

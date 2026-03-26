@@ -142,6 +142,8 @@ def run_cubicasa_phase2(
     output_dir: Path,
     gemini_api_key: str | None = None,
     raster_timings: list | None = None,
+    use_translation_only_raster: bool = True,
+    reuse_cached_translation_only: bool = False,
     progress_callback: callable | None = None,
 ) -> dict:
     """
@@ -167,6 +169,8 @@ def run_cubicasa_phase2(
         save_debug_steps=DEBUG,
         run_phase=2,
         raster_timings=raster_timings,
+        use_translation_only_raster=use_translation_only_raster,
+        reuse_cached_translation_only=reuse_cached_translation_only,
         progress_callback=progress_callback,
     )
 

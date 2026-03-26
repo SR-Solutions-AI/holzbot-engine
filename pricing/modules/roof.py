@@ -6,7 +6,7 @@ def calculate_roof_details(roof_result_data: dict) -> dict:
     """
     components = roof_result_data.get("components", {})
     inputs = roof_result_data.get("inputs", {})
-    total = roof_result_data.get("roof_final_total_eur", 0.0)
+    total = float(roof_result_data.get("roof_final_total_eur", 0.0) or 0.0)
     
     # Extragem cantitățile de bază
     area_roof = inputs.get("house_area_m2", 0.0)
@@ -93,6 +93,21 @@ def calculate_roof_details(roof_result_data: dict) -> dict:
             area_roof,
             "m²"
         ))
+
+    # Neubau: optional percentage surcharge for klempner work from Preisdatenbank.
+    coeffs = roof_result_data.get("price_coeffs", {}) or {}
+    tin_pct = float(coeffs.get("tinichigerie_percent", 0.0) or 0.0)
+    if tin_pct > 0:
+        tin_cost = round(total * (tin_pct / 100.0), 2)
+        if tin_cost > 0:
+            items.append(_make_item(
+                "roof_tinichigerie",
+                "Klempnerarbeiten (Rinnen, Bleche, Anschlüsse)",
+                tin_cost,
+                1.0,
+                "pauschal"
+            ))
+            total = round(total + tin_cost, 2)
 
     return {
         "total_cost": total,

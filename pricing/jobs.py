@@ -15,6 +15,75 @@ from area.calculator import calculate_areas_for_plan
 
 STAGE_NAME = "pricing"
 
+
+def _read_meters_per_pixel(scale_result_path: Path) -> float | None:
+    if not scale_result_path.exists():
+        return None
+    try:
+        data = json.loads(scale_result_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    try:
+        mpp = data.get("meters_per_pixel")
+        return float(mpp) if mpp is not None and float(mpp) > 0 else None
+    except Exception:
+        return None
+
+
+def _compute_interior_mask_area_m2(scale_dir: Path) -> tuple[float | None, int | None, float | None]:
+    """
+    Returns (area_m2, area_px, mpp) computed from 09_interior orange mask and scale_result.mpp.
+    """
+    interior_png = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "09_interior.png"
+    scale_result = scale_dir / "scale_result.json"
+    if not interior_png.exists():
+        return None, None, None
+    mpp = _read_meters_per_pixel(scale_result)
+    if mpp is None or mpp <= 0:
+        return None, None, None
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception:
+        return None, None, None
+    img = cv2.imread(str(interior_png), cv2.IMREAD_COLOR)
+    if img is None:
+        return None, None, None
+    # 09_interior uses orange BGR around [0,165,255]; use tolerance for robustness.
+    lower = np.array([0, 120, 200], dtype=np.uint8)
+    upper = np.array([80, 210, 255], dtype=np.uint8)
+    mask = cv2.inRange(img, lower, upper)
+    area_px = int(np.count_nonzero(mask))
+    if area_px <= 0:
+        return None, 0, mpp
+    area_m2 = float(area_px) * float(mpp) * float(mpp)
+    return area_m2, area_px, mpp
+
+def _count_floors_with_stairs(run_id: str, plans: List[PlanInfo]) -> int:
+    """Count distinct floors containing at least one 'stairs' opening from raster measurements."""
+    run_dir = get_run_dir(run_id)
+    floors_with_stairs = 0
+    for plan in plans:
+        p = run_dir / "scale" / plan.plan_id / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "openings_measurements.json"
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        openings = data.get("openings", []) if isinstance(data, dict) else []
+        has_stairs = False
+        for op in openings:
+            if not isinstance(op, dict):
+                continue
+            t = str(op.get("type", "")).lower()
+            if "stair" in t or "treppe" in t:
+                has_stairs = True
+                break
+        if has_stairs:
+            floors_with_stairs += 1
+    return floors_with_stairs
+
 def _apply_allowed_categories(result: dict, allowed: list[str] | None) -> dict:
     """
     Filters pricing breakdown based on allowed categories coming from offer_types.allowed_pricing_categories.
@@ -142,6 +211,16 @@ def _run_for_single_plan(
                 room_scales_data = json.load(f)
             
             total_area_m2 = room_scales_data.get('total_area_m2', 0.0)
+            total_area_px = room_scales_data.get('total_area_px', 0)
+            area_source = "room_scales.total_area_m2"
+
+            # Prefer full interior mask area (09_interior orange pixels * mpp^2),
+            # because room OCR can leave many rooms with 0 m².
+            interior_area_m2, interior_area_px, interior_mpp = _compute_interior_mask_area_m2(scale_dir)
+            if interior_area_m2 is not None and interior_area_m2 > 0:
+                total_area_m2 = float(interior_area_m2)
+                total_area_px = int(interior_area_px or 0)
+                area_source = "09_interior_mask"
             if total_area_m2 > 0:
                 # ✅ Folosim DOAR walls_measurements din RasterScan (FĂRĂ dependență de CubiCasa)
                 walls_measurements = {
@@ -200,12 +279,15 @@ def _run_for_single_plan(
                     is_top_floor=is_top_floor_plan,
                     floor_height_m_by_option=pricing_coeffs.get("area", {}).get("floor_height_m"),
                 )
+                area_data["surface_area_source"] = area_source
+                if area_source == "09_interior_mask":
+                    area_data["surface_area_from_09_interior_px"] = int(total_area_px or 0)
+                    area_data["surface_area_from_09_interior_mpp"] = float(interior_mpp or 0.0)
                 # Balcon / wintergarden: convert px -> m pentru pricing (perimetru + suprafață podea/tavan)
                 if raster_balcon_wintergarden.exists():
                     try:
                         with open(raster_balcon_wintergarden, "r", encoding="utf-8") as f:
                             bw_list = json.load(f)
-                        total_area_px = room_scales_data.get("total_area_px") or 0
                         if total_area_px > 0 and total_area_m2 > 0 and bw_list:
                             m_px = (total_area_m2 / total_area_px) ** 0.5
                             converted = []
@@ -224,7 +306,10 @@ def _run_for_single_plan(
                         print(f"       ⚠️ Eroare la citirea balcon_wintergarden_measurements.json: {e}")
 
                 use_raster_data = True
-                print(f"       ✅ Folosesc datele din raster_processing pentru pricing: {total_area_m2:.2f} m² (floor_type: {floor_type})")
+                print(
+                    f"       ✅ Folosesc datele din raster_processing pentru pricing: "
+                    f"{total_area_m2:.2f} m² (sursă: {area_source}, floor_type: {floor_type})"
+                )
         except Exception as e:
             print(f"       ⚠️ Eroare la citirea room_scales.json: {e}")
     
@@ -344,7 +429,7 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
     except PlansListError as e:
         return []
         
-    frontend_data = frontend_data_override if frontend_data_override is not None else {}
+    frontend_data = dict(frontend_data_override) if frontend_data_override is not None else {}
     
     # Tenant slug is required (sent by API). No hard-coded fallbacks.
     tenant_slug = frontend_data.get("tenant_slug")
@@ -363,6 +448,7 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
         return []
 
     total_plans = len(plans)
+    frontend_data["_stairs_floors_count"] = _count_floors_with_stairs(run_id, plans)
     basement_plan_index = None
     try:
         run_dir = get_run_dir(run_id)

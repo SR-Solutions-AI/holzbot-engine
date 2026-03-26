@@ -34,6 +34,7 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
     _heat_base = float(data_map.get("heating_base_price", 70.0))
 
     out = {
+        "_raw_params": data_map,
         "foundation": {
             "unit_price_per_m2": {
                 # Form: Untergeschoss / Fundament
@@ -99,6 +100,46 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "roof_ceramic_tile_price_per_m2": data_map.get("roof_ceramic_tile_price_per_m2", 0),
             "roof_tpo_pvc_price_per_m2": data_map.get("roof_tpo_pvc_price_per_m2", 0),
             "roof_green_extensive_price_per_m2": data_map.get("roof_green_extensive_price_per_m2", 0),
+            # Roof-only (Dachstuhl package) pricing variables
+            "roofonly_leistung_abbund_percent": data_map.get("roofonly_leistung_abbund_percent", 8),
+            "roofonly_leistung_lieferung_percent": data_map.get("roofonly_leistung_lieferung_percent", 4),
+            "roofonly_leistung_montage_percent": data_map.get("roofonly_leistung_montage_percent", 16),
+            "roofonly_leistung_kranarbeiten_percent": data_map.get("roofonly_leistung_kranarbeiten_percent", 6),
+            "roofonly_leistung_geruest_percent": data_map.get("roofonly_leistung_geruest_percent", 5),
+            "roofonly_leistung_entsorgung_percent": data_map.get("roofonly_leistung_entsorgung_percent", 3),
+            "roofonly_daemmung_keine_price": data_map.get("roofonly_daemmung_keine_price", 0),
+            "roofonly_daemmung_zwischensparren_price": data_map.get("roofonly_daemmung_zwischensparren_price", 62),
+            "roofonly_daemmung_aufsparren_price": data_map.get("roofonly_daemmung_aufsparren_price", 92),
+            "roofonly_daemmung_kombination_price": data_map.get("roofonly_daemmung_kombination_price", 108),
+            "roofonly_unterdach_folie_price": data_map.get("roofonly_unterdach_folie_price", 14),
+            "roofonly_unterdach_schalung_folie_price": data_map.get("roofonly_unterdach_schalung_folie_price", 32),
+            "roofonly_dachstuhl_sparrendach_price": data_map.get("roofonly_dachstuhl_sparrendach_price", 96),
+            "roofonly_dachstuhl_pfettendach_price": data_map.get("roofonly_dachstuhl_pfettendach_price", 114),
+            "roofonly_dachstuhl_kehlbalkendach_price": data_map.get("roofonly_dachstuhl_kehlbalkendach_price", 108),
+            "roofonly_dachstuhl_sonderkonstruktion_price": data_map.get("roofonly_dachstuhl_sonderkonstruktion_price", 138),
+            "roofonly_sichtdachstuhl_price": data_map.get("roofonly_sichtdachstuhl_price", 36),
+            "roofonly_dachdeckung_ziegel_price": data_map.get("roofonly_dachdeckung_ziegel_price", 84),
+            "roofonly_dachdeckung_betonstein_price": data_map.get("roofonly_dachdeckung_betonstein_price", 74),
+            "roofonly_dachdeckung_blech_price": data_map.get("roofonly_dachdeckung_blech_price", 69),
+            "roofonly_dachdeckung_schindel_price": data_map.get("roofonly_dachdeckung_schindel_price", 89),
+            "roofonly_dachdeckung_sonstiges_price": data_map.get("roofonly_dachdeckung_sonstiges_price", 78),
+            "roofonly_decken_innenausbau_standard_price": data_map.get("roofonly_decken_innenausbau_standard_price", 38),
+            "roofonly_decken_innenausbau_premium_price": data_map.get("roofonly_decken_innenausbau_premium_price", 56),
+            "roofonly_decken_innenausbau_exklusiv_price": data_map.get("roofonly_decken_innenausbau_exklusiv_price", 74),
+            "roofonly_tinichigerie_percent": data_map.get("roofonly_tinichigerie_percent", 5),
+            "tinichigerie_percent": data_map.get("tinichigerie_percent", 5),
+            # Dachfenster (Stück) – Vollhaus
+            "dachfenster_stueck_standard": data_map.get("dachfenster_stueck_standard", 650),
+            "dachfenster_stueck_velux": data_map.get("dachfenster_stueck_velux", 890),
+            "dachfenster_stueck_roto": data_map.get("dachfenster_stueck_roto", 820),
+            "dachfenster_stueck_fakro": data_map.get("dachfenster_stueck_fakro", 850),
+            "dachfenster_stueck_sonstiges": data_map.get("dachfenster_stueck_sonstiges", 750),
+            # Dachfenster (Stück) – roof-only
+            "roofonly_dachfenster_stueck_standard": data_map.get("roofonly_dachfenster_stueck_standard", 650),
+            "roofonly_dachfenster_stueck_velux": data_map.get("roofonly_dachfenster_stueck_velux", 890),
+            "roofonly_dachfenster_stueck_roto": data_map.get("roofonly_dachfenster_stueck_roto", 820),
+            "roofonly_dachfenster_stueck_fakro": data_map.get("roofonly_dachfenster_stueck_fakro", 850),
+            "roofonly_dachfenster_stueck_sonstiges": data_map.get("roofonly_dachfenster_stueck_sonstiges", 750),
         },
         "finishes": {
             "interior": {
@@ -160,7 +201,17 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Hoch (2,85+ m)": float(data_map.get("inaltime_etaje_hoch_m", 2.85)),
             },
         },
-        "stairs": { "price_per_stair_unit": data_map.get("price_per_stair_unit", 0), "railing_price_per_stair": data_map.get("railing_price_per_stair", 0) },
+        "stairs": {
+            "price_per_stair_unit": data_map.get("price_per_stair_unit", 0),
+            "railing_price_per_stair": data_map.get("railing_price_per_stair", 0),
+            "stair_type_price_map": {
+                "Standard": data_map.get("stairs_type_standard_piece_price", data_map.get("price_per_stair_unit", 0)),
+                "Holz": data_map.get("stairs_type_holz_piece_price", data_map.get("price_per_stair_unit", 0)),
+                "Beton": data_map.get("stairs_type_beton_piece_price", data_map.get("price_per_stair_unit", 0)),
+                "Metall": data_map.get("stairs_type_metall_piece_price", data_map.get("price_per_stair_unit", 0)),
+                "Sonder": data_map.get("stairs_type_sonder_piece_price", data_map.get("price_per_stair_unit", 0)),
+            },
+        },
         "utilities": {
             "electricity": {
                 "coefficient_electricity_per_m2": data_map.get("electricity_base_price", 60.0),

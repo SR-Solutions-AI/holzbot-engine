@@ -1,6 +1,18 @@
+def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float:
+    t = str(obj_type or "").lower()
+    if "double" in t:
+        return 2.0
+    if width_m >= 2.0:
+        return 2.0
+    if width_m >= 1.35:
+        return 1.5
+    return 1.0
+
+
 def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data: dict | None = None) -> dict:
     """
-    Cost deschideri: arie = lățime × înălțime (înălțimea vine doar din formular, pentru calcul suprafață; nu afectează prețul).
+    Cost deschideri: arie = lățime × înălțime.
+    Pentru ferestre: folosim height_m din editor/raster când există, altfel euristică din lățime.
     Uși: un preț €/m² interior, unul exterior. Ferestre: preț 2-fach sau 3-fach (din formular Fensterart).
     """
     items = []
@@ -8,18 +20,9 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
 
     ferestre_usi = frontend_data.get("ferestreUsi", {}) if frontend_data else {}
     # Înălțimi doar pentru calculul ariei (nu pentru preț)
-    window_height_m = 1.25
     door_height_m = 2.05
 
     if frontend_data and ferestre_usi:
-        # Bodentiefe Fenster → înălțime ferestre (doar pentru suprafață)
-        bodentiefe = ferestre_usi.get("bodentiefeFenster", "")
-        if bodentiefe == "Nein":
-            window_height_m = 1.0
-        elif bodentiefe == "Ja – einzelne":
-            window_height_m = 1.5
-        elif bodentiefe == "Ja – mehrere / große Glasflächen":
-            window_height_m = 2.0
         # Türhöhe → înălțime uși (doar pentru suprafață)
         turhohe = ferestre_usi.get("turhohe", "")
         if turhohe == "Erhöht / Sondermaß (2,2+ m)":
@@ -46,7 +49,14 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
     for op in openings_list:
         obj_type = op.get("type", "unknown")
         width = float(op.get("width_m", 0.0))
-        height = door_height_m if "door" in obj_type else window_height_m
+        if "door" in obj_type:
+            height = door_height_m
+        else:
+            explicit_h = op.get("height_m")
+            if explicit_h is not None and float(explicit_h) > 0:
+                height = float(explicit_h)
+            else:
+                height = _infer_window_height_from_width(width, obj_type)
         area = width * height
 
         if "door" in obj_type:

@@ -9,7 +9,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional
 
 from config.settings import (
     OUTPUT_ROOT,
@@ -19,6 +19,7 @@ from config.settings import (
     PlanInfo,
 )
 import cv2
+import numpy as np
 from config.frontend_loader import load_frontend_data_for_run
 
 STAGE_NAME = "roof"
@@ -189,6 +190,7 @@ def _run_roof_3d_workflow(
     floor_roof_types: dict | None = None,
     floor_roof_angles: dict | None = None,
     basement_floor_index_override: int | None = None,
+    edited_rectangles_json_path: Path | None = None,
 ) -> Path | None:
     """
     Rulează holzbot-roof clean_workflow cu wall masks din toate etajele.
@@ -287,8 +289,21 @@ def _run_roof_3d_workflow(
     _python = str(_venv_py) if _venv_py.exists() else (shutil.which("python3.14") or sys.executable)
 
     try:
+        # Default: doar rectangles/floor_*; fără roof_types 3D, entire/*, unfold (vezi clean_workflow --rectangles-only).
+        _rect_only = os.environ.get("HOLZBOT_ROOF_RECTANGLES_ONLY", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "",
+        )
+        cmd = [_python, str(script_path)]
+        if _rect_only:
+            cmd.append("--rectangles-only")
+        if edited_rectangles_json_path and edited_rectangles_json_path.exists():
+            cmd.append(f"--edited-json={str(edited_rectangles_json_path)}")
+        cmd.extend([wall_input, str(roof_3d_dir)])
         result = subprocess.run(
-            [_python, str(script_path), wall_input, str(roof_3d_dir)],
+            cmd,
             cwd=str(_ROOF_ROOT),
             capture_output=False,
             timeout=300,
@@ -308,27 +323,403 @@ def _run_roof_3d_workflow(
     return roof_3d_dir
 
 
-def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJobResult]:
+def _editor_review_dimensions(run_id: str, plan: PlanInfo) -> tuple[int, int] | None:
     """
-    Punct de intrare pentru etapa „roof" (calcul acoperiș).
-
-    - Rulează holzbot-roof clean_workflow cu wall masks de pe toate etajele
-    - Notifică UI cu filled.png pentru fiecare tip acoperiș (1_w, 2_w, 4_w, 4.5_w)
-    - Scrie roof_estimation.json cu preț fix 10 EUR pentru top floor
-
-    Output-uri:
-      output/<RUN_ID>/roof/roof_3d/entire/{1_w,2_w,4_w,4.5_w}/filled.png
-      output/<RUN_ID>/roof/<plan_id>/roof_estimation.json
+    Dimensiunile din detections_review_data.json — același spațiu de coordonate ca în RoofReviewEditor
+    (GET roof-review-data / canvas). Nu coincid cu 01_walls_from_coords.png (rezoluție nativă).
     """
+    p = OUTPUT_ROOT / run_id / "scale" / plan.plan_id / "cubicasa_steps" / "raster" / "detections_review_data.json"
+    if not p.exists():
+        return None
     try:
-        plans = load_plan_infos(run_id, stage_name=STAGE_NAME)
-    except PlansListError as e:
-        print(f"❌ [{STAGE_NAME}] {e}")
-        return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ew = int(data.get("imageWidth") or 0)
+        eh = int(data.get("imageHeight") or 0)
+        if ew > 0 and eh > 0:
+            return (ew, eh)
+    except Exception:
+        pass
+    return None
 
-    total = len(plans)
 
+def _meters_per_pixel_for_plan(run_id: str, plan: PlanInfo) -> float | None:
+    scale_dir = OUTPUT_ROOT / run_id / "scale" / plan.plan_id
+    scale_result = scale_dir / "scale_result.json"
+    if scale_result.exists():
+        try:
+            data = json.loads(scale_result.read_text(encoding="utf-8"))
+            mpp = data.get("meters_per_pixel")
+            if isinstance(mpp, (int, float)) and float(mpp) > 0:
+                return float(mpp)
+        except Exception:
+            pass
+    room_scales = scale_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+    if room_scales.exists():
+        try:
+            data = json.loads(room_scales.read_text(encoding="utf-8"))
+            mpp = data.get("m_px") or data.get("weighted_average_m_px")
+            if isinstance(mpp, (int, float)) and float(mpp) > 0:
+                return float(mpp)
+        except Exception:
+            pass
+    return None
+
+
+# Culori BGR aliniate cu visualize_individual_rectangles (holzbot-roof): fill semi-transparent peste masca de pereți.
+_ROOF_SECTION_COLORS_BGR: List[tuple[int, int, int]] = [
+    (255, 100, 100),  # RGB echivalent ~ (100,100,255)
+    (100, 255, 100),
+    (100, 100, 255),
+    (100, 255, 255),
+    (255, 255, 100),
+    (255, 100, 255),
+]
+
+
+_ROOF_TYPE_IDS = frozenset({"0_w", "1_w", "2_w", "4_w", "4.5_w"})
+_DEFAULT_ROOF_ANGLE_DEG = 30.0
+_DEFAULT_ROOF_TYPE = "2_w"
+
+
+def _polygon_area_xy(pts: list[list[float]]) -> float:
+    """Arie poligon în coordonate plane (shoelace)."""
+    if len(pts) < 3:
+        return 0.0
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        j = (i + 1) % n
+        s += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1]
+    return abs(s) * 0.5
+
+
+def _normalize_roof_type(r: Any) -> str:
+    if r is None:
+        return _DEFAULT_ROOF_TYPE
+    if isinstance(r, str):
+        t = r.strip()
+        if t in _ROOF_TYPE_IDS:
+            return t
+    return _DEFAULT_ROOF_TYPE
+
+
+def derive_floor_roof_settings_from_edited(
+    edited: dict,
+    num_floors: int,
+    basement_idx: Optional[int],
+) -> tuple[dict[int, float], dict[int, Optional[str]]]:
+    """
+    Din roof_rectangles_edited.json: unghi mediu ponderat (suprafață) și tip dominant (suprafață max)
+    per etaj. Etaj beci: tip None, unghi 0 (neutilizat de workflow).
+    """
+    floor_angles: dict[int, float] = {}
+    floor_types: dict[int, Optional[str]] = {}
+
+    for floor_key, rects in edited.items():
+        try:
+            floor_idx = int(floor_key)
+        except Exception:
+            continue
+        if floor_idx < 0 or floor_idx >= num_floors:
+            continue
+        if floor_idx == basement_idx:
+            floor_types[floor_idx] = None
+            floor_angles[floor_idx] = 0.0
+            continue
+        if not isinstance(rects, list) or not rects:
+            floor_angles[floor_idx] = _DEFAULT_ROOF_ANGLE_DEG
+            floor_types[floor_idx] = _DEFAULT_ROOF_TYPE
+            continue
+
+        best_area = -1.0
+        best_type = _DEFAULT_ROOF_TYPE
+        w_sum = 0.0
+        w_ang = 0.0
+
+        for r in rects:
+            if not isinstance(r, dict):
+                continue
+            pts = r.get("points")
+            if not isinstance(pts, list) or len(pts) < 3:
+                continue
+            arr: list[list[float]] = []
+            for p in pts:
+                if isinstance(p, list) and len(p) >= 2:
+                    arr.append([float(p[0]), float(p[1])])
+            if len(arr) < 3:
+                continue
+            area = _polygon_area_xy(arr)
+            if area <= 0:
+                continue
+            try:
+                ang_f = float(r.get("roofAngleDeg", _DEFAULT_ROOF_ANGLE_DEG))
+            except Exception:
+                ang_f = _DEFAULT_ROOF_ANGLE_DEG
+            ang_f = float(max(0.0, min(60.0, ang_f)))
+            rt = _normalize_roof_type(r.get("roofType"))
+            w_sum += area
+            w_ang += area * ang_f
+            if area > best_area:
+                best_area = area
+                best_type = rt
+
+        if w_sum > 0:
+            floor_angles[floor_idx] = w_ang / w_sum
+        else:
+            floor_angles[floor_idx] = _DEFAULT_ROOF_ANGLE_DEG
+        floor_types[floor_idx] = best_type if best_area > 0 else _DEFAULT_ROOF_TYPE
+
+    for i in range(num_floors):
+        if i == basement_idx:
+            floor_types.setdefault(i, None)
+            floor_angles.setdefault(i, 0.0)
+        else:
+            floor_types.setdefault(i, _DEFAULT_ROOF_TYPE)
+            floor_angles.setdefault(i, _DEFAULT_ROOF_ANGLE_DEG)
+
+    return floor_angles, floor_types
+
+
+def _basement_floor_index_from_roof_3d(roof_3d_dir: Path) -> Optional[int]:
+    p = roof_3d_dir / "basement_floor_index.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if data.get("basement_floor_index") is not None:
+            return int(data["basement_floor_index"])
+    except Exception:
+        pass
+    return None
+
+
+def _write_floor_roof_json_from_edited(
+    roof_3d_dir: Path,
+    edited: dict,
+    num_floors: int,
+) -> None:
+    """Sincronizează floor_roof_angles.json / floor_roof_types.json cu editorul."""
+    bi = _basement_floor_index_from_roof_3d(roof_3d_dir)
+    angles, types = derive_floor_roof_settings_from_edited(edited, num_floors, bi)
+    fra_path = roof_3d_dir / "floor_roof_angles.json"
+    frt_path = roof_3d_dir / "floor_roof_types.json"
+    try:
+        fra_path.write_text(
+            json.dumps({str(k): float(v) for k, v in sorted(angles.items())}, indent=0),
+            encoding="utf-8",
+        )
+        # JSON null pentru beci
+        frt_path.write_text(
+            json.dumps({str(k): v for k, v in sorted(types.items())}, indent=0),
+            encoding="utf-8",
+        )
+        print(
+            f"       [roof] Sincronizat {fra_path.name} + {frt_path.name} din editor (aggregat per etaj)",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"       ⚠️ [roof] Nu pot scrie floor_roof_*.json: {e}", flush=True)
+
+
+def _blend_polygon_over_wall_mask(
+    wall_gray: np.ndarray,
+    poly: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    alpha: float = 0.52,
+) -> np.ndarray:
+    """Imagine BGR: masca de pereți + umplere colorată a poligonului (același tip ca la generarea inițială)."""
+    h, w = wall_gray.shape[:2]
+    base = cv2.cvtColor(wall_gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
+    fill_layer = np.zeros_like(base)
+    cv2.fillPoly(fill_layer, [poly], color_bgr)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [poly], 255)
+    a = float(np.clip(alpha, 0.0, 1.0))
+    idx = mask > 0
+    out = base.copy()
+    out[idx] = (1.0 - a) * base[idx] + a * fill_layer[idx]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: List[PlanInfo]) -> bool:
+    """
+    Aplică editările din roof_rectangles_edited.json peste roof_3d/rectangles/floor_X
+    și recalculează metrici aggregate (entire/mixed/roof_metrics.json) pe noile dreptunghiuri.
+
+    Scrie rectangle_S{i}.png: masca 01_walls_from_coords + umplere colorată (ca la pipeline), nu doar binar.
+    """
+    edits_path = roof_3d_dir / "roof_rectangles_edited.json"
+    if not edits_path.exists():
+        return False
+    try:
+        edited = json.loads(edits_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"       ⚠️ [roof] roof_rectangles_edited.json invalid: {e}", flush=True)
+        return False
+    if not isinstance(edited, dict):
+        return False
+
+    rectangles_root = roof_3d_dir / "rectangles"
+    rectangles_root.mkdir(parents=True, exist_ok=True)
+
+    total_area_m2 = 0.0
+    total_contour_m = 0.0
+    # Also persist a walls-coordinate version of the edited polygons for holzbot-roof (3D + overhang).
+    edited_walls: dict[str, list[dict]] = {}
+
+    for floor_key, rects in edited.items():
+        try:
+            floor_idx = int(floor_key)
+        except Exception:
+            continue
+        if floor_idx < 0 or floor_idx >= len(plans_roof):
+            continue
+        if not isinstance(rects, list):
+            continue
+
+        wall_mask = OUTPUT_ROOT / run_id / "scale" / plans_roof[floor_idx].plan_id / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "01_walls_from_coords.png"
+        wall_img = cv2.imread(str(wall_mask), cv2.IMREAD_GRAYSCALE)
+        if wall_img is None:
+            continue
+        h, w = wall_img.shape[:2]
+        plan = plans_roof[floor_idx]
+        ed = _editor_review_dimensions(run_id, plan)
+        if ed:
+            sx = float(w) / float(ed[0])
+            sy = float(h) / float(ed[1])
+            print(
+                f"       [roof] floor_{floor_idx} ({plan.plan_id}): scale editor→walls "
+                f"{ed[0]}x{ed[1]} → {w}x{h} (sx={sx:.4f}, sy={sy:.4f})",
+                flush=True,
+            )
+        else:
+            sx = sy = 1.0
+            print(
+                f"       ⚠️ [roof] floor_{floor_idx}: lipsă detections_review_data.json — "
+                f"coordonate fără scalare (posibil greșit)",
+                flush=True,
+            )
+
+        floor_dir = rectangles_root / f"floor_{floor_idx}"
+        floor_dir.mkdir(parents=True, exist_ok=True)
+        for p in floor_dir.glob("*.png"):
+            p.unlink(missing_ok=True)
+
+        union_mask = np.zeros((h, w), dtype=np.uint8)
+        out_i = 0
+        edited_walls[str(floor_idx)] = []
+        for r in rects:
+            pts = r.get("points") if isinstance(r, dict) else None
+            if not isinstance(pts, list) or len(pts) < 3:
+                continue
+            arr: list[list[float]] = []
+            for p in pts:
+                if isinstance(p, list) and len(p) >= 2:
+                    arr.append([float(p[0]), float(p[1])])
+            if len(arr) < 3:
+                continue
+            arr_scaled = [
+                [int(round(x * sx)), int(round(y * sy))] for x, y in arr
+            ]
+            poly = np.array(arr_scaled, dtype=np.int32)
+            poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+            poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            color_bgr = _ROOF_SECTION_COLORS_BGR[out_i % len(_ROOF_SECTION_COLORS_BGR)]
+            composite_bgr = _blend_polygon_over_wall_mask(wall_img, poly, color_bgr, alpha=0.52)
+            cv2.imwrite(str(floor_dir / f"rectangle_S{out_i}.png"), composite_bgr)
+            row = {"points": arr_scaled}
+            if isinstance(r, dict):
+                if r.get("roofAngleDeg") is not None:
+                    row["roofAngleDeg"] = r.get("roofAngleDeg")
+                if r.get("roofType") is not None:
+                    row["roofType"] = r.get("roofType")
+                if r.get("roomName") is not None:
+                    row["roomName"] = r.get("roomName")
+            edited_walls[str(floor_idx)].append(row)
+            out_i += 1
+            union_mask = np.maximum(union_mask, mask)
+
+        mpp = _meters_per_pixel_for_plan(run_id, plans_roof[floor_idx]) or 0.01
+        area_px = float(np.count_nonzero(union_mask))
+        contours, _ = cv2.findContours(union_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_px = float(sum(cv2.arcLength(c, True) for c in contours))
+        total_area_m2 += area_px * (mpp ** 2)
+        total_contour_m += contour_px * mpp
+
+    # Preserve any existing 3D-derived overhang metrics (computed by holzbot-roof clean_workflow).
+    # The roof editor currently modifies the "roof (insulated) zone" rectangles; we recompute unfold_roof totals
+    # from the edited polygons, and keep unfold_overhang from the latest 3D workflow if available.
+    prev_overhang_total_area_m2 = 0.0
+    prev_overhang_total_contour_m = 0.0
+    prev_metrics_path = (roof_3d_dir / "entire" / "mixed" / "roof_metrics.json")
+    if prev_metrics_path.exists():
+        try:
+            prev = json.loads(prev_metrics_path.read_text(encoding="utf-8"))
+            uo = (prev.get("unfold_overhang") or {}).get("total") or {}
+            prev_overhang_total_area_m2 = float(uo.get("area_m2") or 0.0)
+            prev_overhang_total_contour_m = float(uo.get("contour_m") or 0.0)
+        except Exception:
+            prev_overhang_total_area_m2 = 0.0
+            prev_overhang_total_contour_m = 0.0
+
+    roof_area_m2 = round(total_area_m2, 4)
+    roof_contour_m = round(total_contour_m, 4)
+    overhang_area_m2 = round(prev_overhang_total_area_m2, 4)
+    overhang_contour_m = round(prev_overhang_total_contour_m, 4)
+    combined_area_m2 = round(float(roof_area_m2) + float(overhang_area_m2), 4)
+    combined_contour_m = round(float(roof_contour_m) + float(overhang_contour_m), 4)
+
+    metrics = {
+        "unfold_roof": {"total": {"area_m2": roof_area_m2, "contour_m": roof_contour_m}},
+        "unfold_overhang": {"total": {"area_m2": overhang_area_m2, "contour_m": overhang_contour_m}},
+        "total_combined": {"area_m2": combined_area_m2, "contour_m": combined_contour_m},
+    }
+    mixed_dir = roof_3d_dir / "entire" / "mixed"
+    mixed_dir.mkdir(parents=True, exist_ok=True)
+    (mixed_dir / "roof_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    _write_floor_roof_json_from_edited(roof_3d_dir, edited, len(plans_roof))
+
+    # Save walls-coordinate polygons for holzbot-roof (expects same coordinates as wall masks).
+    try:
+        (roof_3d_dir / "roof_rectangles_edited_walls.json").write_text(
+            json.dumps(edited_walls, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"       ⚠️ [roof] Nu pot scrie roof_rectangles_edited_walls.json: {e}", flush=True)
+
+    # Re-run holzbot-roof workflow with edited sections so overhang faces/metrics
+    # are recalculated from the editor geometry, not kept from a previous run.
+    try:
+        basement_idx = _basement_floor_index_from_roof_3d(roof_3d_dir)
+        edited_angles, edited_types = derive_floor_roof_settings_from_edited(edited, len(plans_roof), basement_idx)
+        rerun_dir = _run_roof_3d_workflow(
+            run_id,
+            plans_roof,
+            floor_roof_types=edited_types,
+            floor_roof_angles=edited_angles,
+            basement_floor_index_override=basement_idx,
+            edited_rectangles_json_path=(roof_3d_dir / "roof_rectangles_edited_walls.json"),
+        )
+        if rerun_dir:
+            print("       ✅ [roof] Aplicate editările în holzbot-roof (roof_types + unfold_overhang recalculat)", flush=True)
+            return True
+    except Exception as e:
+        print(f"       ⚠️ [roof] Re-run holzbot-roof cu editări a eșuat: {e}", flush=True)
+
+    print("       ✅ [roof] Aplicate editările din roof editor în roof_3d/rectangles + roof_metrics.json", flush=True)
+    return True
+
+
+def resolve_plans_roof_order(run_id: str) -> tuple[List[PlanInfo], Path, List[PlanInfo]]:
+    """
+    Aceeași ordine ca la clean_workflow (floor_0, floor_1, …) pentru mapare cu roof_rectangles_edited.json.
+    Returnează (plans_roof, job_root, plans) — plans = ordinea din load_plan_infos (pentru run_roof_for_run).
+    """
+    plans = load_plan_infos(run_id, stage_name=STAGE_NAME)
     from config.settings import JOBS_ROOT
+
     job_root = None
     for jdir in JOBS_ROOT.glob("*"):
         if jdir.is_dir() and run_id in jdir.name:
@@ -337,11 +728,7 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
     if job_root is None:
         job_root = JOBS_ROOT / run_id
 
-    frontend_data = load_frontend_data_for_run(run_id, job_root)
-
     run_dir = RUNS_ROOT / run_id
-
-    # Beci (dacă există) primește cel mai mic index (0); parter indexul următor (0 fără beci, 1 cu beci); apoi etajele.
     basement_plan_id: str | None = None
     order_from_bottom: list[int] | None = None
     if run_dir.exists():
@@ -366,29 +753,90 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
 
     if order_from_bottom is not None:
         plans_roof = [plans[i] for i in order_from_bottom]
-        print(f"   [roof] Planuri ordonate după floor_order.json (de jos în sus): {[p.plan_id for p in plans_roof]}", flush=True)
     else:
-        # Sortare: beci=0, parter=1, intermediar=2, top=3, unknown=4; la egalitate după arie (parter = mai mare).
+
         def _key(p):
             return _floor_sort_key(p, job_root, basement_plan_id, run_id, run_dir)
 
         plans_roof = sorted(plans, key=_key)
-        for p in plans_roof:
-            k = _key(p)
-            rank_name = ("beci", "parter", "intermediar", "etaj", "unknown")[k[0]] if k[0] < 5 else "unknown"
-            print(f"   [roof] floor_{plans_roof.index(p)} ← {p.plan_id} (rang={rank_name}, arie_mask={-k[1]} px)", flush=True)
-        if plans_roof != plans:
-            order_desc = "beci=0, parter=1, etaj=2" if basement_plan_id else "parter=0, etaj=1"
-            print(f"   [roof] Planuri reordonate ({order_desc}): {[p.plan_id for p in plans_roof]}", flush=True)
 
-    # Indexul beciului în lista sortată (beci e mereu la 0 când există)
+    return plans_roof, job_root, plans
+
+
+def apply_roof_edits_from_disk(run_id: str) -> bool:
+    """
+    Regenerează rectangle_S*.png din roof_rectangles_edited.json (ex.: după PATCH din UI).
+    """
+    roof_3d_dir = OUTPUT_ROOT / run_id / "roof" / "roof_3d"
+    if not (roof_3d_dir / "roof_rectangles_edited.json").exists():
+        return False
+    try:
+        plans_roof, _, _ = resolve_plans_roof_order(run_id)
+    except Exception as e:
+        print(f"       ⚠️ [roof] apply_roof_edits_from_disk: {e}", flush=True)
+        return False
+    return _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+
+
+def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_events: bool = True) -> List[RoofJobResult]:
+    """
+    Punct de intrare pentru etapa „roof" (calcul acoperiș).
+
+    - Rulează holzbot-roof clean_workflow cu wall masks de pe toate etajele
+    - Notifică UI cu filled.png pentru fiecare tip acoperiș (1_w, 2_w, 4_w, 4.5_w)
+    - Scrie roof_estimation.json cu preț fix 10 EUR pentru top floor
+
+    Output-uri:
+      output/<RUN_ID>/roof/roof_3d/entire/{1_w,2_w,4_w,4.5_w}/filled.png
+      output/<RUN_ID>/roof/<plan_id>/roof_estimation.json
+    """
+    try:
+        plans_roof, job_root, plans = resolve_plans_roof_order(run_id)
+    except PlansListError as e:
+        print(f"❌ [{STAGE_NAME}] {e}")
+        return []
+
+    total = len(plans)
+    print(f"   [roof] Ordine acoperiș floor_0..floor_X: {[p.plan_id for p in plans_roof]}", flush=True)
+
+    frontend_data = load_frontend_data_for_run(run_id, job_root)
+
+    run_dir = RUNS_ROOT / run_id
+
+    basement_plan_id: str | None = None
+    order_from_bottom: list[int] | None = None
+    if run_dir.exists():
+        if (run_dir / "floor_order.json").exists():
+            try:
+                data = json.loads((run_dir / "floor_order.json").read_text(encoding="utf-8"))
+                ob = data.get("order_from_bottom")
+                if ob is not None and len(ob) == len(plans) and set(ob) == set(range(len(plans))):
+                    order_from_bottom = ob
+            except Exception:
+                order_from_bottom = None
+        if order_from_bottom is None and (run_dir / "basement_plan_id.json").exists():
+            try:
+                data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+                oi = data.get("basement_plan_index")
+                if oi is not None and 0 <= oi < len(plans):
+                    basement_plan_id = plans[oi].plan_id
+            except Exception:
+                pass
+
+    # Indexul beciului în lista sortată plans_roof.
     basement_idx: int | None = None
     if order_from_bottom is not None and (run_dir / "basement_plan_id.json").exists():
         try:
             data = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
-            if data.get("basement_plan_index") is not None:
-                basement_idx = 0
-                print(f"   [roof] Beci: plan la index 0 (din floor_order)", flush=True)
+            raw_bidx = data.get("basement_plan_index")
+            if raw_bidx is not None:
+                original_bidx = int(raw_bidx)
+                if original_bidx in order_from_bottom:
+                    basement_idx = order_from_bottom.index(original_bidx)
+                    print(
+                        f"   [roof] Beci: plan original index {original_bidx} -> roof index {basement_idx} (din floor_order)",
+                        flush=True,
+                    )
         except Exception:
             pass
     if basement_idx is None and basement_plan_id:
@@ -473,6 +921,25 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
     else:
         floor_roof_angles = None
 
+    # Dacă utilizatorul a salvat din editorul de acoperiș, suprascriem Gemini/fallback cu agregat per etaj.
+    roof_3d_edits = OUTPUT_ROOT / run_id / "roof" / "roof_3d" / "roof_rectangles_edited.json"
+    if roof_3d_edits.exists() and num_floors_roof >= 1 and floor_roof_angles is not None and floor_roof_types is not None:
+        try:
+            edited_ov = json.loads(roof_3d_edits.read_text(encoding="utf-8"))
+            if isinstance(edited_ov, dict) and edited_ov:
+                d_ang, d_typ = derive_floor_roof_settings_from_edited(
+                    edited_ov, num_floors_roof, basement_idx
+                )
+                floor_roof_angles = {i: float(d_ang[i]) for i in range(num_floors_roof)}
+                floor_roof_types = {i: d_typ[i] for i in range(num_floors_roof)}
+                print(
+                    f"   [roof] Override din roof editor (aggregat per etaj): "
+                    f"angles={floor_roof_angles}, types={floor_roof_types}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"   [roof] Override editor ignorate: {e}", flush=True)
+
     print(f"   [roof] Valorile trimise la workflow: floor_roof_types={floor_roof_types}, floor_roof_angles={floor_roof_angles}", flush=True)
     print(f"\n⚙️  [{STAGE_NAME}] Acoperiș pentru {total} plan{'uri' if total > 1 else ''} (inclusiv beci în 3D, preț fix 10 EUR)...")
 
@@ -482,6 +949,8 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
         basement_floor_index_override=basement_idx,
     )
     if roof_3d_dir:
+        _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+    if roof_3d_dir and notify_ui_events:
         try:
             from orchestrator import notify_ui
             mixed_png = roof_3d_dir / "entire" / "mixed" / "filled.png"
@@ -546,3 +1015,12 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None) -> List[RoofJ
     print(f"{'─'*70}\n")
     
     return results
+
+
+if __name__ == '__main__':
+    # Regenerează rectangle_S*.png din roof_rectangles_edited.json: python -m roof.jobs <run_id>
+    if len(sys.argv) < 2:
+        print('Usage: python -m roof.jobs <run_id>', flush=True)
+        raise SystemExit(2)
+    _ok = apply_roof_edits_from_disk(sys.argv[1])
+    raise SystemExit(0 if _ok else 1)

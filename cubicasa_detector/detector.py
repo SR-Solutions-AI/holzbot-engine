@@ -2154,6 +2154,7 @@ def run_cubicasa_detection(
     raster_timings: list | None = None,
     brute_force_no_cache: bool = False,
     use_translation_only_raster: bool = True,
+    reuse_cached_translation_only: bool = False,
     progress_callback: callable | None = None,
 ) -> dict:
     """
@@ -2967,6 +2968,24 @@ def run_cubicasa_detection(
             
             # Dacă nu există cache (sau e dezactivat), rulăm brute force
             translation_only_config = None
+            if (not use_translation_only_raster) and reuse_cached_translation_only:
+                try:
+                    cached_trans_path = raster_dir / "brute_steps" / "translation_only_config.json"
+                    if cached_trans_path.exists():
+                        with open(cached_trans_path, "r") as f:
+                            _cfg = json.load(f)
+                        pos = _cfg.get("position")
+                        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                            tx = int(round(float(pos[0])))
+                            ty = int(round(float(pos[1])))
+                            translation_only_config = {
+                                "position": [tx, ty],
+                                "score": float(_cfg.get("score", 0.0)),
+                                "direction": "translation_only",
+                            }
+                            print(f"      ♻️ Refolosesc translation-only din cache: (tx, ty)=({tx}, {ty})")
+                except Exception as e:
+                    print(f"      ⚠️ Nu am putut citi translation_only din cache: {e}")
             if best_config is None and use_translation_only_raster:
                 try:
                     request_info_path = raster_dir / "raster_request_info.json"

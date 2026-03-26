@@ -11,6 +11,7 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
 
 from config.settings import OUTPUT_ROOT, RUNNER_ROOT, JOBS_ROOT, RUNS_ROOT, load_plan_infos, PlansListError
 from config.frontend_loader import load_frontend_data_for_run
@@ -117,8 +118,11 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     if not job_root.exists():
         job_root = None
     frontend_data = load_frontend_data_for_run(run_id, job_root)
+    roof_only = bool(frontend_data.get("roof_only_offer")) if isinstance(frontend_data, dict) else False
     sistem_constructiv = frontend_data.get("sistemConstructiv", {})
     tip_acoperis = sistem_constructiv.get("tipAcoperis", "—")
+    projektdaten = frontend_data.get("projektdaten", {}) or {}
+    dd = frontend_data.get("daemmungDachdeckung", {}) or {}
 
     # Ordine etaje și etichete (Keller, Erdgeschoss, 1. Obergeschoss, Mansardă, etc.)
     plan_id_to_label: dict[str, str] = {}
@@ -215,8 +219,10 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         output_path = pdf_dir / f"roof_measurements_{run_id}.pdf"
 
     metrics_path = out_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_metrics.json"
+    roof_pricing_path = out_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_pricing.json"
     metrics = {}
     by_floor = {}
+    roof_pricing = {}
     if metrics_path.exists():
         try:
             with open(metrics_path, encoding="utf-8") as f:
@@ -226,6 +232,12 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             print(f"⚠️ [PDF ROOF] Eroare la citire roof_metrics.json: {e}")
     else:
         print(f"⚠️ [PDF ROOF] roof_metrics.json lipsește – se generează PDF minimal pentru toți utilizatorii.")
+    if roof_pricing_path.exists():
+        try:
+            with open(roof_pricing_path, encoding="utf-8") as f:
+                roof_pricing = json.load(f)
+        except Exception:
+            roof_pricing = {}
 
     doc = SimpleDocTemplate(
         str(output_path),
@@ -241,6 +253,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         parent=styles["Heading1"],
         fontSize=16,
         spaceAfter=8,
+        alignment=TA_CENTER,
     )
     heading_style = ParagraphStyle(
         name="RoofHeading",
@@ -251,16 +264,26 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     body = styles["BodyText"]
 
     story = []
-    story.append(Paragraph("Dämmung & Dachdeckung – Dachmaße", title_style))
-    story.append(Paragraph(
-        "Detaillierte Messungen der Dachflächen für Dämmung, Eindeckung, Klempnerarbeiten und Folien. "
-        "Alle Angaben basieren auf der 3D-Roof-Analyse.",
-        body
-    ))
-    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("Mengenermittlung", title_style))
+    story.append(Spacer(1, 3 * mm))
 
-    total = metrics.get("total") or {}
-    total_roof_area_m2 = total.get("area_m2")
+    unfold_roof_total = (metrics.get("unfold_roof") or {}).get("total") or {}
+    unfold_overhang_total = (metrics.get("unfold_overhang") or {}).get("total") or {}
+    total_combined = metrics.get("total_combined") or {}
+    rp_meas = (roof_pricing.get("roof_measurements") or {}) if isinstance(roof_pricing, dict) else {}
+
+    roof_area_without_overhang_m2 = rp_meas.get("roof_area_without_overhang_m2")
+    roof_area_with_overhang_m2 = rp_meas.get("roof_area_with_overhang_m2")
+    overhang_area_m2 = rp_meas.get("roof_area_overhang_only_m2")
+    if roof_area_without_overhang_m2 is None:
+        roof_area_without_overhang_m2 = unfold_roof_total.get("area_m2")
+    if overhang_area_m2 is None:
+        overhang_area_m2 = unfold_overhang_total.get("area_m2")
+    if roof_area_with_overhang_m2 is None:
+        if roof_area_without_overhang_m2 is not None and overhang_area_m2 is not None:
+            roof_area_with_overhang_m2 = float(roof_area_without_overhang_m2) + float(overhang_area_m2)
+        else:
+            roof_area_with_overhang_m2 = total_combined.get("area_m2")
     roof_angles_str = "—"
     for candidate in (out_root, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id):
         ang_path = Path(candidate) / "roof" / "roof_3d" / "floor_roof_angles.json"
@@ -274,12 +297,16 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             break
     story.append(Paragraph("<b>Übersicht Dach</b>", heading_style))
     story.append(Paragraph(
-        f"<b>Dachfläche (Gesamt):</b> {total_roof_area_m2:.2f} m²" if total_roof_area_m2 is not None else "<b>Dachfläche (Gesamt):</b> —",
+        f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> {roof_area_without_overhang_m2:.2f} m²" if roof_area_without_overhang_m2 is not None else "<b>Dachfläche (Dämmzone, ohne Überstand):</b> —",
+        body
+    ))
+    story.append(Paragraph(
+        f"<b>Überstand-Fläche (nur Überstand):</b> {overhang_area_m2:.2f} m²" if overhang_area_m2 is not None else "<b>Überstand-Fläche (nur Überstand):</b> —",
         body
     ))
     story.append(Paragraph(f"<b>Dachtyp:</b> {tip_acoperis}", body))
     story.append(Paragraph(f"<b>Dachneigung:</b> {roof_angles_str}", body))
-    story.append(Spacer(1, 8 * mm))
+    story.append(Spacer(1, 4 * mm))
 
     floor_labels_fallback = {
         "0": "Erdgeschoss",
@@ -288,47 +315,88 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         "3": "3. Obergeschoss",
     }
 
-    for floor_key in sorted(by_floor.keys(), key=lambda k: int(k) if str(k).isdigit() else 0):
-        data = by_floor[floor_key]
-        idx = int(floor_key) if str(floor_key).isdigit() else 0
-        label = roof_floor_labels[idx] if idx < len(roof_floor_labels) else floor_labels_fallback.get(str(floor_key), f"Etaj {floor_key}")
+    # Per-rectangle roof measurements (preferred for roof-only flows).
+    by_rectangle = ((roof_pricing.get("roof_measurements") or {}).get("by_rectangle") or [])
+    if by_rectangle:
+        roof_type_label = {
+            "0_w": "Flachdach",
+            "1_w": "Pultdach",
+            "2_w": "Satteldach",
+            "4_w": "Walmdach",
+            "4.5_w": "Krüppelwalmdach",
+        }
+        for rec in sorted(by_rectangle, key=lambda r: (int(r.get("floor_idx", 0)), int(r.get("rectangle_idx", 0)))):
+            floor_idx = int(rec.get("floor_idx", 0))
+            rect_idx = int(rec.get("rectangle_idx", 0))
+            floor_label = roof_floor_labels[floor_idx] if floor_idx < len(roof_floor_labels) else f"Etage {floor_idx}"
+            roof_name = "Dach" if rect_idx == 0 else f"Dach {rect_idx + 1}"
+            story.append(Paragraph(f"<b>{floor_label} – {roof_name}</b>", heading_style))
+            rows = [["Position", "Wert", "Einheit"]]
+            rows.append(["Dachneigung", f"{float(rec.get('roof_angle_deg')):.1f}" if rec.get("roof_angle_deg") is not None else "—", "°"])
+            raw_rt = str(rec.get("roof_type") or "")
+            rows.append(["Dachtyp", roof_type_label.get(raw_rt, raw_rt or "—"), "—"])
+            rows.append(["Dachfläche gesamt (mit Überstand)", f"{float(rec.get('roof_area_with_overhang_m2')):.2f}" if rec.get("roof_area_with_overhang_m2") is not None else "—", "m²"])
+            rows.append(["Dachfläche gedämmt (ohne Überstand)", f"{float(rec.get('roof_area_without_overhang_m2')):.2f}" if rec.get("roof_area_without_overhang_m2") is not None else "—", "m²"])
+            rows.append(["Dachumfang (mit Überstand)", f"{float(rec.get('roof_perimeter_with_overhang_m')):.2f}" if rec.get("roof_perimeter_with_overhang_m") is not None else "—", "m"])
+            t_rect = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
+            t_rect.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3E2C22")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F5F0E8")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8B7355")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ]))
+            story.append(t_rect)
+            story.append(Spacer(1, 8 * mm))
 
-        story.append(Paragraph(f"<b>{label}</b>", heading_style))
+    # Per-floor data fallback.
+    by_floor_roof = (metrics.get("unfold_roof") or {}).get("by_floor") or by_floor
+    if not by_rectangle:
+        for floor_key in sorted(by_floor_roof.keys(), key=lambda k: int(k) if str(k).isdigit() else 0):
+            data = by_floor_roof[floor_key]
+            idx = int(floor_key) if str(floor_key).isdigit() else 0
+            label = roof_floor_labels[idx] if idx < len(roof_floor_labels) else floor_labels_fallback.get(str(floor_key), f"Etaj {floor_key}")
 
-        area_m2 = data.get("area_m2")
-        contour_m = data.get("contour_m")
+            story.append(Paragraph(f"<b>{label}</b>", heading_style))
 
-        rows = [
-            ["Kennzahl", "Wert", "Einheit"],
-            ["Fläche Dämmzone (gedämmte Dachfläche)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
-            ["Eindeckfläche (Dachdeckung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
-            ["Klempnerarbeiten (Dachumfang)", f"{contour_m:.2f}" if contour_m is not None else "—", "m"],
-            ["Fläche Finisagen (Innenverkleidung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
-            ["Fläche Unterspannbahn / Folie", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
-        ]
+            area_m2 = data.get("area_m2")
+            contour_m = data.get("contour_m")
 
-        t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3E2C22")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 10),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F5F0E8")),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8B7355")),
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica"),
-            ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 10 * mm))
+            rows = [
+                ["Element", "Wert", "Einheit"],
+                ["Fläche Dämmzone (gedämmte Dachfläche)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
+                ["Eindeckfläche (Dachdeckung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
+                ["Klempnerarbeiten (Dachumfang)", f"{contour_m:.2f}" if contour_m is not None else "—", "m"],
+                ["Fläche Innenausbau (Innenverkleidung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
+                ["Fläche Unterspannbahn / Folie", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"],
+            ]
 
-    total_area = total.get("area_m2")
-    total_contour = total.get("contour_m")
-    if total_area is not None or total_contour is not None:
+            t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3E2C22")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F5F0E8")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8B7355")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 10 * mm))
+
+    total_area = unfold_roof_total.get("area_m2")
+    total_contour = unfold_roof_total.get("contour_m")
+    if (total_area is not None or total_contour is not None) and not by_rectangle:
         story.append(Paragraph("<b>Gesamtsumme (alle Etagen)</b>", heading_style))
         rows_total = [
-            ["Kennzahl", "Wert", "Einheit"],
-            ["Gesamtfläche Dämmung / Eindeckung / Finisagen / Folie", f"{total_area:.2f}" if total_area is not None else "—", "m²"],
+            ["Element", "Wert", "Einheit"],
+            ["Gesamtfläche Dämmung / Eindeckung / Innenausbau / Folie", f"{total_area:.2f}" if total_area is not None else "—", "m²"],
             ["Gesamtumfang Klempnerarbeiten", f"{total_contour:.2f}" if total_contour is not None else "—", "m"],
         ]
         t2 = Table(rows_total, colWidths=[90 * mm, 50 * mm, 25 * mm])
@@ -345,26 +413,26 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         ]))
         story.append(t2)
 
-    # Secțiune nouă: Bauteilmaße (Wände, Böden, Decken, Öffnungen) din pricing_raw.json
+    # Secțiune nouă: Übersicht Gebäude (Wände, Böden, Decken, Öffnungen) din pricing_raw.json
     floors_data = _load_floor_data_from_pricing(out_root)
-    if floors_data:
+    if floors_data and not roof_only:
         story.append(PageBreak())
-        story.append(Paragraph("Bauteilmaße (Wände, Böden, Decken, Öffnungen)", title_style))
+        story.append(Paragraph("Übersicht Gebäude", title_style))
         story.append(Paragraph(
-            "Netto-Flächen für Strukturen, Finisagen, Böden und Decken sowie Anzahl und Gesamtfläche der Öffnungen, "
-            "sortiert nach Etagen. Basierend auf den Planungsdaten.",
+            "Netto-Flächen für Strukturen, Innenausbau, Böden und Decken sowie Anzahl und Gesamtfläche der Öffnungen, "
+            "sortiert nach Stockwerken. Basierend auf den Planungsdaten.",
             body
         ))
         story.append(Spacer(1, 8 * mm))
         for idx, fd in enumerate(floors_data):
-            label = plan_id_to_label.get(fd.get("plan_id", ""), floor_labels_fallback.get(str(idx), f"Etaj {idx}"))
+            label = plan_id_to_label.get(fd.get("plan_id", ""), floor_labels_fallback.get(str(idx), f"Stockwerk {idx}"))
             story.append(Paragraph(f"<b>{label}</b>", heading_style))
             rows = [
-                ["Kennzahl", "Wert", "Einheit"],
+                ["Element", "Wert", "Einheit"],
                 ["Strukturen Innenwände (netto)", f"{fd['structure_int_net_m2']:.2f}", "m²"],
                 ["Strukturen Außenwände (netto)", f"{fd['structure_ext_net_m2']:.2f}", "m²"],
-                ["Finisagen Innen (netto)", f"{fd['finish_int_net_m2']:.2f}", "m²"],
-                ["Finisagen Außen (netto)", f"{fd['finish_ext_net_m2']:.2f}", "m²"],
+                ["Innenausbau Innen (netto)", f"{fd['finish_int_net_m2']:.2f}", "m²"],
+                ["Innenausbau Außen (netto)", f"{fd['finish_ext_net_m2']:.2f}", "m²"],
                 ["Bodenfläche / Planché", f"{fd['floor_area_m2']:.2f}", "m²"],
                 ["Deckenfläche", f"{fd['ceiling_area_m2']:.2f}", "m²"],
                 ["Anzahl Türen", str(fd['num_doors']), "Stk."],

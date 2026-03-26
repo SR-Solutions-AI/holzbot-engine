@@ -662,13 +662,18 @@ def generate_walls_from_room_coordinates(
             data = {}
 
         rooms_polygons = []
-        # După edit în UI: preferăm camerele din response.json ca să refacem 01_walls_from_coords din noile forme
-        if data.get("rooms"):
+        edited_rooms_path = raster_dir / "detections_edited.json"
+        has_ui_room_edits = edited_rooms_path.exists()
+        # După edit în UI: preferăm camerele din response.json ca să refacem 01_walls_from_coords din noile forme.
+        # IMPORTANT: înainte de editor NU reconstruim pereții din poligoane; păstrăm masca din api_walls_mask (initial_walls_mask_1px).
+        if has_ui_room_edits and data.get("rooms"):
             for i, room in enumerate(data["rooms"]):
                 pts_raw = []
                 for point in room:
                     if isinstance(point, dict) and "x" in point and "y" in point:
-                        ox, oy = api_to_original_coords(point["x"], point["y"])
+                        # După editor, punctele sunt în spațiul blueprint-ului din review și le mapăm doar cu scale.
+                        ox = int(point["x"] * scale_x)
+                        oy = int(point["y"] * scale_y)
                         ox = max(0, min(w_orig - 1, ox))
                         oy = max(0, min(h_orig - 1, oy))
                         pts_raw.append([ox, oy])
@@ -677,6 +682,8 @@ def generate_walls_from_room_coordinates(
             if rooms_polygons:
                 rooms_from_response = True
                 _log(f"      📐 [skip path] {len(rooms_polygons)} camere din response.json (după edit) → refacem pereți + 09_interior")
+        elif data.get("rooms"):
+            _log("      ℹ️ [skip path] Înainte de editor: ignor poligoanele din response.json pentru pereți; folosesc masca api_walls_mask")
         if not rooms_polygons:
             # Prima dată (fără edit): camere din pereții raster (spațiu liber)
             free_space = (255 - (initial_walls_mask_1px > 0).astype(np.uint8) * 255).astype(np.uint8)
@@ -724,7 +731,8 @@ def generate_walls_from_room_coordinates(
             _log(f"      💾 Salvat: 09_interior.png (skip path, aceleași camere ca pentru Gemini)")
         # Poligoanele sunt cele de la rooms (boss); după modificări le folosim pentru walls_from_coords
         if rooms_from_response and len(rooms_polygons) > 0:
-            # Aceleași poligoane ca în rooms.png (sursă: rooms boss)
+            # După editor refacem 01_walls_from_coords DOAR din camerele noi (schelet nou),
+            # fără OR cu scheletul vechi.
             walls_from_rooms = np.zeros((h_orig, w_orig), dtype=np.uint8)
             for rp in rooms_polygons:
                 cv2.polylines(walls_from_rooms, [rp], isClosed=True, color=255, thickness=2)
@@ -737,14 +745,15 @@ def generate_walls_from_room_coordinates(
             walls_from_rooms = cv2.dilate(walls_from_rooms, kernel)
             from skimage.morphology import skeletonize
             walls_from_rooms = (skeletonize((walls_from_rooms > 0).astype(bool)).astype(np.uint8)) * 255
+
             accepted_wall_segments_mask = walls_from_rooms.copy()
             walls_mask_validated = walls_from_rooms.copy()
             walls_overlay_mask = walls_from_rooms.copy()
             mask_for_coverage = walls_from_rooms.copy()
-            _log(f"      🔄 Mască pereți (01_walls_from_coords) din rooms boss, pereți uniți (1px)")
+            _log(f"      🔄 Mască pereți (01_walls_from_coords): schelet nou din camere editate")
             segments_path_skip = output_dir / "01_walls_from_coords.png"
             cv2.imwrite(str(segments_path_skip), walls_from_rooms)
-            _log(f"      💾 Salvat: 01_walls_from_coords.png (skip path, din camere editate)")
+            _log(f"      💾 Salvat: 01_walls_from_coords.png (skip path, doar scheletul nou)")
     else:
         _skip_to_garage = False
         _input_is_1px = False
@@ -2591,14 +2600,16 @@ def generate_walls_from_room_coordinates(
     _log(f"      💾 Salvat: 06_walls_separated.png")
     
     # 7. Generăm pereții interiori -> 07_walls_interior.png
-    _log(f"      🏗️ Generez pereții interiori...")
-    walls_interior = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    
-    # Pereții interiori = pereții care sunt lângă outline-urile care NU ating flood fill (galben) — vectorizat
-    outline_interior = (walls_outline > 0) & (outline_touches_flood == 0)
-    dilated_outline_int = cv2.dilate(outline_interior.astype(np.uint8), kernel_outline)
-    walls_interior = np.where((walls_thick > 0) & (dilated_outline_int > 0), 255, 0).astype(np.uint8)
-    _log(f"      💾 Salvat: 07_walls_interior.png")
+    # Aliniat la 06: doar pixelii galbeni (outline interior, fără atingere flood) → mască albă.
+    # În 06: BGR [0, 255, 255] = galben; nu mai intersectăm cu walls_thick dilatat (construcție veche, greșită).
+    _log(f"      🏗️ Generez pereții interiori (din galben 06)...")
+    yellow_bgr = np.array([0, 255, 255], dtype=np.uint8)
+    walls_interior = (
+        (separated_img[:, :, 0] == yellow_bgr[0])
+        & (separated_img[:, :, 1] == yellow_bgr[1])
+        & (separated_img[:, :, 2] == yellow_bgr[2])
+    ).astype(np.uint8) * 255
+    _log(f"      💾 Salvat: 07_walls_interior.png (pixeli = galben din 06 → alb)")
     
     # 8. Generăm pereții exteriori -> 08_walls_exterior.png
     _log(f"      🏗️ Generez pereții exteriori...")

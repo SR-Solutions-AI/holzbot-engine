@@ -26,20 +26,26 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
     ("daemmungDachdeckung", "sichtdachstuhl"): "visible_roof_structure",
     ("daemmungDachdeckung", "dachdeckung"): "roof_covering",
     ("daemmungDachdeckung", "pantaAcoperis"): "roof_pitch",
-    ("ferestreUsi", "bodentiefeFenster"): "floor_level_windows",
+    ("daemmungDachdeckung", "dachfensterImDach"): "roof_skylights",
+    ("daemmungDachdeckung", "dachfensterTyp"): "roof_skylight_type",
     ("ferestreUsi", "windowQuality"): "window_quality",
     ("ferestreUsi", "turhohe"): "door_height",
     ("ferestreUsi", "doorMaterialInterior"): "door_material_interior",
     ("ferestreUsi", "doorMaterialExterior"): "door_material_exterior",
+    ("ferestreUsi", "treppeTyp"): "stairs_type",
     ("performantaEnergetica", "nivelEnergetic"): "energy_level",
     ("performantaEnergetica", "tipIncalzire"): "heating_type",
     ("performantaEnergetica", "ventilatie"): "ventilation",
     ("performantaEnergetica", "tipSemineu"): "fireplace_type",
+    ("performantaEnergetica", "includeElectricity"): "include_electricity",
+    ("performantaEnergetica", "includeSewage"): "include_sewage",
     # Alias-uri pentru payload-uri care folosesc step keys diferite
     ("performanta", "nivelEnergetic"): "energy_level",
     ("performanta", "tipIncalzire"): "heating_type",
     ("performanta", "ventilatie"): "ventilation",
     ("performanta", "tipSemineu"): "fireplace_type",
+    ("performanta", "includeElectricity"): "include_electricity",
+    ("performanta", "includeSewage"): "include_sewage",
 }
 
 
