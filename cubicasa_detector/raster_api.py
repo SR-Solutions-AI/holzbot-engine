@@ -435,6 +435,7 @@ def _get_room_polygons_from_response(
     offset_xy: Tuple[int, int],
     request_w: int,
     request_h: int,
+    scale_xy: Tuple[float, float] = (1.0, 1.0),
 ) -> List[np.ndarray]:
     """
     Poligoane pentru editor din rooms (boss): response.json data.rooms.
@@ -450,12 +451,16 @@ def _get_room_polygons_from_response(
         if not rooms_data:
             return []
         ox, oy = offset_xy
+        sx, sy = float(scale_xy[0]), float(scale_xy[1])
         polygons_request: List[np.ndarray] = []
         for room in rooms_data:
             pts = []
             for p in room:
                 if isinstance(p, dict) and "x" in p and "y" in p:
-                    pts.append([int(p["x"]) + ox, int(p["y"]) + oy])
+                    pts.append([
+                        int(round(float(p["x"]) * sx)) + ox,
+                        int(round(float(p["y"]) * sy)) + oy,
+                    ])
             if len(pts) >= 3:
                 polygons_request.append(np.array(pts, dtype=np.int32).reshape(-1, 1, 2))
         return polygons_request
@@ -711,10 +716,12 @@ def _save_detections_review_data(
     offset_xy: Tuple[int, int],
     req_w: int,
     req_h: int,
+    scale_xy: Tuple[float, float] = (1.0, 1.0),
 ) -> None:
     """Salvează detections_review_data.json: rooms (poligoane + roomType + roomName) + doors.
     Aceeași sursă ca în LiveFeed și pipeline: room_scales.json (per-crop Gemini, OCR exact) pentru
-    etichete camere; doors_types.json (Gemini) + euristică aspect pentru uși/geamuri.
+    etichete camere; markeri culoare din raster_response (red=window, green=door), apoi
+    doors_types.json (Gemini) + euristică aspect pentru fallback uși/geamuri.
     Prioritate etichete camere: 1) room_scales.json (walls_from_coords), 2) room_types.json (doar după edit în editor).
     """
     out_path = raster_dir / "detections_review_data.json"
@@ -827,6 +834,7 @@ def _save_detections_review_data(
             with open(response_path, "r", encoding="utf-8") as f:
                 data = json.load(f).get("data", {})
         ox, oy = offset_xy
+        sx, sy = float(scale_xy[0]), float(scale_xy[1])
         if not rooms and data.get("rooms"):
             if not room_types_by_index:
                 _room_scales_path = raster_dir.parent / "raster_processing" / "walls_from_coords" / "room_scales.json"
@@ -845,7 +853,10 @@ def _save_detections_review_data(
                 pts = []
                 for p in room:
                     if isinstance(p, dict) and "x" in p and "y" in p:
-                        pts.append([int(p["x"]) + ox, int(p["y"]) + oy])
+                        pts.append([
+                            int(round(float(p["x"]) * sx)) + ox,
+                            int(round(float(p["y"]) * sy)) + oy,
+                        ])
                 if len(pts) >= 3:
                     room_type = room_types_by_index[idx] if idx < len(room_types_by_index) else "Raum"
                     room_name = room_names_by_index[idx] if idx < len(room_names_by_index) else "Raum"
@@ -873,23 +884,34 @@ def _save_detections_review_data(
             return inter / u if u > 0 else 0.0
 
         kept_bboxes: List[tuple] = []
-        edited_marker_exists = (raster_dir / "detections_edited.json").exists()
+        markers = _load_opening_color_markers(raster_dir)
         stairs_count = 0
         for idx, door in enumerate(data.get("doors") or []):
             if "bbox" not in door or len(door["bbox"]) != 4:
                 continue
             x1, y1, x2, y2 = door["bbox"]
-            x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+            x1 = int(round(float(x1) * sx)) + ox
+            y1 = int(round(float(y1) * sy)) + oy
+            x2 = int(round(float(x2) * sx)) + ox
+            y2 = int(round(float(y2) * sy)) + oy
             bbox = (x1, y1, x2, y2)
             if any(_bbox_iou(bbox, k) > 0.15 for k in kept_bboxes):
                 continue  # fără suprapuneri în payload pentru editor
             kept_bboxes.append(bbox)
-            # Aceeași clasificare ca în LiveFeed: doors_types.json (Gemini) + euristică aspect
+            marker_type = _closest_opening_type_from_markers(
+                (x1, y1, x2, y2),
+                markers,
+                req_w=req_w,
+                req_h=req_h,
+                marker_offset_xy=offset_xy,
+                marker_scale_xy=scale_xy,
+            )
+            # Aceeași clasificare ca în LiveFeed: marker culoare -> Gemini -> euristică fallback
             type_str = _door_type_from_response_or_fallback(door, idx, doors_types_list)
-            # Nu permitem clasificarea automată (Gemini/heuristic) ca "stairs".
-            # Tipul stairs e permis doar după editare explicită în editor.
-            if type_str == "stairs" and not edited_marker_exists:
-                type_str = "door"
+            if marker_type == "stairs":
+                type_str = "stairs"
+            elif type_str != "stairs" and marker_type in ("door", "window"):
+                type_str = marker_type
             # Maxim o scară pe etaj.
             if type_str == "stairs":
                 if stairs_count >= 1:
@@ -1040,6 +1062,7 @@ def _draw_response_overlay(
     draw_doors: bool = True,
     draw_walls: bool = True,
     offset_xy: Tuple[int, int] = (0, 0),
+    scale_xy: Tuple[float, float] = (1.0, 1.0),
 ) -> bool:
     """Desenează rooms/doors/walls din response.json pe base_img (fill transparent, contur).
     offset_xy: (tx, ty) adăugat la toate coordonatele (pentru aliniere cu masca Raster la translația brute force).
@@ -1050,7 +1073,8 @@ def _draw_response_overlay(
     with open(response_path, "r", encoding="utf-8") as f:
         result = json.load(f)
     data = result.get("data", result)
-    # Tipuri uși/geamuri: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed)
+    # Tipuri uși/geamuri: 1) marker culoare raster_response (aliniat cu brute force),
+    # 2) Raster JSON, 3) doors_types.json (Gemini), 4) euristică aspect (fallback)
     doors_types_list = []
     doors_types_path = raster_dir / "doors_types.json"
     if doors_types_path.exists():
@@ -1059,12 +1083,27 @@ def _draw_response_overlay(
                 doors_types_list = json.load(f)
         except Exception:
             pass
+    markers = _load_opening_color_markers(raster_dir)
+    req_w = req_h = 0
+    req_info = raster_dir / "raster_request_info.json"
+    if req_info.exists():
+        try:
+            ri = json.loads(req_info.read_text(encoding="utf-8"))
+            req_w = int(ri.get("request_w") or 0)
+            req_h = int(ri.get("request_h") or 0)
+        except Exception:
+            req_w = req_h = 0
+    if req_w <= 0 or req_h <= 0:
+        req_w = int(markers.get("img_w") or 0)
+        req_h = int(markers.get("img_h") or 0)
+
     overlay = base_img.copy()
     h, w = overlay.shape[:2]
     ox, oy = offset_xy
+    sx, sy = float(scale_xy[0]), float(scale_xy[1])
 
     def pt(x: float, y: float):
-        return (int(round(x + ox)), int(round(y + oy)))
+        return (int(round(x * sx + ox)), int(round(y * sy + oy)))
 
     # Culoare distinctă per cameră (BGR) din HSV
     def _room_color(i: int):
@@ -1105,14 +1144,29 @@ def _draw_response_overlay(
         for door_idx, door in enumerate(data["doors"]):
             if "bbox" not in door or len(door["bbox"]) != 4:
                 continue
-            x1, y1, x2, y2 = map(int, door["bbox"])
-            x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+            x1, y1, x2, y2 = map(float, door["bbox"])
+            x1 = int(round(x1 * sx)) + ox
+            y1 = int(round(y1 * sy)) + oy
+            x2 = int(round(x2 * sx)) + ox
+            y2 = int(round(y2 * sy)) + oy
             if x2 <= x1 or y2 <= y1:
                 continue
-            # Prioritate: 1) Raster JSON, 2) doors_types.json (Gemini), 3) euristică aspect (ca livefeed/count_objects)
+            marker_type = _closest_opening_type_from_markers(
+                (x1, y1, x2, y2),
+                markers,
+                req_w,
+                req_h,
+                marker_offset_xy=(float(ox), float(oy)),
+                marker_scale_xy=scale_xy,
+            )
+            # Prioritate: marker culoare aliniat -> Raster JSON -> Gemini -> aspect fallback
             type_str = _door_type_from_response_or_fallback(door, door_idx, doors_types_list)
+            if marker_type in ("door", "window", "stairs"):
+                type_str = marker_type
+
             is_window = type_str == "window"
-            if not is_window and type_str == "door":
+            is_stairs = type_str == "stairs"
+            if not is_window and not is_stairs and type_str == "door":
                 width = x2 - x1
                 height = y2 - y1
                 is_window = _is_window_by_aspect(float(width), float(height))
@@ -1120,6 +1174,10 @@ def _draw_response_overlay(
                 border_color = _COLOR_WINDOW_BORDER
                 fill_color = _COLOR_WINDOW_FILL
                 label = "W"
+            elif is_stairs:
+                border_color = (0, 255, 255)
+                fill_color = (120, 120, 0)
+                label = "S"
             else:
                 border_color = _COLOR_DOOR_BORDER
                 fill_color = _COLOR_DOOR_FILL
@@ -1451,10 +1509,101 @@ def _door_type_from_response_or_fallback(
     return "door"
 
 
+def _load_opening_color_markers(raster_dir: Path) -> dict:
+    """
+    Extrage centrele markerelor de culoare din raster_response.png.
+    Convenție:
+      - roșu  -> window
+      - verde -> door
+    """
+    out = {"img_w": 0, "img_h": 0, "red": [], "green": []}
+    img_path = raster_dir / "raster_response.png"
+    if not img_path.exists():
+        return out
+    try:
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img is None:
+            return out
+        h, w = img.shape[:2]
+        out["img_w"] = int(w)
+        out["img_h"] = int(h)
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv, (0, 100, 120), (10, 255, 255))
+        red2 = cv2.inRange(hsv, (170, 100, 120), (180, 255, 255))
+        red_mask = cv2.bitwise_or(red1, red2)
+        green_mask = cv2.inRange(hsv, (35, 80, 80), (95, 255, 255))
+
+        b, g, r = cv2.split(img)
+        red_rgb = ((r > 180) & (g < 120) & (b < 120)).astype(np.uint8) * 255
+        green_rgb = ((g > 170) & (r < 140) & (b < 140)).astype(np.uint8) * 255
+        red_mask = cv2.bitwise_or(red_mask, red_rgb)
+        green_mask = cv2.bitwise_or(green_mask, green_rgb)
+
+        def _centers(mask: np.ndarray) -> List[Tuple[float, float]]:
+            centers: List[Tuple[float, float]] = []
+            num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            for i in range(1, num_labels):
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < 3:
+                    continue
+                cx, cy = cents[i]
+                centers.append((float(cx), float(cy)))
+            return centers
+
+        out["red"] = _centers(red_mask)
+        out["green"] = _centers(green_mask)
+    except Exception:
+        return out
+    return out
+
+
+def _closest_opening_type_from_markers(
+    bbox_xyxy: Tuple[float, float, float, float],
+    markers: dict,
+    req_w: int,
+    req_h: int,
+    marker_offset_xy: Tuple[float, float] = (0.0, 0.0),
+    marker_scale_xy: Tuple[float, float] = (1.0, 1.0),
+) -> Optional[str]:
+    img_w = int(markers.get("img_w") or 0)
+    img_h = int(markers.get("img_h") or 0)
+    if img_w <= 0 or img_h <= 0 or req_w <= 0 or req_h <= 0:
+        return None
+    reds = markers.get("red") or []
+    greens = markers.get("green") or []
+    if not reds and not greens:
+        return None
+
+    sx = float(req_w) / float(max(1, img_w))
+    sy = float(req_h) / float(max(1, img_h))
+    ox, oy = float(marker_offset_xy[0]), float(marker_offset_xy[1])
+    kx, ky = float(marker_scale_xy[0]), float(marker_scale_xy[1])
+    red_pts = [((float(x) * sx) * kx + ox, (float(y) * sy) * ky + oy) for (x, y) in reds]
+    green_pts = [((float(x) * sx) * kx + ox, (float(y) * sy) * ky + oy) for (x, y) in greens]
+
+    x1, y1, x2, y2 = bbox_xyxy
+    cx = 0.5 * (float(x1) + float(x2))
+    cy = 0.5 * (float(y1) + float(y2))
+
+    def _best_dist(points: List[Tuple[float, float]]) -> float:
+        if not points:
+            return float("inf")
+        return min(((px - cx) ** 2 + (py - cy) ** 2) for (px, py) in points)
+
+    d_red = _best_dist(red_pts)
+    d_green = _best_dist(green_pts)
+    if d_red == float("inf") and d_green == float("inf"):
+        return "stairs"
+    return "window" if d_red < d_green else "door"
+
+
 def _get_door_types_for_drawing(raster_dir: Path, data: dict) -> List[bool]:
     """
     Returnează o listă is_window[i] pentru fiecare door din data['doors'].
-    Prioritate: 1) Raster JSON (type/class), 2) doors_types.json (Gemini), 3) euristică aspect (ca în count_objects / livefeed).
+    Prioritate: 1) marker culoare din raster_response (red=window, green=door),
+               2) Raster JSON (type/class), 3) doors_types.json (Gemini),
+               4) euristică aspect (fallback).
     """
     doors = data.get("doors") or []
     if not doors:
@@ -1467,6 +1616,19 @@ def _get_door_types_for_drawing(raster_dir: Path, data: dict) -> List[bool]:
                 doors_types_list = json.load(f)
         except Exception:
             pass
+    markers = _load_opening_color_markers(raster_dir)
+    req_w = req_h = 0
+    req_info = raster_dir / "raster_request_info.json"
+    if req_info.exists():
+        try:
+            ri = json.loads(req_info.read_text(encoding="utf-8"))
+            req_w = int(ri.get("request_w") or 0)
+            req_h = int(ri.get("request_h") or 0)
+        except Exception:
+            req_w = req_h = 0
+    if req_w <= 0 or req_h <= 0:
+        req_w = int(markers.get("img_w") or 0)
+        req_h = int(markers.get("img_h") or 0)
     result: List[bool] = []
     for idx, door in enumerate(doors):
         if "bbox" not in door or len(door["bbox"]) != 4:
@@ -1475,6 +1637,15 @@ def _get_door_types_for_drawing(raster_dir: Path, data: dict) -> List[bool]:
         x1, y1, x2, y2 = door["bbox"]
         width = abs(x2 - x1)
         height = abs(y2 - y1)
+        marker_type = _closest_opening_type_from_markers(
+            (x1, y1, x2, y2), markers, req_w, req_h, marker_offset_xy=(0.0, 0.0)
+        )
+        if marker_type in ("door", "window"):
+            result.append(marker_type == "window")
+            continue
+        if marker_type == "stairs":
+            result.append(False)
+            continue
         type_str = _door_type_from_response_or_fallback(door, idx, doors_types_list)
         is_window = type_str == "window"
         if not is_window and type_str == "door":
@@ -2260,6 +2431,32 @@ def brute_force_alignment(
                         cv2.imwrite(str(brute_steps_dir / "translation_only_overlay.png"), overlay_req)
                     except OSError:
                         pass
+
+        # NEW (non-breaking): brute force separat pe masca gri a pereților din raster_response.
+        # Nu schimbă config-ul folosit de pipeline; salvează doar debug/config secundar.
+        if ref_request is not None:
+            try:
+                gray_req = cv2.resize(
+                    (api_walls_mask > 0).astype(np.uint8) * 255,
+                    (ref_request.shape[1], ref_request.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                cv2.imwrite(str(brute_steps_dir / "api_walls_from_raster_gray_request.png"), gray_req)
+                gray_cfg = brute_force_translation_only(ref_request, gray_req)
+                if gray_cfg is not None:
+                    with open(brute_steps_dir / "translation_only_config_raster_gray.json", "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "position": list(gray_cfg["position"]),
+                                "score": gray_cfg["score"],
+                                "direction": "translation_only",
+                                "template_size": list(gray_cfg["template_size"]),
+                            },
+                            f,
+                            indent=2,
+                        )
+            except Exception:
+                pass
 
         # Dacă avem rezultat doar translații, îl folosim ca rezultat final (fără scale, fără Gemini)
         use_translation_only = trans_only_cfg is not None

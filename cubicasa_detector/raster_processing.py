@@ -13,7 +13,16 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .scale_detection import call_gemini, GEMINI_PROMPT_CROP, call_gemini_zone_labels, call_gemini_blacklist, call_gemini_rooms_per_crop, call_gemini_doors_batch, is_informational_total_result
+from .scale_detection import (
+    call_gemini,
+    GEMINI_PROMPT_CROP,
+    GEMINI_DOORS_BATCH_CHUNK_SIZE,
+    call_gemini_zone_labels,
+    call_gemini_blacklist,
+    call_gemini_rooms_per_crop,
+    call_gemini_doors_batch,
+    is_informational_total_result,
+)
 from .ocr_room_filling import (
     run_ocr_on_zones,
     run_ocr_scan_regions,
@@ -2927,11 +2936,13 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
             y_max = min(h_orig, max(y1_orig, y2_orig))
             bbox_width = x_max - x_min
             bbox_height = y_max - y_min
-            padding = min(20, max(5, int(min(bbox_width, bbox_height) * 0.1)))
-            x_min_crop = max(0, x_min - padding)
-            y_min_crop = max(0, y_min - padding)
-            x_max_crop = min(w_orig, x_max + padding)
-            y_max_crop = min(h_orig, y_max + padding)
+            # Include context: +50% din dimensiunea bbox pe fiecare direcție
+            pad_x = max(1, int(round(bbox_width * 0.5)))
+            pad_y = max(1, int(round(bbox_height * 0.5)))
+            x_min_crop = max(0, x_min - pad_x)
+            y_min_crop = max(0, y_min - pad_y)
+            x_max_crop = min(w_orig, x_max + pad_x)
+            y_max_crop = min(h_orig, y_max + pad_y)
             if x_max_crop <= x_min_crop or y_max_crop <= y_min_crop:
                 continue
             door_crop = original_img[y_min_crop:y_max_crop, x_min_crop:x_max_crop]
@@ -2967,7 +2978,15 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
         batch_types = None
         if door_items and gemini_api_key:
             paths = [item[1] for item in door_items]
+            n_paths = len(paths)
+            n_calls = (n_paths + GEMINI_DOORS_BATCH_CHUNK_SIZE - 1) // GEMINI_DOORS_BATCH_CHUNK_SIZE
+            _log(
+                f"      [GEMINI] Uși/geamuri: {n_paths} crop-uri, "
+                f"max {GEMINI_DOORS_BATCH_CHUNK_SIZE} per apel (~{n_calls} apeluri)"
+            )
             batch_types = call_gemini_doors_batch(paths, gemini_api_key)
+            if batch_types is None:
+                _log("      [GEMINI] Batch uși/geamuri eșuat – fallback per-crop pentru fiecare deschidere")
 
         for pos, (idx, temp_crop_path, room_name, door_crop, x_min, y_min, x_max, y_max, door_crop_small) in enumerate(door_items):
             bbox_w = x_max - x_min

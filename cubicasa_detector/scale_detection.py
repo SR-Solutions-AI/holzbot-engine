@@ -848,11 +848,15 @@ USE "window" for:
 
 USE "door" for:
 - Passage openings for people (single/double leaf, may show swing arc). Also use "door" for very wide openings (e.g. garage) – user will set garage manually in the app.
+- IMPORTANT: Double doors are still "door" (NOT window).
+- IMPORTANT: Sliding openings (sliding door / Schiebetür) should be classified as "window".
 
 USE "stairs" for:
 - Staircase / Treppe: visible step pattern (parallel lines going up or down), L-shape or rectangular opening connecting floors. If you see steps, it is "stairs" not "door".
 
-Rule: When in doubt between door and window, prefer "window" if there are lines/grid or strip shape. When you see steps, always "stairs". Return exactly {n} types. Only use: "door", "window", "stairs" (no garage_door).
+USE "garage_door" only if you are VERY SURE it is a garage opening (large vehicle entry). If not very sure, use "door".
+
+Rule: When in doubt between door and window, prefer "window" for fenestration and sliding systems. Double swing/leaf doors are "door". When you see steps, always "stairs". Return exactly {n} types. Only use: "door", "window", "garage_door", "stairs".
 
 Return ONLY this JSON (no markdown): {{"types": ["door", "window", "stairs", ...]}}
 """
@@ -900,25 +904,30 @@ def _parse_doors_batch_text(text: str, n: int):
     return out, None
 
 
-def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 2) -> list[str] | None:
-    """
-    Trimite toate crop-urile de deschideri (doors) într-un singur apel Gemini.
-    Returnează list[str] de tipuri ('door', 'window', 'garage_door', 'stairs') în aceeași ordine, sau None.
-    """
-    if not image_paths or not api_key:
-        return None
-    image_paths = [Path(p) for p in image_paths]
+def _call_gemini_doors_batch_single(
+    image_paths: list[Path], api_key: str, max_retries: int = 2
+) -> list[str] | None:
+    """Un singur apel Gemini pentru o listă de crop-uri (Path)."""
     n = len(image_paths)
+    if n == 0:
+        return []
     parts = []
     for p in image_paths:
-        with open(p, 'rb') as f:
-            data = base64.b64encode(f.read()).decode('utf-8')
+        with open(p, "rb") as f:
+            data = base64.b64encode(f.read()).decode("utf-8")
         ext = p.suffix.lower()
-        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
-        mime_type = mime_map.get(ext, 'image/png')
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+        mime_type = mime_map.get(ext, "image/png")
         parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
     prompt = GEMINI_PROMPT_DOORS_BATCH.format(n=n)
-    parts.append({"text": prompt + "\n\nIMPORTANT: Reply only with JSON object with key 'types' and an array of exactly " + str(n) + " strings."})
+    parts.append(
+        {
+            "text": prompt
+            + "\n\nIMPORTANT: Reply only with JSON object with key 'types' and an array of exactly "
+            + str(n)
+            + " strings."
+        }
+    )
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     gen_config = {"temperature": 0.0, "maxOutputTokens": 1024, "responseMimeType": "application/json"}
@@ -931,19 +940,23 @@ def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 
             if response.status_code != 200:
                 return None
             result = response.json()
-            if 'candidates' not in result or not result['candidates']:
+            if "candidates" not in result or not result["candidates"]:
                 return None
-            text = result['candidates'][0]['content']['parts'][0].get('text', '').strip()
+            text = result["candidates"][0]["content"]["parts"][0].get("text", "").strip()
             out, err = _parse_doors_batch_text(text, n)
             if out is not None:
                 return out
             if attempt == max_retries and os.getenv("OPENAI_API_KEY"):
                 try:
                     import sys
+
                     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
                     from common.json_repair import repair_json_with_gpt
+
                     schema = (
-                        'Object with key "types" (array of exactly ' + str(n) + ' strings). '
+                        "Object with key 'types' (array of exactly "
+                        + str(n)
+                        + " strings). "
                         'Each string is one of: "door", "window", "garage_door", "stairs".'
                     )
                     repaired = repair_json_with_gpt(text, schema)
@@ -966,6 +979,39 @@ def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 
             print(f"⚠️  Gemini doors batch error: {e}")
             return None
     return None
+
+
+# Max crop-uri per apel Gemini (folosit în pipeline → doors_types.json / editor)
+GEMINI_DOORS_BATCH_CHUNK_SIZE = 10
+
+
+def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 2) -> list[str] | None:
+    """
+    Trimite crop-urile de deschideri la Gemini în batch-uri de câte cel mult
+    GEMINI_DOORS_BATCH_CHUNK_SIZE imagini (ultimul batch poate avea mai puține).
+    Ordinea se păstrează. Returnează list[str] sau None (pipeline-ul face fallback per-crop).
+    """
+    if not image_paths or not api_key:
+        return None
+    paths = [Path(p) for p in image_paths]
+    n = len(paths)
+    chunk = GEMINI_DOORS_BATCH_CHUNK_SIZE
+    merged: list[str] = []
+    for start in range(0, n, chunk):
+        sub = paths[start : start + chunk]
+        part = _call_gemini_doors_batch_single(sub, api_key, max_retries)
+        if part is None:
+            return None
+        if len(part) != len(sub):
+            print(
+                f"⚠️  Gemini doors batch: chunk size mismatch len(part)={len(part)} != len(sub)={len(sub)}"
+            )
+            return None
+        merged.extend(part)
+    if len(merged) != n:
+        print(f"⚠️  Gemini doors batch: total length mismatch {len(merged)} != {n}")
+        return None
+    return merged
 
 
 GEMINI_PROMPT_WALL_ALIGNMENT = """

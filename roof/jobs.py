@@ -890,21 +890,37 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
                 types_result, angles_result = classify_roof_types_per_floor(
                     gemini, side_views, num_floors_for_gemini
                 )
-                # Gemini classifier returns floor indices in "bottom-up" semantic order
-                # (parter, etaj_1, ...). Our roof rectangles order is now "top-down".
-                # Remap Gemini indices accordingly so floor_0 stays top floor.
-                if types_result:
-                    n = int(num_floors_for_gemini)
-                    types_result = {int(n - 1 - int(k)): v for k, v in types_result.items()}
-                if angles_result:
-                    n = int(num_floors_for_gemini)
-                    angles_result = {int(n - 1 - int(k)): v for k, v in angles_result.items()}
-                if types_result:
-                    floor_roof_types = types_result
-                    print(f"   [roof] FOLOSIM tipuri acoperiș de la Gemini: {floor_roof_types}", flush=True)
-                if angles_result:
-                    floor_roof_angles = angles_result
-                    print(f"   [roof] FOLOSIM unghiuri acoperiș de la Gemini: {floor_roof_angles}", flush=True)
+                # Gemini întoarce indexare semantică "bottom-up" (parter, etaj_1, ...).
+                # Workflow-ul roof folosește indexare "top-down" (floor_0 = cel mai sus).
+                # Mapăm explicit prin ordinea reală a etajelor, nu prin presupunere simplă pe index.
+                roof_indices_bottom_up = list(reversed(list(range(num_floors_roof))))
+                if basement_idx is not None:
+                    roof_indices_bottom_up = [i for i in roof_indices_bottom_up if i != basement_idx]
+                gemini_to_roof_idx = {
+                    int(gidx): int(roof_idx)
+                    for gidx, roof_idx in enumerate(roof_indices_bottom_up)
+                }
+
+                mapped_types: dict[int, str] = {}
+                mapped_angles: dict[int, float] = {}
+                for gidx, roof_idx in gemini_to_roof_idx.items():
+                    if types_result and gidx in types_result:
+                        mapped_types[roof_idx] = types_result[gidx]
+                    if angles_result and gidx in angles_result:
+                        mapped_angles[roof_idx] = float(angles_result[gidx])
+
+                if mapped_types:
+                    floor_roof_types = mapped_types
+                    print(
+                        f"   [roof] FOLOSIM tipuri acoperiș de la Gemini (mapat bottom->top): {floor_roof_types}",
+                        flush=True,
+                    )
+                if mapped_angles:
+                    floor_roof_angles = mapped_angles
+                    print(
+                        f"   [roof] FOLOSIM unghiuri acoperiș de la Gemini (mapat bottom->top): {floor_roof_angles}",
+                        flush=True,
+                    )
                 if not floor_roof_types:
                     print(f"   [roof] NU avem tipuri de la Gemini – vom folosi fallback 2_w pentru toate etajele.", flush=True)
                 if not floor_roof_angles:
@@ -918,17 +934,18 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
         floor_roof_types = {i: "2_w" for i in range(num_floors_roof)}
         print(f"   [roof] Aplicat fallback: floor_roof_types={floor_roof_types}", flush=True)
     elif floor_roof_types is not None and basement_idx is not None and num_floors_roof >= 1:
-        # Beci: nu adăugăm acoperiș (null); restul etajelor păstrează tipul de la Gemini
-        full_types: dict = {}
-        gemini_idx = 0
+        # Beci: fără acoperiș; celelalte etaje rămân la valorile deja mapate pe roof-index.
+        full_types: dict[int, str | None] = {}
         for i in range(num_floors_roof):
             if i == basement_idx:
-                full_types[i] = None  # no roof for basement
+                full_types[i] = None
             else:
-                full_types[i] = floor_roof_types.get(gemini_idx, "2_w")
-                gemini_idx += 1
+                full_types[i] = floor_roof_types.get(i, "2_w")
         floor_roof_types = full_types
-        print(f"   [roof] Beci fără acoperiș la index {basement_idx}; floor_roof_types={floor_roof_types}", flush=True)
+        print(
+            f"   [roof] Beci fără acoperiș la index {basement_idx}; floor_roof_types={floor_roof_types}",
+            flush=True,
+        )
 
     # Unghiuri: folosim cele de la Gemini; lipsă = default 30° (sau 0 pentru 0_w)
     if floor_roof_angles is None or not floor_roof_angles:
@@ -938,16 +955,8 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
             t = (floor_roof_types or {}).get(i)
             floor_roof_angles[i] = 0.0 if t == "0_w" else DEFAULT_ROOF_ANGLE_DEG
     if basement_idx is not None and floor_roof_angles:
-        # Reindexare unghiuri când avem beci: Gemini nu a dat unghi pentru beci
-        ang_from_gemini = dict(floor_roof_angles)
-        floor_roof_angles = {}
-        gemini_idx = 0
-        for i in range(num_floors_roof):
-            if i == basement_idx:
-                floor_roof_angles[i] = 0.0  # nefolosit (fără acoperiș)
-            else:
-                floor_roof_angles[i] = ang_from_gemini.get(gemini_idx, DEFAULT_ROOF_ANGLE_DEG)
-                gemini_idx += 1
+        # Fixăm explicit unghiul beciului; restul cheilor sunt deja mapate pe roof-index.
+        floor_roof_angles[basement_idx] = 0.0
     if num_floors_roof >= 1:
         floor_roof_angles = {i: float(floor_roof_angles.get(i, DEFAULT_ROOF_ANGLE_DEG)) for i in range(num_floors_roof)}
     else:
