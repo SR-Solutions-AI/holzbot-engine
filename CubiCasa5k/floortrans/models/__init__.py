@@ -1,3 +1,12 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:9eb6b4906a922a8ceee9e925e89495408a0b163a64b30e13b52334957973b646
-size 325
+from floortrans.models.hg_furukawa_original import *
+
+def get_model(name, n_classes=None, version=None):
+    if name == 'hg_furukawa_original':
+        model = hg_furukawa_original(n_classes=n_classes)
+        model.init_weights()
+    else:
+        raise ValueError('Model {} not available'.format(name))
+
+    return model
+
+

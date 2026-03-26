@@ -1,5 +1,1 @@
-cubicasa_detector/model_weights.pth filter=lfs diff=lfs merge=lfs -text
-CubiCasa5k filter=lfs diff=lfs merge=lfs -text
-CubiCasa5k/** filter=lfs diff=lfs merge=lfs -text
-# Python sources must stay normal files (no LFS) so they run on server
-CubiCasa5k/**/*.py -filter -diff -merge
+

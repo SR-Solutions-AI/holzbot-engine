@@ -1,3 +1,11 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:89fa724c4ad063d2a0fd0638878337a0139f423041e148b7dc40970dd0eb1637
-size 206
+FROM anibali/pytorch:cuda-9.0
+
+RUN sudo apt-get update
+RUN sudo apt-get upgrade -y
+RUN sudo apt-get install -y \
+        build-essential 
+
+COPY requirements.txt /app/.
+
+RUN pip install -r requirements.txt
+
