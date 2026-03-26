@@ -873,6 +873,8 @@ def _save_detections_review_data(
             return inter / u if u > 0 else 0.0
 
         kept_bboxes: List[tuple] = []
+        edited_marker_exists = (raster_dir / "detections_edited.json").exists()
+        stairs_count = 0
         for idx, door in enumerate(data.get("doors") or []):
             if "bbox" not in door or len(door["bbox"]) != 4:
                 continue
@@ -884,6 +886,16 @@ def _save_detections_review_data(
             kept_bboxes.append(bbox)
             # Aceeași clasificare ca în LiveFeed: doors_types.json (Gemini) + euristică aspect
             type_str = _door_type_from_response_or_fallback(door, idx, doors_types_list)
+            # Nu permitem clasificarea automată (Gemini/heuristic) ca "stairs".
+            # Tipul stairs e permis doar după editare explicită în editor.
+            if type_str == "stairs" and not edited_marker_exists:
+                type_str = "door"
+            # Maxim o scară pe etaj.
+            if type_str == "stairs":
+                if stairs_count >= 1:
+                    type_str = "door"
+                else:
+                    stairs_count += 1
             if type_str == "door":
                 w = abs(x2 - x1)
                 h = abs(y2 - y1)
@@ -987,7 +999,20 @@ def apply_detections_edited(raster_dir: Path) -> bool:
                 json.dump(room_types_list, f, ensure_ascii=False)
 
         types_path = raster_dir / "doors_types.json"
-        types_list = [{"type": str(d.get("type", "door")).lower()} for d in doors_raw if isinstance(d, dict)]
+        types_list = []
+        stairs_count = 0
+        for d in doors_raw:
+            if not isinstance(d, dict):
+                continue
+            t = str(d.get("type", "door")).lower().strip()
+            if t not in ("door", "window", "garage_door", "stairs"):
+                t = "door"
+            if t == "stairs":
+                if stairs_count >= 1:
+                    t = "door"
+                else:
+                    stairs_count += 1
+            types_list.append({"type": t})
         if types_list:
             with open(types_path, "w", encoding="utf-8") as f:
                 json.dump(types_list, f, indent=2)

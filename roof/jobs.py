@@ -216,6 +216,15 @@ def _run_roof_3d_workflow(
 
     roof_3d_dir = out_root / "roof" / "roof_3d"
     roof_3d_dir.mkdir(parents=True, exist_ok=True)
+    # Persist explicit mapping floor index -> plan_id used by roof workflow.
+    # UI/API must use this mapping instead of assuming raster plan order == floor_X order.
+    try:
+        floor_plan_ids = {str(i): p.plan_id for i, p in enumerate(plans)}
+        (roof_3d_dir / "roof_floor_plan_ids.json").write_text(
+            json.dumps(floor_plan_ids, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"       ⚠️ [roof] Nu pot scrie roof_floor_plan_ids.json: {e}", flush=True)
     if floor_roof_types is not None:
         frt_path = roof_3d_dir / "floor_roof_types.json"
         try:
