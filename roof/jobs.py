@@ -263,6 +263,12 @@ def _run_roof_3d_workflow(
 
     if len(paths) == 1:
         wall_input = str(paths[0])
+        try:
+            rp = Path(wall_input).resolve()
+            print(f"       [roof] Input mask (algorithm): {rp}", flush=True)
+            print(f"       [roof] Input mask URL: file://{rp}", flush=True)
+        except Exception:
+            pass
     else:
         tmp = tempfile.mkdtemp(prefix="holzbot_roof_floors_")
         try:
@@ -270,6 +276,14 @@ def _run_roof_3d_workflow(
             for i, (src, plan) in enumerate(zip(paths, plans)):
                 dst = Path(tmp) / f"floor_{i:02d}.png"
                 shutil.copy2(src, dst)
+                try:
+                    print(
+                        f"       [roof] Input mask floor_{i:02d} ({plan.plan_id}): {dst.resolve()}",
+                        flush=True,
+                    )
+                    print(f"       [roof] Input mask URL floor_{i:02d}: file://{dst.resolve()}", flush=True)
+                except Exception:
+                    pass
                 interior_path = src.parent / "09_interior.png"
                 floors_meta.append({
                     "floor_path": dst.name,
@@ -280,6 +294,11 @@ def _run_roof_3d_workflow(
                 json.dumps(floors_meta, indent=0), encoding="utf-8"
             )
             wall_input = tmp
+            try:
+                print(f"       [roof] Input folder (algorithm): {Path(wall_input).resolve()}", flush=True)
+                print(f"       [roof] Input folder URL: file://{Path(wall_input).resolve()}", flush=True)
+            except Exception:
+                pass
         except Exception as e:
             print(f"       ⚠️ [{STAGE_NAME}] Eroare la pregătirea etajelor: {e}", flush=True)
             if os.path.exists(tmp):
