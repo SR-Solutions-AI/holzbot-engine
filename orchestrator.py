@@ -35,9 +35,13 @@ from typing import List, Tuple
 from segmenter.jobs import run_segmentation_for_documents, get_all_classification_results
 
 from floor_classifier import run_floor_classification, FloorClassificationResult
-from detections.jobs import run_detections_for_run
-from cubicasa_detector.jobs import run_cubicasa_phase1, run_cubicasa_phase2
 from cubicasa_detector.raster_api import save_detections_review_image, apply_detections_edited
+from cubicasa_detector.manual_blueprint import (
+    prepare_manual_blueprint_workspace,
+    run_walls_pipeline_after_manual_editor,
+    ensure_roof_3d_floor_manifest,
+    apply_roof_only_synthetic_walls_and_scale,
+)
 from scale import run_scale_detection_for_run
 from count_objects import run_count_objects_for_run
 from roof.jobs import run_roof_for_run
@@ -181,14 +185,21 @@ def _notify_all_cubicasa_images_for_plan(plan: PlanInfo) -> None:
                 notify_ui("cubicasa_step", p)
 
 
-def _check_raster_complete(plans: List[PlanInfo]) -> Tuple[bool, List[str]]:
+def _check_raster_complete(plans: List[PlanInfo], job_root: Path | None = None) -> Tuple[bool, List[str]]:
     """
     Verifică că toate planurile au camerele calculate:
     - room_scales.json există, total_area_m2 > 0, total_area_px > 0
-    - cel puțin o cameră în room_scales/rooms
+    - cel puțin o cameră în room_scales (sare pentru roof_only_offer sintetic)
     - rooms.png există (masca camerelor)
     Returns (all_ok, failed_plan_ids).
     """
+    roof_only = False
+    if job_root is not None:
+        try:
+            fd = load_frontend_data_for_run(job_root.name, job_root)
+            roof_only = bool(fd.get("roof_only_offer"))
+        except Exception:
+            roof_only = False
     failed: List[str] = []
     for plan in plans:
         base = plan.stage_work_dir / "cubicasa_steps"
@@ -210,7 +221,7 @@ def _check_raster_complete(plans: List[PlanInfo]) -> Tuple[bool, List[str]]:
 
             if m2 <= 0 or px <= 0:
                 failed.append(plan.plan_id)
-            elif num_rooms < 1:
+            elif num_rooms < 1 and not roof_only:
                 failed.append(plan.plan_id)
             elif not rooms_png_path.exists():
                 failed.append(plan.plan_id)
@@ -519,203 +530,110 @@ def run_segmentation_and_classification_for_document(
             )
             print(f"   💾 Salvat: {run_dir / 'basement_plan_id.json'} (beci = plan index {basement_plan_index})")
         
-        with Timer("STEP 5: Detections") as t:
-            run_detections_for_run(run_id)
-            # Notificarea UI pentru detections este trimisă direct din raster_processing.py
-            # după generarea 01_openings.png (în timpul scale detection - STEP 6)
+        with Timer("STEP 5: Detections (skipped — no Roboflow)") as t:
+            print("📌 [Pipeline] Roboflow / object_crops dezactivate (editor manual).", flush=True)
         set_progress(_PROGRESS_WEIGHTS["detections_end"])
-        pipeline_timer.add_step("Detections", t.end_time - t.start_time)
-        
-        # ✅ STEP 5.5: RasterScan Processing (generează room_scales.json)
-        # Acest pas apelează RasterScan API și generează pereții corecți + lista de camere + room_scales.json
-        # DUPĂ ce avem lista de camere, putem calcula scale detection (STEP 6)
-        raster_timings = []  # (nume_pas, durata) din fiecare plan, agregate la final
-        with Timer("STEP 5.5: RasterScan Processing") as t:
-            print(f"\n{'='*60}")
-            print(f"[RasterScan] Starting RasterScan processing for run: {run_id}")
-            print(f"{'='*60}\n")
-            
-            # Încărcăm planurile pentru acest run
-            plans = load_plan_infos(run_id, "scale")  # Folosim "scale" pentru că output_dir va fi în scale/
-            raster_scan_failed = False
-            on_raster_tick = get_raster_progress_fn(num_plans)
-            set_progress(_PROGRESS_WEIGHTS["raster_start"])
-            # Phase 1 = apeluri HTTP către RasterScan API — implicit SECVENȚIAL (1 plan odată),
-            # ca backend-ul raster să nu fie suprasolicitat. Override: HOLZBOT_RASTER_WORKERS=2|3|...
-            _raster_phase1 = os.environ.get("HOLZBOT_RASTER_WORKERS", "1")
-            max_workers_phase1 = int(_raster_phase1) if str(_raster_phase1).isdigit() else 1
-            max_workers_phase1 = max(1, max_workers_phase1)
-            # Phase 2 = brute force + walls_from_coords (fără Raster API) — poate rula în paralel
-            _phase2 = os.environ.get("HOLZBOT_PHASE2_WORKERS", "")
-            max_workers_phase2 = (
-                int(_phase2)
-                if str(_phase2).isdigit()
-                else (min(3, len(plans)) if plans else 1)
-            )
-            max_workers_phase2 = max(1, max_workers_phase2)
-            print(
-                f"[RasterScan] Workers: Phase1 (Raster API)={max_workers_phase1}, Phase2 (local)={max_workers_phase2}",
-                flush=True,
-            )
-            # Phase 1: Raster API (+ AI walls). Implicit un singur etaj la un moment dat.
-            def do_phase1(plan, plan_index: int):
-                def on_progress(sub_step: int):
-                    on_raster_tick()
-                _t0 = time.time()
-                print(f"[RasterScan] Phase 1 {plan.plan_id} → Raster API + 02_ai_walls_closed", flush=True)
-                run_cubicasa_phase1(
-                    plan_image=plan.plan_image,
-                    output_dir=plan.stage_work_dir,
-                    raster_timings=raster_timings,
-                    progress_callback=on_progress,
-                )
-                dur = time.time() - _t0
-                raster_timings.append((f"Raster P1 plan {plan.plan_id}", dur))
-                print(f"✅ [RasterScan] {plan.plan_id}: Phase 1 OK ({dur:.1f}s)", flush=True)
-            with ThreadPoolExecutor(max_workers=max_workers_phase1) as executor:
-                futures_phase1 = {executor.submit(do_phase1, plan, i): plan for i, plan in enumerate(plans)}
-                for future in as_completed(futures_phase1):
-                    plan = futures_phase1[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 1: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-                        raster_scan_failed = True
-            if not raster_scan_failed:
-                # Phase 2 în paralel (fără Raster API; workers separat de Phase 1)
-                def do_phase2(plan, plan_index: int):
-                    def on_progress(sub_step: int):
-                        on_raster_tick()
-                    _t0 = time.time()
-                    print(f"[RasterScan] Phase 2 {plan.plan_id} → brute force + room_scales.json", flush=True)
-                    run_cubicasa_phase2(
-                        output_dir=plan.stage_work_dir,
-                        raster_timings=raster_timings,
-                        progress_callback=on_progress,
-                    )
-                    dur = time.time() - _t0
-                    raster_timings.append((f"Raster P2 plan {plan.plan_id}", dur))
-                    print(f"✅ [RasterScan] {plan.plan_id}: room_scales.json generat cu succes ({dur:.1f}s)", flush=True)
-                with ThreadPoolExecutor(max_workers=max_workers_phase2) as executor:
-                    futures_phase2 = {executor.submit(do_phase2, plan, i): plan for i, plan in enumerate(plans)}
-                    for future in as_completed(futures_phase2):
-                        plan = futures_phase2[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            print(f"❌ [RasterScan] {plan.plan_id}: Eroare Phase 2: {e}", flush=True)
-                            import traceback
-                            traceback.print_exc()
-                            raster_scan_failed = True
-                # Trimite toate imaginile Cubicasa (pereți, camere, fill, openings, etc.) la admin Details
-                if not raster_scan_failed:
-                    for plan in plans:
-                        _notify_all_cubicasa_images_for_plan(plan)
-                    # Editor verificare: imagine de bază per plan (fără poligoane); UI desenează poligoanele din API
-                    base_paths: List[Path] = []
-                    def _save_review(plan):
-                        raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-                        return save_detections_review_image(raster_dir)
-                    with ThreadPoolExecutor(max_workers=max_workers_phase2) as executor:
-                        futures = [executor.submit(_save_review, plan) for plan in plans]
-                        for future in futures:
-                            path_base, _path_rooms, _path_doors = future.result()
-                            if path_base:
-                                base_paths.append(path_base)
-                    review_paths = base_paths
-                    if review_paths:
-                        # Etichete etaje (Keller, Erdgeschoss, 1. Obergeschoss, ...) pentru tab-uri în UI
-                        # IMPORTANT: scriem acest fișier și pentru roof_only_offer, ca RoofReviewEditor să aibă numele corecte.
-                        run_dir = get_run_dir(run_id)
-                        order_from_bottom = None
-                        basement_plan_index = None
-                        if (run_dir / "floor_order.json").exists():
-                            try:
-                                fo = json.loads((run_dir / "floor_order.json").read_text(encoding="utf-8"))
-                                order_from_bottom = fo.get("order_from_bottom")
-                            except Exception:
-                                pass
-                        if (run_dir / "basement_plan_id.json").exists():
-                            try:
-                                bp = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
-                                basement_plan_index = bp.get("basement_plan_index")
-                            except Exception:
-                                pass
-                        n_plans = len(plans)
-                        if order_from_bottom is not None and len(order_from_bottom) == n_plans:
-                            labels_from_bottom = []
-                            if basement_plan_index is not None:
-                                labels_from_bottom.append("Keller")
-                            labels_from_bottom.append("Erdgeschoss")
-                            for k in range(1, n_plans - (1 if basement_plan_index is not None else 0)):
-                                labels_from_bottom.append(f"{k}. Obergeschoss")
-                            plan_index_to_label = {order_from_bottom[pos]: labels_from_bottom[pos] for pos in range(n_plans)}
-                            floor_labels = [plan_index_to_label[i] for i in range(n_plans)]
-                            try:
-                                (job_root / "detections_review_floor_labels.json").write_text(
-                                    json.dumps(floor_labels, ensure_ascii=False), encoding="utf-8"
-                                )
-                                print(f"   💾 Etichete etaje pentru UI: {floor_labels}")
-                            except Exception as e:
-                                print(f"   ⚠️ Nu s-a putut scrie detections_review_floor_labels.json: {e}")
+        pipeline_timer.add_step("Detections (skipped)", t.end_time - t.start_time)
 
-                        if roof_only_offer:
-                            # Dachstuhl: fără editor camere în UI; continuăm pipeline-ul ca și cum detecțiile ar fi aprobate
-                            try:
-                                (job_root / DETECTIONS_REVIEW_FLAG).write_text("auto", encoding="utf-8")
-                                print("🔸 [Pipeline] roof_only_offer: skip detections review UI (auto-approved)", flush=True)
-                            except Exception as e:
-                                print(f"   ⚠️ Could not write {DETECTIONS_REVIEW_FLAG}: {e}")
-                            # Pentru RoofReviewEditor avem nevoie de imagini de bază în event-ul [roof].
-                            # Trimitem aceleași planuri de review direct pe stage-ul roof.
-                            notify_ui_batch("roof", review_paths)
-                        else:
-                            notify_ui_batch("detections_review", review_paths)
-                            # Oprește calculele până când utilizatorul confirmă detecțiile în UI (sau timeout)
-                            _wait_detections_review_approval(job_root)
-                            # Aplicăm modificările din editor (camere / uși-ferestre) și re-rulăm Cubicasa phase 2 pentru planurile editate
-                            for plan in plans:
-                                raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-                                if apply_detections_edited(raster_dir):
-                                    print(f"   🔄 Re-rulare Cubicasa phase 2 pentru {plan.plan_id} (cu camere/uși editate)...", flush=True)
-                                    try:
-                                        run_cubicasa_phase2(
-                                            plan.stage_work_dir,
-                                            raster_timings=raster_timings,
-                                            use_translation_only_raster=False,
-                                            reuse_cached_translation_only=True,
-                                            progress_callback=lambda *a: on_raster_tick(),
-                                        )
-                                    except Exception as e:
-                                        print(f"   ❌ Eroare la re-rularea phase 2 pentru {plan.plan_id}: {e}", flush=True)
-                                        import traceback
-                                        traceback.print_exc()
-                                        raster_scan_failed = True
-                    # Nu mai trimitem scale_flood, detections, exterior_doors în LiveFeed – doar editorul de verificare
-            
-            raster_ok, failed_plan_ids = _check_raster_complete(plans)
-            if failed_plan_ids:
-                print(f"⚠️ [RasterScan] Planuri fără camere calculate (room_scales.json + rooms.png): {failed_plan_ids}", flush=True)
-            raster_ok = raster_ok and not raster_scan_failed
-            
+        raster_timings: List[tuple] = []
+        with Timer("STEP 5.5: Manual blueprint + editor + walls_from_coords") as t:
             print(f"\n{'='*60}")
-            print(f"[RasterScan] RasterScan Processing Complete")
+            print(f"[ManualBlueprint] Run {run_id}: fără Raster API / brute force", flush=True)
             print(f"{'='*60}\n")
-        pipeline_timer.add_step("RasterScan Processing", t.end_time - t.start_time)
-        # Pași detaliați Raster (agregare pe toate planurile + timpi per plan)
-        if raster_timings:
-            by_name = defaultdict(float)
-            for name, dur in raster_timings:
-                by_name[name] += dur
-            # Sortează: mai întâi pașii agregați (fără "plan"), apoi per-plan (pentru diagnostic)
-            steps_agg = [(n, d) for n, d in sorted(by_name.items(), key=lambda x: -x[1]) if " plan " not in n]
-            steps_plan = [(n, d) for n, d in sorted(by_name.items(), key=lambda x: -x[1]) if " plan " in n]
-            for name, dur in steps_agg:
-                pipeline_timer.add_step(f"  └ {name}", dur)
-            for name, dur in steps_plan:
-                pipeline_timer.add_step(f"  └ {name}", dur)
+
+            plans = load_plan_infos(run_id, "scale")
+            raster_scan_failed = False
+            set_progress(_PROGRESS_WEIGHTS["raster_start"])
+
+            for plan in plans:
+                try:
+                    prepare_manual_blueprint_workspace(plan)
+                except Exception as e:
+                    print(f"❌ [ManualBlueprint] {plan.plan_id}: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    raster_scan_failed = True
+
+            ensure_roof_3d_floor_manifest(run_id, [p.plan_id for p in plans])
+
+            review_paths: List[Path] = []
+            for plan in plans:
+                raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                path_base, _, _ = save_detections_review_image(raster_dir)
+                if path_base:
+                    review_paths.append(path_base)
+
+            if not raster_scan_failed and review_paths:
+                run_dir = get_run_dir(run_id)
+                order_from_bottom = None
+                basement_plan_index = None
+                if (run_dir / "floor_order.json").exists():
+                    try:
+                        fo = json.loads((run_dir / "floor_order.json").read_text(encoding="utf-8"))
+                        order_from_bottom = fo.get("order_from_bottom")
+                    except Exception:
+                        pass
+                if (run_dir / "basement_plan_id.json").exists():
+                    try:
+                        bp = json.loads((run_dir / "basement_plan_id.json").read_text(encoding="utf-8"))
+                        basement_plan_index = bp.get("basement_plan_index")
+                    except Exception:
+                        pass
+                n_plans = len(plans)
+                if order_from_bottom is not None and len(order_from_bottom) == n_plans:
+                    labels_from_bottom = []
+                    if basement_plan_index is not None:
+                        labels_from_bottom.append("Keller")
+                    labels_from_bottom.append("Erdgeschoss")
+                    for k in range(1, n_plans - (1 if basement_plan_index is not None else 0)):
+                        labels_from_bottom.append(f"{k}. Obergeschoss")
+                    plan_index_to_label = {order_from_bottom[pos]: labels_from_bottom[pos] for pos in range(n_plans)}
+                    floor_labels = [plan_index_to_label[i] for i in range(n_plans)]
+                    try:
+                        (job_root / "detections_review_floor_labels.json").write_text(
+                            json.dumps(floor_labels, ensure_ascii=False), encoding="utf-8"
+                        )
+                        print(f"   💾 Etichete etaje pentru UI: {floor_labels}")
+                    except Exception as e:
+                        print(f"   ⚠️ Nu s-a putut scrie detections_review_floor_labels.json: {e}")
+
+                notify_ui_batch("detections_review", review_paths)
+                # UI unificat: la Confirm se scriu detections_review_approved.flag și roof_review_approved.flag.
+                _wait_detections_review_approval(job_root)
+
+                if roof_only_offer:
+                    print("🔸 [Pipeline] roof_only_offer: walls_from_coords sintetic + mpp default.", flush=True)
+                    for plan in plans:
+                        if not apply_roof_only_synthetic_walls_and_scale(plan):
+                            raster_scan_failed = True
+                else:
+                    for plan in plans:
+                        raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                        apply_detections_edited(raster_dir)
+                    max_w = max(1, min(3, len(plans)))
+
+                    def _walls_one(p):
+                        return run_walls_pipeline_after_manual_editor(p)
+
+                    with ThreadPoolExecutor(max_workers=max_w) as ex:
+                        results = list(ex.map(_walls_one, plans))
+                    if not all(results):
+                        raster_scan_failed = True
+
+            set_progress(_PROGRESS_WEIGHTS["raster_end"] - 1)
+
+            raster_ok, failed_plan_ids = _check_raster_complete(plans, job_root)
+            if failed_plan_ids:
+                print(
+                    f"⚠️ [ManualBlueprint] Planuri incomplete (room_scales.json + rooms.png): {failed_plan_ids}",
+                    flush=True,
+                )
+            raster_ok = raster_ok and not raster_scan_failed
+
+            print(f"\n{'='*60}")
+            print(f"[ManualBlueprint] Complete")
+            print(f"{'='*60}\n")
+        pipeline_timer.add_step("Manual blueprint + walls", t.end_time - t.start_time)
         
         if not raster_ok:
             print(f"\n⛔ [Pipeline] Camerele nu sunt calculate pentru toate planurile.", flush=True)
@@ -737,8 +655,7 @@ def run_segmentation_and_classification_for_document(
                 return time.time() - _start
             def _run_roof_timed():
                 _start = time.time()
-                run_roof_for_run(run_id, notify_ui_events=False)
-                notify_ui("roof")
+                run_roof_for_run(run_id, notify_ui_events=True)
                 return time.time() - _start
             with Timer("STEP 7 + 13: Count Objects || Roof (parallel)") as t_par:
                 with ThreadPoolExecutor(max_workers=2) as executor:
@@ -749,34 +666,6 @@ def run_segmentation_and_classification_for_document(
             pipeline_timer.add_step("Count Objects", t_count_objects)
             pipeline_timer.add_step("Roof", t_roof)
             set_progress(_PROGRESS_WEIGHTS["count_roof_end"])
-
-            # Pauză înainte de pricing doar dacă există date pentru editorul de acoperiș.
-            roof_rectangles_dir = OUTPUT_ROOT / run_id / "roof" / "roof_3d" / "rectangles"
-            has_roof_review_data = roof_rectangles_dir.exists()
-            if has_roof_review_data:
-                # Trigger instant UI switch GIF -> roof editor with concrete image files.
-                # Reuse detections review base images (same coordinate space for RoofReviewEditor).
-                try:
-                    roof_review_paths: List[Path] = []
-                    def _save_roof_review(plan):
-                        raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-                        return save_detections_review_image(raster_dir)
-                    with ThreadPoolExecutor(max_workers=max(1, min(3, len(plans)))) as executor:
-                        futures = [executor.submit(_save_roof_review, plan) for plan in plans]
-                        for future in futures:
-                            path_base, _path_rooms, _path_doors = future.result()
-                            if path_base:
-                                roof_review_paths.append(path_base)
-                    if roof_review_paths:
-                        notify_ui_batch("roof", roof_review_paths)
-                    else:
-                        notify_ui("roof")
-                except Exception as _roof_ui_err:
-                    print(f"   ⚠️ [roof] Could not emit roof review files: {_roof_ui_err}", flush=True)
-                    notify_ui("roof")
-                _wait_roof_review_approval(job_root)
-                # Reaplică editările userului pe roof_3d/rectangles și recalculează metricile pe noile dreptunghiuri.
-                run_roof_for_run(run_id)
 
             frontend_data = load_frontend_data_for_run(run_id, job_root)
 

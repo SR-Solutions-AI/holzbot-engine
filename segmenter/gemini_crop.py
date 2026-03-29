@@ -33,7 +33,7 @@ CRITICAL FOR FLOOR PLANS: For each floor plan (blueprint), the bounding box must
 
 FLOOR ORDER ON THIS PAGE: You must also return the stacking order of the FLOOR PLANS on this page from BOTTOM to TOP (building levels: basement lowest, then ground floor, then upper floors). The floor plans appear in your "items" array; some items are floor plans, some are side views. Ignore side views for ordering. Number the FLOOR plans in the order they appear in the array as 0, 1, 2, ... (first floor plan = 0, second = 1, etc.). Return "floor_order": an array of these indices in order from BOTTOM to TOP. Example: if you have 3 floor plans at array positions 0, 1, 2 and they are KG, EG, OG, then floor_order must be [0, 1, 2]. If the order on the page is EG, KG, OG (positions 0,1,2), then floor_order must be [1, 0, 2] (basement KG first, then EG, then OG).
 
-IGNORE: the general site/lot plan (if the whole page is one big site map, still extract any smaller floor-plan or elevation boxes inside it). Exclude 3D color renderings and project data tables in corners. Focus on technical drawings only.
+IGNORE: the general site/lot plan. Do NOT include Lageplan / Abstandsflächenplan / Situationsplan as floor plans. If the whole page is one big site map, still extract any smaller building floor-plan or elevation boxes inside it. Exclude 3D color renderings and project data tables in corners. Focus on technical drawings only.
 
 COORDINATE SYSTEM: Use bounding boxes in format [ymin, xmin, ymax, xmax] normalized on a scale of 0 to 1000. So the image width and height each map to 0–1000. Example: left half of image ≈ xmin 0, xmax 500; top 10% ≈ ymin 0, ymax 100.
 
@@ -51,6 +51,29 @@ Example format:
 (Here the first and third items are floor plans; KG is bottom so index 0 first, then EG index 2. Side view is not in floor_order.)
 
 Output ONLY the raw JSON object."""
+
+# Fallback prompt când primul apel clasifică totul ca side_view:
+# forțăm extragerea planurilor de etaj (blueprints) cu reguli mai stricte.
+PROMPT_BOXES_FLOOR_RETRY = """You previously failed to extract floor plans correctly.
+Now do a second strict pass and prioritize FLOOR PLANS (top-down blueprints).
+
+Task:
+1) Extract ALL FLOOR PLANS on the page (Grundriss KG/EG/OG, floor plans).
+2) Also extract side views/sections if present, but DO NOT replace floor plans with side views.
+
+Critical:
+- If the page contains floor plans, you MUST return at least one item labeled as floor.
+- A floor plan can have attached garage/terrace/balcony/covered entrance; keep them inside the box.
+- If uncertain between floor vs side_view, prefer floor when it is top-down architectural plan geometry.
+- NEVER classify site plans as floors: Lageplan, Abstandsflächenplan (Abstandsflaechenplan), Situationsplan must be side_view/non-floor.
+
+Return ONLY this JSON object:
+{
+  "items": [{"box_2d":[ymin,xmin,ymax,xmax], "label":"floor"|"side_view"}],
+  "floor_order": [indices of floor items from BOTTOM to TOP]
+}
+Coordinates must be normalized 0..1000 scale.
+No markdown, no explanation."""
 
 
 # Aliniere două măști de pereți: Gemini returnează procente (scara 0–1000), ca la box_2d
@@ -432,7 +455,17 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             raw_label = (item.get("label") or "").strip()
             label_lower = raw_label.lower()
             label_norm = label_lower.replace("\u00df", "ss")
-            if label_lower in ("floor", "side_view"):
+
+            # Excludere explicită pentru planuri de sit care NU trebuie să intre la etaje.
+            site_plan_markers = (
+                "lageplan", "site_plan", "site plan",
+                "situationsplan", "situation plan",
+                "abstandsflachenplan", "abstandsflaechenplan", "abstandsflächenplan",
+                "abstandsflache", "abstandsflaeche", "abstandsfläche",
+            )
+            if any(k in label_norm for k in site_plan_markers):
+                label = "side_view"
+            elif label_lower in ("floor", "side_view"):
                 label = label_lower
             elif any(k in label_norm for k in (
                 "grundriss", "etaj", "floor", "plan", " eg ", " eg.", " og ", " og.", ".og", "blueprint",
@@ -504,6 +537,38 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
                 valid = _validate_items(items)
                 if valid:
                     print(f"   [Gemini Crop] După reparare ChatGPT: {len(valid)} zone valide.")
+    # Dacă după validare nu avem niciun floor, facem încă un apel Gemini mai strict.
+    n_floor_now = sum(1 for v in valid if v.get("label") == "floor")
+    if n_floor_now == 0:
+        print("   [Gemini Crop] 0 floor detectate → fallback strict Gemini pentru extragere floor plans...")
+        try:
+            response_floor = client.generate_content(
+                [PROMPT_BOXES_FLOOR_RETRY, img],
+                generation_config={"temperature": 0.0, "max_output_tokens": 8192},
+                safety_settings=_GEMINI_SAFETY,
+            )
+            raw_floor = _get_response_text(response_floor)
+            if raw_floor:
+                raw_floor = raw_floor.strip()
+                items_floor, order_floor = _extract_json_object(raw_floor)
+                if not items_floor:
+                    items_floor = _extract_json_array(raw_floor)
+                    order_floor = []
+                if not items_floor:
+                    items_floor = _repair_json_with_chatgpt(raw_floor)
+                    order_floor = []
+                if items_floor:
+                    valid_floor = _validate_items(items_floor)
+                    floor_count_retry = sum(1 for v in valid_floor if v.get("label") == "floor")
+                    if floor_count_retry > 0:
+                        print(f"   [Gemini Crop] Fallback strict a recuperat {floor_count_retry} floor plan(s).")
+                        valid = valid_floor
+                        floor_order = order_floor
+                    else:
+                        print("   [Gemini Crop] Fallback strict încă fără floor plans.")
+        except Exception as e:
+            print(f"   [Gemini Crop] Fallback strict Gemini eroare: {e}")
+
     # Ordine etaje pe pagină (de la Gemini): adăugăm position_from_bottom la fiecare plan floor
     floor_indices = [i for i, v in enumerate(valid) if v.get("label") == "floor"]
     n_floor = len(floor_indices)

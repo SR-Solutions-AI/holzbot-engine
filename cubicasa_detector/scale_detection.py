@@ -1014,6 +1014,138 @@ def call_gemini_doors_batch(image_paths: list, api_key: str, max_retries: int = 
     return merged
 
 
+GEMINI_PROMPT_OPENING_WITH_CONTEXT = """
+You are an expert in architectural house floor plans.
+You receive TWO images:
+1) a crop around one candidate opening
+2) the full floor plan with only that opening marked
+
+Classify the opening into exactly one of:
+- "door" (single or double door symbols)
+- "window"
+- "stairs"
+- "garage_door"
+
+Critical rules:
+- Choose "stairs" ONLY if a staircase pattern is clearly visible (multiple step/tread lines in sequence).
+- If uncertain between "stairs" and "window", choose "window".
+- If the symbol looks like a window but is on a garage/carport wall or near a car drawing, choose "garage_door".
+- If uncertain between "door" and "window", use the symbol conventions from the crop first, then plan context.
+
+Return ONLY strict JSON:
+{"type":"door","confidence":0.83,"reason":"short reason"}
+No markdown, no extra text.
+"""
+
+
+def _normalize_opening_type(raw_type: str) -> str:
+    t = (raw_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if t in ("fenster", "geam"):
+        return "window"
+    if t in ("treppe",):
+        return "stairs"
+    if t in ("garagentor",):
+        return "garage_door"
+    if t not in ("door", "window", "stairs", "garage_door"):
+        return "door"
+    return t
+
+
+def call_gemini_openings_with_context(
+    opening_crop_paths: list[str | Path],
+    full_plan_image_path: str | Path,
+    bboxes_on_full_plan: list[tuple[int, int, int, int]],
+    api_key: str,
+    room_hints: list[str] | None = None,
+    max_retries: int = 1,
+) -> list[str] | None:
+    """
+    Clasifică fiecare opening folosind Gemini cu context în 2 imagini:
+      - crop deschidere
+      - plan complet cu bbox evidențiat
+    Returnează listă tipuri (door/window/stairs/garage_door) în aceeași ordine.
+    """
+    if not opening_crop_paths or not api_key:
+        return None
+    if len(opening_crop_paths) != len(bboxes_on_full_plan):
+        return None
+
+    plan_img = cv2.imread(str(full_plan_image_path), cv2.IMREAD_COLOR)
+    if plan_img is None:
+        return None
+
+    model_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+
+    out: list[str] = []
+    for i, crop_path in enumerate(opening_crop_paths):
+        crop_path = Path(crop_path)
+        if not crop_path.exists():
+            out.append("door")
+            continue
+        x1, y1, x2, y2 = bboxes_on_full_plan[i]
+        context_img = plan_img.copy()
+        cv2.rectangle(context_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+        ok, enc = cv2.imencode(".jpg", context_img)
+        if not ok:
+            out.append("door")
+            continue
+        context_b64 = base64.b64encode(enc.tobytes()).decode("utf-8")
+
+        with open(crop_path, "rb") as f:
+            crop_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        extra = ""
+        if room_hints and i < len(room_hints) and room_hints[i]:
+            extra = f"\nRoom context hint from pipeline: {room_hints[i]}"
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"inline_data": {"mime_type": "image/jpeg", "data": crop_b64}},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": context_b64}},
+                        {"text": GEMINI_PROMPT_OPENING_WITH_CONTEXT + extra},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 512,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        best_type = "door"
+        for attempt in range(max_retries + 1):
+            try:
+                resp = requests.post(model_url, json=payload, headers=headers, timeout=45)
+                if resp.status_code != 200:
+                    if attempt < max_retries:
+                        continue
+                    break
+                data = resp.json()
+                if "candidates" not in data or not data["candidates"]:
+                    if attempt < max_retries:
+                        continue
+                    break
+                text = data["candidates"][0]["content"]["parts"][0].get("text", "").strip()
+                start = text.find("{")
+                end = text.rfind("}") + 1
+                if start == -1 or end <= start:
+                    if attempt < max_retries:
+                        continue
+                    break
+                parsed = json.loads(text[start:end])
+                best_type = _normalize_opening_type(str(parsed.get("type", "door")))
+                break
+            except Exception:
+                if attempt < max_retries:
+                    continue
+        out.append(best_type)
+    return out
+
+
 GEMINI_PROMPT_WALL_ALIGNMENT = """
 You are given TWO images of floor plan wall masks (binary or grayscale: white/light = walls, black = background).
 

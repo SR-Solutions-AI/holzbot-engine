@@ -189,7 +189,12 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "2-fach verglast": data_map.get("window_2_fach_price", data_map.get("window_3fach_verglast_price", 320)),
                 "3-fach verglast": data_map.get("window_3_fach_price", data_map.get("window_3fach_verglast_price", 420)),
                 "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
-            }
+            },
+            "garage_door_prices": {
+                "Sektionaltor Standard": data_map.get("garage_door_standard_price", 360),
+                "Sektionaltor Premium": data_map.get("garage_door_premium_price", 470),
+                "Rolltor": data_map.get("garage_door_rolltor_price", 420),
+            },
         },
         "area": {
             "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0),
@@ -327,6 +332,8 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                     out.setdefault("sistem_constructiv", {}).setdefault("teren_factor", {})[label] = val
                 elif tag == "foundation_type":
                     out.setdefault("foundation", {}).setdefault("unit_price_per_m2", {})[label] = val
+                elif tag == "garage_door_type":
+                    out.setdefault("openings", {}).setdefault("garage_door_prices", {})[label] = val
     except Exception:
         pass
 

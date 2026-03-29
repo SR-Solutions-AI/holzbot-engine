@@ -45,11 +45,21 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
     windows_prices = coeffs.get("windows_price_per_m2", {})
     window_quality = (ferestre_usi.get("windowQuality", "3-fach verglast") if frontend_data else "3-fach verglast")
     window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
+    garage_prices = coeffs.get("garage_door_prices", {})
+    garage_type = (ferestre_usi.get("garageDoorType", "Sektionaltor Standard") if frontend_data else "Sektionaltor Standard")
+    has_garage = bool((frontend_data or {}).get("structuraCladirii", {}).get("hasGarage")) if frontend_data else False
+    garage_price_per_m2 = float(garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", door_ext_price)))
 
     for op in openings_list:
         obj_type = op.get("type", "unknown")
         width = float(op.get("width_m", 0.0))
-        if "door" in obj_type:
+        if obj_type == "garage_door":
+            explicit_h = op.get("height_m")
+            if explicit_h is not None and float(explicit_h) > 0:
+                height = float(explicit_h)
+            else:
+                height = 2.1
+        elif "door" in obj_type:
             height = door_height_m
         else:
             explicit_h = op.get("height_m")
@@ -59,7 +69,11 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
                 height = _infer_window_height_from_width(width, obj_type)
         area = width * height
 
-        if "door" in obj_type:
+        if obj_type == "garage_door":
+            is_exterior = True
+            price_per_m2 = garage_price_per_m2 if has_garage else door_ext_price
+            door_status = "exterior"
+        elif "door" in obj_type:
             is_exterior = op.get("status") == "exterior"
             price_per_m2 = door_ext_price if is_exterior else door_int_price
             door_status = op.get("status", "interior")
@@ -72,7 +86,9 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         total += cost
 
         material_label = "Interior" if not is_exterior and "door" in obj_type else ("Exterior" if "door" in obj_type else window_quality)
-        if "door" in obj_type:
+        if obj_type == "garage_door":
+            material_label = garage_type
+        elif "door" in obj_type:
             material_label = door_material_int if not is_exterior else door_material_ext
         items.append({
             "id": op.get("id"),

@@ -212,6 +212,8 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             roof_floor_labels.append(label)
     else:
         roof_floor_labels = ["Erdgeschoss", "1. Obergeschoss / Dachgeschoss", "2. Obergeschoss", "3. Obergeschoss"]
+    # Roof metrics/pricing use floor_0 as top floor; labels above are built bottom->top.
+    roof_floor_labels_topdown = list(reversed(roof_floor_labels))
 
     pdf_dir = out_root / "offer_pdf"
     pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +330,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         for rec in sorted(by_rectangle, key=lambda r: (int(r.get("floor_idx", 0)), int(r.get("rectangle_idx", 0)))):
             floor_idx = int(rec.get("floor_idx", 0))
             rect_idx = int(rec.get("rectangle_idx", 0))
-            floor_label = roof_floor_labels[floor_idx] if floor_idx < len(roof_floor_labels) else f"Etage {floor_idx}"
+            floor_label = roof_floor_labels_topdown[floor_idx] if floor_idx < len(roof_floor_labels_topdown) else f"Etage {floor_idx}"
             roof_name = "Dach" if rect_idx == 0 else f"Dach {rect_idx + 1}"
             story.append(Paragraph(f"<b>{floor_label} – {roof_name}</b>", heading_style))
             rows = [["Position", "Wert", "Einheit"]]
@@ -359,7 +361,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         for floor_key in sorted(by_floor_roof.keys(), key=lambda k: int(k) if str(k).isdigit() else 0):
             data = by_floor_roof[floor_key]
             idx = int(floor_key) if str(floor_key).isdigit() else 0
-            label = roof_floor_labels[idx] if idx < len(roof_floor_labels) else floor_labels_fallback.get(str(floor_key), f"Etaj {floor_key}")
+            label = roof_floor_labels_topdown[idx] if idx < len(roof_floor_labels_topdown) else floor_labels_fallback.get(str(floor_key), f"Etaj {floor_key}")
 
             story.append(Paragraph(f"<b>{label}</b>", heading_style))
 

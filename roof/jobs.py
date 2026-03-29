@@ -1003,13 +1003,39 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
     print(f"   [roof] Valorile trimise la workflow: floor_roof_types={floor_roof_types}, floor_roof_angles={floor_roof_angles}", flush=True)
     print(f"\n⚙️  [{STAGE_NAME}] Acoperiș pentru {total} plan{'uri' if total > 1 else ''} (inclusiv beci în 3D, preț fix 10 EUR)...")
 
-    # 1. Rulează holzbot-roof 3D workflow (toate etajele, inclusiv beci)
-    roof_3d_dir = _run_roof_3d_workflow(
-        run_id, plans_roof, floor_roof_types, floor_roof_angles,
-        basement_floor_index_override=basement_idx,
-    )
-    if roof_3d_dir:
+    roof_3d_dir = OUTPUT_ROOT / run_id / "roof" / "roof_3d"
+    skip_auto_rectangles = False
+    if roof_3d_edits.exists():
+        try:
+            edited_probe = json.loads(roof_3d_edits.read_text(encoding="utf-8"))
+            skip_auto_rectangles = isinstance(edited_probe, dict) and len(edited_probe) > 0
+        except Exception:
+            skip_auto_rectangles = False
+    if skip_auto_rectangles:
+        roof_3d_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            floor_plan_ids = {str(i): p.plan_id for i, p in enumerate(plans_roof)}
+            (roof_3d_dir / "roof_floor_plan_ids.json").write_text(
+                json.dumps(floor_plan_ids, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"       ⚠️ [roof] roof_floor_plan_ids.json: {e}", flush=True)
+        if basement_idx is not None:
+            try:
+                (roof_3d_dir / "basement_floor_index.json").write_text(
+                    json.dumps({"basement_floor_index": basement_idx}, indent=0), encoding="utf-8"
+                )
+            except Exception:
+                pass
         _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+        print("       [roof] Sărit clean_workflow (poligoane doar din editor).", flush=True)
+    else:
+        roof_3d_dir = _run_roof_3d_workflow(
+            run_id, plans_roof, floor_roof_types, floor_roof_angles,
+            basement_floor_index_override=basement_idx,
+        )
+        if roof_3d_dir:
+            _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
     if roof_3d_dir and notify_ui_events:
         try:
             from orchestrator import notify_ui
