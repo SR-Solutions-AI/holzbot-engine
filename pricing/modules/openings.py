@@ -13,7 +13,7 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
     """
     Ferestre: cost = suprafață (m²) × preț €/m² (Fensterart din formular).
     Uși normale: cost = preț €/Stück după tipul Innen/Außen selectat (o bucată = o deschidere în plan).
-    Garagentor: cost = preț €/Stück după tip, doar dacă „Garagentor gewünscht“ e bifat în formular.
+    Garagentor: dacă „Garagentor gewünscht“ e bifat, cost = preț €/Stück; altfel 0 €, dar rămâne în listă (aceeași număr ca în editor).
     """
     items = []
     total = 0.0
@@ -68,11 +68,15 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         area = width * height
 
         if ot == "garage_door":
-            if not wants_garage_door:
-                continue
-            cost = garage_price_piece
+            # Immer eine Zeile pro Öffnung (wie Editor): ohne Wunsch-Flag Kosten 0, damit
+            # breakdown/Angebot dieselbe Stückzahl wie measurements_plan.json haben.
+            if wants_garage_door:
+                cost = garage_price_piece
+                price_factor = garage_price_piece
+            else:
+                cost = 0.0
+                price_factor = 0.0
             unit_label = "€/Stück"
-            price_factor = garage_price_piece
             material_label = garage_type
             door_status = "exterior"
             is_exterior = True

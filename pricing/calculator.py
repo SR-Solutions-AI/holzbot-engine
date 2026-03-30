@@ -204,7 +204,39 @@ def calculate_pricing_for_plan(
                     {"category": "sewage", "name": "Canalizare beci", "area_m2": round(floor_area, 2), "total_cost": round(floor_area * sewage_base, 2)}
                 ]
             }
-        total_b = cost_walls_b["total_cost"] + cost_finishes_b["total_cost"] + cost_floors_b["total_cost"] + cost_utilities_b["total_cost"]
+        # Uși/ferestre beci: aceeași listă ca la celelate planuri + același „nivel ofertă” (Rohbau fără deschideri)
+        nivel_oferta_raw_b = (str(_fv("offer_scope") or sist_constr.get("nivelOferta") or mat_finisaj.get("nivelOferta") or "").strip())
+        _nivel_map_b = {
+            "Structură": "Rohbau/Tragwerk",
+            "Structură + ferestre": "Tragwerk + Fenster",
+            "Casă completă": "Schlüsselfertiges Haus",
+        }
+        nivel_oferta_b = _nivel_map_b.get(nivel_oferta_raw_b, nivel_oferta_raw_b)
+        if nivel_oferta_b == nivel_oferta_raw_b:
+            nl_b = nivel_oferta_b.lower()
+            if ("rohbau" in nl_b or "tragwerk" in nl_b) and "fenster" not in nl_b:
+                nivel_oferta_b = "Rohbau/Tragwerk"
+            elif "tragwerk" in nl_b and "fenster" in nl_b:
+                nivel_oferta_b = "Tragwerk + Fenster"
+            elif "schlüsselfertig" in nl_b or "schlusselfertig" in nl_b:
+                nivel_oferta_b = "Schlüsselfertiges Haus"
+        include_openings_b = nivel_oferta_b != "Rohbau/Tragwerk"
+        cost_openings_b = calculate_openings_details(
+            openings_coeffs, openings_data,
+            frontend_data=frontend_input,
+        )
+        if include_openings_b:
+            openings_breakdown_b = cost_openings_b
+        else:
+            openings_breakdown_b = {"total_cost": 0.0, "detailed_items": [], "items": []}
+
+        total_b = (
+            cost_walls_b["total_cost"]
+            + cost_finishes_b["total_cost"]
+            + cost_floors_b["total_cost"]
+            + cost_utilities_b["total_cost"]
+            + (cost_openings_b["total_cost"] if include_openings_b else 0.0)
+        )
         cost_basement_only = {
             "total_cost": round(total_b, 2),
             "detailed_items": (
@@ -214,7 +246,7 @@ def calculate_pricing_for_plan(
                 cost_utilities_b.get("detailed_items", [])
             )
         }
-        print(f"✅ [PRICING] Plan beci (dedicat): {cost_basement_only['total_cost']:,.0f} EUR (structură interior + exterior, finisaje doar interior)")
+        print(f"✅ [PRICING] Plan beci (dedicat): {cost_basement_only['total_cost']:,.0f} EUR (structură + finisaje interior + utilități + deschideri după nivel ofertă)")
         return {
             "total_cost_eur": round(total_b, 2),
             "total_area_m2": floor_area,
@@ -224,7 +256,7 @@ def calculate_pricing_for_plan(
                 "structure_walls": cost_walls_b,
                 "floors_ceilings": cost_floors_b,
                 "roof": {"total_cost": 0.0, "detailed_items": []},
-                "openings": {"total_cost": 0.0, "detailed_items": []},
+                "openings": openings_breakdown_b,
                 "finishes": cost_finishes_b,
                 "utilities": cost_utilities_b,
                 "stairs": {"total_cost": 0.0, "detailed_items": []},
