@@ -76,7 +76,7 @@ def prepare_manual_blueprint_workspace(plan: PlanInfo) -> None:
     (raster_dir / "doors_types.json").write_text("[]", encoding="utf-8")
 
 
-def run_walls_pipeline_after_manual_editor(plan: PlanInfo) -> bool:
+def run_walls_pipeline_after_manual_editor(plan: PlanInfo, roof_only_offer: bool = False) -> bool:
     """
     După apply_detections_edited: generează walls_from_coords + room_scales (Gemini pe camere).
     Folosește mască 1px inițială nulă + camere din response (mod manual).
@@ -108,6 +108,7 @@ def run_walls_pipeline_after_manual_editor(plan: PlanInfo) -> bool:
             gemini_key,
             initial_walls_mask_1px=initial,
             progress_callback=None,
+            notify_scale_walls_3d_ui=not roof_only_offer,
         )
         return True
     except Exception as e:
@@ -116,6 +117,118 @@ def run_walls_pipeline_after_manual_editor(plan: PlanInfo) -> bool:
 
         traceback.print_exc()
         return False
+
+
+def seed_roof_only_rooms_from_roof_polygons(run_id: str, plans: list["PlanInfo"]) -> dict[str, int]:
+    """
+    roof_only_offer: construiește 09_interior.png direct din poligoanele editorului de acoperiș
+    și injectează aceleași poligoane în raster/response.json (rooms), per plan.
+    Returnează numărul de poligoane aplicate pentru fiecare plan_id.
+    """
+    from config.settings import OUTPUT_ROOT
+
+    roof_3d = OUTPUT_ROOT / run_id / "roof" / "roof_3d"
+    roof_polys_path = roof_3d / "roof_rectangles_edited_walls.json"
+    if not roof_polys_path.exists():
+        roof_polys_path = roof_3d / "roof_rectangles_edited.json"
+    manifest_path = roof_3d / "roof_floor_plan_ids.json"
+
+    if not roof_polys_path.exists() or not manifest_path.exists():
+        return {}
+
+    try:
+        roof_data = json.loads(roof_polys_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    plan_by_id = {p.plan_id: p for p in plans}
+    polygons_by_plan: dict[str, list[list[list[int]]]] = {}
+
+    for floor_key, entries in (roof_data or {}).items():
+        if not isinstance(floor_key, str) or floor_key.startswith("_"):
+            continue
+        if not isinstance(entries, list):
+            continue
+        plan_id = manifest.get(str(floor_key))
+        if not plan_id or plan_id not in plan_by_id:
+            continue
+        polys = polygons_by_plan.setdefault(plan_id, [])
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pts = entry.get("points")
+            if not isinstance(pts, list):
+                continue
+            clean: list[list[int]] = []
+            for pxy in pts:
+                if not isinstance(pxy, (list, tuple)) or len(pxy) < 2:
+                    continue
+                try:
+                    x = int(round(float(pxy[0])))
+                    y = int(round(float(pxy[1])))
+                except Exception:
+                    continue
+                clean.append([x, y])
+            if len(clean) >= 3:
+                polys.append(clean)
+
+    applied_counts: dict[str, int] = {}
+    for plan in plans:
+        stage = Path(plan.stage_work_dir)
+        cubicasa = stage / "cubicasa_steps"
+        raster_dir = cubicasa / "raster"
+        output_dir = cubicasa / "raster_processing" / "walls_from_coords"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        orig_path = cubicasa / "00_original.png"
+        img = cv2.imread(str(orig_path), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        raw_polys = polygons_by_plan.get(plan.plan_id, [])
+        clipped_polys = []
+        for pts in raw_polys:
+            arr = np.array(
+                [
+                    [
+                        max(0, min(w - 1, int(p[0]))),
+                        max(0, min(h - 1, int(p[1]))),
+                    ]
+                    for p in pts
+                ],
+                dtype=np.int32,
+            )
+            if arr.shape[0] >= 3:
+                clipped_polys.append(arr)
+
+        interior = np.zeros((h, w, 3), dtype=np.uint8)
+        for poly in clipped_polys:
+            cv2.fillPoly(interior, [poly], (0, 165, 255))
+        cv2.imwrite(str(output_dir / "09_interior.png"), interior)
+
+        response_path = raster_dir / "response.json"
+        data = {"rooms": [], "doors": []}
+        if response_path.exists():
+            try:
+                current = json.loads(response_path.read_text(encoding="utf-8"))
+                data = current.get("data", current) if isinstance(current, dict) else data
+            except Exception:
+                pass
+        rooms = [
+            [{"x": int(p[0]), "y": int(p[1])} for p in poly.tolist()]
+            for poly in clipped_polys
+        ]
+        data["rooms"] = rooms
+        wrapped = {"data": data}
+        response_path.write_text(json.dumps(wrapped, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        applied_counts[plan.plan_id] = len(clipped_polys)
+
+    return applied_counts
 
 
 def apply_roof_only_synthetic_walls_and_scale(plan: PlanInfo, meters_per_pixel: float = 0.01) -> bool:

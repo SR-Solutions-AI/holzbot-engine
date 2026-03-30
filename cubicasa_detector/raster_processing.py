@@ -613,6 +613,7 @@ def generate_walls_from_room_coordinates(
     gemini_api_key: str = None,
     initial_walls_mask_1px: np.ndarray = None,
     progress_callback: Optional[Callable[[], None]] = None,
+    notify_scale_walls_3d_ui: bool = True,
 ) -> Dict[str, Any]:
     """
     Generează pereții pentru camere folosind coordonatele din overlay_on_original.png,
@@ -1921,8 +1922,8 @@ def generate_walls_from_room_coordinates(
             cv2.imwrite(str(output_path), render_3d)
             _log(f"      💾 Salvat: 04_walls_3d.png ({len(wall_pixels[0])} pixeli pereți extruși, înălțime {wall_height_px}px)")
             
-            # ✅ Notificare UI imediat după generarea fișierului 3D
-            if output_path.exists():
+            # ✅ Notificare UI imediat după generarea fișierului 3D (opțional: ascunsă la roof_only_offer)
+            if output_path.exists() and notify_scale_walls_3d_ui:
                 notify_ui("scale", output_path)
                 _log(f"      📢 Notificat UI pentru 04_walls_3d.png")
             rendering_success = True

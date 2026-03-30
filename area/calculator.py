@@ -9,7 +9,8 @@ from .config import (
     STANDARD_DOOR_HEIGHT_M,
     STANDARD_WINDOW_HEIGHT_M,
     WALL_THICKNESS_EXTERIOR_M,
-    WALL_THICKNESS_INTERIOR_M
+    WALL_THICKNESS_INTERIOR_M,
+    WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M,
 )
 
 STRUCTURE_OPENING_AREA_THRESHOLD_M2 = 2.50
@@ -78,13 +79,18 @@ def calculate_areas_for_plan(
             inaltime_pereti_mansarda = frontend_data.get("inaltimePeretiMansarda")
             if inaltime_pereti_mansarda and float(inaltime_pereti_mansarda) > 0:
                 wall_height_m = float(inaltime_pereti_mansarda)
+
+    _h_extra = float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
+    # Finisaj interior: strict înălțimea din formular. Structură int/ext + finisaj exterior: +18 cm.
+    h_finish_interior = wall_height_m
+    h_structure_and_ext_finish = wall_height_m + _h_extra
     
     # Arii brute pentru finisaje (folosim outline)
-    interior_walls_gross_m2_finish = interior_length_m_finish * wall_height_m
-    exterior_walls_gross_m2 = exterior_length_m * wall_height_m
+    interior_walls_gross_m2_finish = interior_length_m_finish * h_finish_interior
+    exterior_walls_gross_m2 = exterior_length_m * h_structure_and_ext_finish
     
-    # Arii brute pentru structură (folosim skeleton pentru interior)
-    interior_walls_gross_m2_structure = interior_length_m_structure * wall_height_m
+    # Arii brute pentru structură (skeleton interior; înălțime cu același adaos ca structura exterioară)
+    interior_walls_gross_m2_structure = interior_length_m_structure * h_structure_and_ext_finish
     
     # Calculăm footprint-ul doar informativ (nu îl mai folosim la ariile casei)
     # Folosim lungimea skeleton pentru structură interior
@@ -105,20 +111,12 @@ def calculate_areas_for_plan(
     # Determinăm înălțimile; pentru ferestre NU mai folosim bodentiefe din formular.
     # Prioritate: height_m din detecție/editor, fallback pe euristică din lățime.
     window_height_m_default = STANDARD_WINDOW_HEIGHT_M  # fallback final
-    door_height_m = STANDARD_DOOR_HEIGHT_M  # Default 2.05m
-    
-    if frontend_data:
-        ferestre_usi = frontend_data.get("ferestreUsi", {})
-        
-        # Înălțime uși bazată pe turhohe
-        turhohe = ferestre_usi.get("turhohe", "")
-        if turhohe == "Erhöht / Sondermaß (2,2+ m)":
-            door_height_m = 2.2  # 2.2m pentru uși înalte
     
     for opening in openings_all:
         obj_type = opening.get("type", "").lower()
         width_m = float(opening.get("width_m", 0.0))
-        if width_m <= 0: continue
+        if width_m <= 0:
+            continue
         
         if "window" in obj_type:
             explicit_h = opening.get("height_m")
@@ -131,8 +129,18 @@ def calculate_areas_for_plan(
             if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
                 area_windows_structure_m2 += area
             counts["windows"] += 1
+        elif obj_type == "garage_door":
+            explicit_h = opening.get("height_m")
+            gh = float(explicit_h) if explicit_h is not None and float(explicit_h) > 0 else 2.1
+            area = width_m * gh
+            area_doors_exterior_m2 += area
+            if area >= STRUCTURE_OPENING_AREA_THRESHOLD_M2:
+                area_doors_exterior_structure_m2 += area
+            counts["doors_exterior"] += 1
         elif "door" in obj_type:
-            area = width_m * door_height_m
+            explicit_h = opening.get("height_m")
+            dh = float(explicit_h) if explicit_h is not None and float(explicit_h) > 0 else STANDARD_DOOR_HEIGHT_M
+            area = width_m * dh
             status = opening.get("status", "").lower()
             if status == "exterior":
                 area_doors_exterior_m2 += area

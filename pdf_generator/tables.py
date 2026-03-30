@@ -386,11 +386,16 @@ def create_walls_structure_table(walls_bd: dict, plan_data: dict, enforcer: Germ
 # ----------------------------
 # Wall Measurements Table (for Admin & Calculation Method PDFs)
 # ----------------------------
-def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) -> Table:
+def create_wall_measurements_table(
+    plan_data: dict,
+    enforcer: GermanEnforcer,
+    inclusions: dict | None = None,
+) -> Table:
     """
     Creează un tabel detaliat cu toate măsurătorile pereților pentru un plan:
     - Lungimi pereți (interior/exterior) pentru finisaje și structură
     - Arii brute, deschideri și nete pentru fiecare tip
+    Dacă inclusions e setat și finishes e False (Rohbau): fără rânduri Innenausbau/Ausbau.
     """
     from .utils import format_length, format_area, safe_get
     
@@ -431,6 +436,8 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
     
     data = []
     
+    show_finish = True if inclusions is None else bool(inclusions.get("finishes"))
+
     # Structură pereți exteriori
     data.append([
         P(enforcer.get("Pereți Exteriori"), "Cell"),
@@ -440,17 +447,18 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P(format_area(ext_openings_structure), "Cell"),
         P(format_area(ext_area_structure), "CellBold"),
     ])
-    
-    # Finisaje pereți exteriori
-    data.append([
-        P(enforcer.get("Pereți Exteriori"), "Cell"),
-        P("Ausbau & Oberflächen", "Cell"),  # Direct translation for wall measurements context
-        P(format_length(ext_length), "Cell"),
-        P(format_area(ext_gross), "Cell"),
-        P(format_area(ext_openings_finish), "Cell"),
-        P(format_area(ext_area_finish), "CellBold"),
-    ])
-    
+
+    # Finisaje pereți exteriori — nu la Rohbau
+    if show_finish:
+        data.append([
+            P(enforcer.get("Pereți Exteriori"), "Cell"),
+            P("Ausbau & Oberflächen", "Cell"),  # Direct translation for wall measurements context
+            P(format_length(ext_length), "Cell"),
+            P(format_area(ext_gross), "Cell"),
+            P(format_area(ext_openings_finish), "Cell"),
+            P(format_area(ext_area_finish), "CellBold"),
+        ])
+
     # Structură pereți interiori (din skeleton)
     data.append([
         P(enforcer.get("Pereți Interiori"), "Cell"),
@@ -460,16 +468,17 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
         P(format_area(int_openings_structure), "Cell"),
         P(format_area(int_area_structure), "CellBold"),
     ])
-    
+
     # Finisaje pereți interiori (din outline)
-    data.append([
-        P(enforcer.get("Pereți Interiori"), "Cell"),
-        P(enforcer.get("Finisaje (Outline)"), "Cell"),
-        P(format_length(int_length_finish), "Cell"),
-        P(format_area(int_gross_finish), "Cell"),
-        P(format_area(int_openings_finish), "Cell"),
-        P(format_area(int_area_finish), "CellBold"),
-    ])
+    if show_finish:
+        data.append([
+            P(enforcer.get("Pereți Interiori"), "Cell"),
+            P(enforcer.get("Finisaje (Outline)"), "Cell"),
+            P(format_length(int_length_finish), "Cell"),
+            P(format_area(int_gross_finish), "Cell"),
+            P(format_area(int_openings_finish), "Cell"),
+            P(format_area(int_area_finish), "CellBold"),
+        ])
     
     # Removed calculation formulas as requested - no formulas should appear in admin PDF
     
@@ -485,7 +494,7 @@ def create_wall_measurements_table(plan_data: dict, enforcer: GermanEnforcer) ->
     return tbl
 
 
-def create_wall_measurements_table_english(plan_data: dict) -> Table:
+def create_wall_measurements_table_english(plan_data: dict, inclusions: dict | None = None) -> Table:
     """
     Same as create_wall_measurements_table but with English headers only (for Calculation Method PDF).
     """
@@ -512,6 +521,8 @@ def create_wall_measurements_table_english(plan_data: dict) -> Table:
     ext_area_finish = safe_get(exterior_data, "net_area_m2", default=0.0)
     ext_area_structure = safe_get(exterior_data, "net_area_m2_structure", default=ext_area_finish)
 
+    show_finish = True if inclusions is None else bool(inclusions.get("finishes"))
+
     head = [
         P("Wall Type", "CellBold"),
         P("Use", "CellBold"),
@@ -522,20 +533,13 @@ def create_wall_measurements_table_english(plan_data: dict) -> Table:
     ]
     data = []
     data.append([P("Exterior Walls", "Cell"), P("Structure", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings_structure), "Cell"), P(format_area(ext_area_structure), "CellBold")])
-    data.append([P("Exterior Walls", "Cell"), P("Finishes", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings_finish), "Cell"), P(format_area(ext_area_finish), "CellBold")])
+    if show_finish:
+        data.append([P("Exterior Walls", "Cell"), P("Finishes", "Cell"), P(format_length(ext_length), "Cell"), P(format_area(ext_gross), "Cell"), P(format_area(ext_openings_finish), "Cell"), P(format_area(ext_area_finish), "CellBold")])
     data.append([P("Interior Walls", "Cell"), P("Structure (skeleton)", "Cell"), P(format_length(int_length_structure), "Cell"), P(format_area(int_gross_structure), "Cell"), P(format_area(int_openings_structure), "Cell"), P(format_area(int_area_structure), "CellBold")])
-    data.append([P("Interior Walls", "Cell"), P("Finishes (outline)", "Cell"), P(format_length(int_length_finish), "Cell"), P(format_area(int_gross_finish), "Cell"), P(format_area(int_openings_finish), "Cell"), P(format_area(int_area_finish), "CellBold")])
+    if show_finish:
+        data.append([P("Interior Walls", "Cell"), P("Finishes (outline)", "Cell"), P(format_length(int_length_finish), "Cell"), P(format_area(int_gross_finish), "Cell"), P(format_area(int_openings_finish), "Cell"), P(format_area(int_area_finish), "CellBold")])
 
     tbl = Table([head] + data, colWidths=[40*mm, 38*mm, 32*mm, 32*mm, 32*mm, 32*mm])
-    tbl.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.3, colors.black),
-        ("BACKGROUND", (0,0), (-1,0), COLORS["bg_header"]),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("ALIGN", (2,1), (-1,-1), "RIGHT"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5),
-        ("RIGHTPADDING", (0,0), (-1,-1), 5),
-    ]))
-    return tbl
     tbl.setStyle(TableStyle([
         ("GRID", (0,0), (-1,-1), 0.3, colors.black),
         ("BACKGROUND", (0,0), (-1,0), COLORS["bg_header"]),

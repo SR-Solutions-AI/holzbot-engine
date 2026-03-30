@@ -65,8 +65,14 @@ def _build_coeffs_from_data_map(data_map: dict) -> dict:
             "horn_per_floor": data_map.get("horn_price_per_floor", 1500.0),
         },
         "openings": {
-            "door_interior_price_per_m2": data_map.get("door_interior_price", data_map.get("door_standard_2m_price", 0)),
-            "door_exterior_price_per_m2": data_map.get("door_exterior_price", data_map.get("door_standard_2m_price", 0)),
+            "door_interior_prices": {
+                "Standard": data_map.get("door_interior_standard", data_map.get("door_interior_price", 320)),
+                "Holz": data_map.get("door_interior_holz", 580),
+            },
+            "door_exterior_prices": {
+                "Standard": data_map.get("door_exterior_standard", data_map.get("door_exterior_price", 1450)),
+                "Holz": data_map.get("door_exterior_holz", 2200),
+            },
             "windows_price_per_m2": {
                 "2-fach verglast": data_map.get("window_2_fach_price", 320),
                 "3-fach verglast": data_map.get("window_3_fach_price", 420),
@@ -167,8 +173,8 @@ class TestPreisdatenbankMapping:
 
     def test_openings_and_utilities(self):
         data_map = {
-            "door_interior_price": 180.0,
-            "door_exterior_price": 220.0,
+            "door_interior_standard": 180.0,
+            "door_exterior_standard": 220.0,
             "window_2_fach_price": 320.0,
             "window_3_fach_price": 420.0,
             "window_3fach_passiv_price": 580.0,
@@ -178,8 +184,8 @@ class TestPreisdatenbankMapping:
             "ventilation_base_price": 56.0,
         }
         out = _build_coeffs_from_data_map(data_map)
-        assert out["openings"]["door_interior_price_per_m2"] == 180.0
-        assert out["openings"]["door_exterior_price_per_m2"] == 220.0
+        assert out["openings"]["door_interior_prices"]["Standard"] == 180.0
+        assert out["openings"]["door_exterior_prices"]["Standard"] == 220.0
         assert out["openings"]["windows_price_per_m2"]["2-fach verglast"] == 320.0
         assert out["openings"]["windows_price_per_m2"]["3-fach verglast"] == 420.0
         assert out["openings"]["windows_price_per_m2"]["3-fach verglast, Passiv"] == 580.0

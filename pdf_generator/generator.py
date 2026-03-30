@@ -32,6 +32,13 @@ from config.frontend_loader import load_frontend_data_for_run
 from pdf_generator.utils import resolve_plan_image_for_pdf
 from branding.db_loader import fetch_tenant_branding
 
+from .offer_scope import (
+    normalize_nivel_oferta as _normalize_nivel_oferta,
+    get_offer_inclusions as _get_offer_inclusions,
+    roof_items_for_pdf_table as _roof_items_for_pdf_table,
+    baukosten_position_label_de as _baukosten_position_label_de,
+)
+
 # ---------- 1. DICTIONAR STATIC EXTINS (CONSTANTE) ----------
 STATIC_TRANSLATIONS = {
     # Unități
@@ -641,63 +648,6 @@ def _clean_multiline_text(v: object, *, max_lines: int = 6, max_line_len: int = 
             clipped.append(ln)
     return "\n".join(clipped)
 
-# ---------- LOGIC ----------
-def _normalize_nivel_oferta(frontend_data: dict) -> str:
-    """Mapează valorile din formular/calc_mode la cheia exactă pentru PDF: Structură | Structură + ferestre | Casă completă."""
-    materiale = frontend_data.get("materialeFinisaj") or {}
-    raw = (materiale.get("nivelOferta") or "").strip()
-    calc_mode = (frontend_data.get("calc_mode") or "").strip().lower()
-    if not raw and calc_mode:
-        if calc_mode in ("full_house", "full_house_premium", "casa_completa", "casacompleta"):
-            return "Casă completă"
-        if calc_mode in ("structure_windows", "structura_ferestre", "structura+ferestre"):
-            return "Structură + ferestre"
-        if calc_mode in ("structure", "structura"):
-            return "Structură"
-    if not raw:
-        return "Casă completă"
-    lower = raw.lower()
-    if lower in ("casă completă", "casa completa", "full_house", "full_house_premium", "casa_completa", "casacompleta",
-                 "schlüsselfertig", "schlüsselfertiges haus", "turnkey house"):
-        return "Casă completă"
-    if lower in ("structură + ferestre", "structure_windows", "structura+ferestre", "structura + ferestre",
-                 "structure + windows", "rohbau + fenster", "tragwerk + fenster"):
-        return "Structură + ferestre"
-    if lower in ("structură", "structura", "structure", "structure only", "rohbau", "rohbau / konstruktion"):
-        return "Structură"
-    if raw in ("Casă completă", "Structură + ferestre", "Structură"):
-        return raw
-    return "Casă completă"
-
-
-def _get_offer_inclusions(nivel_oferta: str, frontend_data: dict | None = None) -> dict:
-    if frontend_data and bool(frontend_data.get("roof_only_offer")):
-        return {
-            "foundation": False,
-            "structure_walls": False,
-            "roof": True,
-            "floors_ceilings": False,
-            "openings": False,
-            "finishes": False,
-            "utilities": False,
-        }
-    INCLUSIONS = {
-        "Structură": {
-            "foundation": True, "structure_walls": True, "roof": True, "floors_ceilings": True,
-            "openings": False, "finishes": False, "utilities": False
-        },
-        "Structură + ferestre": {
-            "foundation": True, "structure_walls": True, "roof": True, "floors_ceilings": True,
-            "openings": True, "finishes": False, "utilities": False
-        },
-        "Casă completă": {
-            "foundation": True, "structure_walls": True, "roof": True, "floors_ceilings": True,
-            "openings": True, "finishes": True, "utilities": True
-        }
-    }
-    return INCLUSIONS.get(nivel_oferta, INCLUSIONS["Casă completă"])
-
-
 def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, enforcer) -> list[tuple[str, str, str, str]]:
     """
     Builds rows for the Admin PDF table: (Kategorie, Parameter, Im Formular gewählt, Preis Preisdatenbank).
@@ -751,6 +701,8 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
     perf = (frontend_data or {}).get("performantaEnergetica") or (frontend_data or {}).get("performanta") or {}
     fer = (frontend_data or {}).get("ferestreUsi") or {}
     dd = (frontend_data or {}).get("daemmungDachdeckung") or {}
+    _nivel_pd = _normalize_nivel_oferta(frontend_data or {})
+    _incl_pd = _get_offer_inclusions(_nivel_pd, frontend_data)
 
     # --- Fundație / Keller (einmal: Untergeschoss, einmal: Fundamenttyp) ---
     _acces_to_key = {
@@ -767,34 +719,36 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
     else:
         tip_beci_lookup = tip_beci
     f_coeff = pc.get("foundation", {}).get("unit_price_per_m2", {})
-    price_beci = f_coeff.get(tip_beci_lookup) or f_coeff.get(tip_beci) if tip_beci else None
-    rows.append((
-        "Fundament",
-        "Untergeschoss / Fundament",
-        _fv("structuraCladirii", "tipFundatieBeci", "sistemConstructiv", "tipFundatieBeci", "—"),
-        _price(price_beci) if price_beci is not None else "—"
-    ))
-    tip_fund = sist.get("tipFundatie") or struct.get("tipFundatie")
-    price_fund = f_coeff.get(tip_fund) if tip_fund else None
-    rows.append((
-        "Fundament",
-        "Fundamenttyp (Platte / Piloți / Sockel)",
-        _fv("sistemConstructiv", "tipFundatie", "structuraCladirii", "tipFundatie", "—"),
-        _price(price_fund) if price_fund is not None else "—"
-    ))
+    if _incl_pd.get("foundation"):
+        price_beci = f_coeff.get(tip_beci_lookup) or f_coeff.get(tip_beci) if tip_beci else None
+        rows.append((
+            "Fundament",
+            "Untergeschoss / Fundament",
+            _fv("structuraCladirii", "tipFundatieBeci", "sistemConstructiv", "tipFundatieBeci", "—"),
+            _price(price_beci) if price_beci is not None else "—"
+        ))
+        tip_fund = sist.get("tipFundatie") or struct.get("tipFundatie")
+        price_fund = f_coeff.get(tip_fund) if tip_fund else None
+        rows.append((
+            "Fundament",
+            "Fundamenttyp (Platte / Piloți / Sockel)",
+            _fv("sistemConstructiv", "tipFundatie", "structuraCladirii", "tipFundatie", "—"),
+            _price(price_fund) if price_fund is not None else "—"
+        ))
 
     # --- Sistem constructiv ---
-    tip_sistem = sist.get("tipSistem")
-    sys_prices = pc.get("system", {}).get("base_unit_prices", {}).get(tip_sistem, {}) if tip_sistem else {}
-    p_int = sys_prices.get("interior") if isinstance(sys_prices, dict) else None
-    p_ext = sys_prices.get("exterior") if isinstance(sys_prices, dict) else None
-    price_sys = f"{p_int:,.2f} / {p_ext:,.2f} €/m²" if p_int is not None and p_ext is not None else "—"
-    rows.append((
-        "Tragwerk",
-        "Bausystem (Innen / Außen €/m²)",
-        _fv("sistemConstructiv", "tipSistem", "—"),
-        price_sys
-    ))
+    if _incl_pd.get("structure_walls"):
+        tip_sistem = sist.get("tipSistem")
+        sys_prices = pc.get("system", {}).get("base_unit_prices", {}).get(tip_sistem, {}) if tip_sistem else {}
+        p_int = sys_prices.get("interior") if isinstance(sys_prices, dict) else None
+        p_ext = sys_prices.get("exterior") if isinstance(sys_prices, dict) else None
+        price_sys = f"{p_int:,.2f} / {p_ext:,.2f} €/m²" if p_int is not None and p_ext is not None else "—"
+        rows.append((
+            "Tragwerk",
+            "Bausystem (Innen / Außen €/m²)",
+            _fv("sistemConstructiv", "tipSistem", "—"),
+            price_sys
+        ))
 
     # --- Acces șantier, teren (mit Normalisierung wie im Rechner) ---
     acces_raw = sist.get("accesSantier") or (frontend_data or {}).get("logistica", {}).get("accesSantier")
@@ -818,289 +772,306 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
         _fv("sistemConstructiv", "teren", "—"),
         _price(fac_teren) if fac_teren is not None else "— (Faktor)"
     ))
-    util_price = sist_c.get("utilitati_anschluss_price")
-    has_util = sist.get("utilitati") or (frontend_data or {}).get("logistica", {}).get("utilitati")
-    rows.append((
-        "Anschlüsse",
-        "Versorgungsanschlüsse",
-        "Ja" if has_util else "Nein",
-        _price(util_price) if has_util and util_price is not None else "—"
-    ))
+    if _incl_pd.get("utilities"):
+        util_price = sist_c.get("utilitati_anschluss_price")
+        has_util = sist.get("utilitati") or (frontend_data or {}).get("logistica", {}).get("utilitati")
+        rows.append((
+            "Anschlüsse",
+            "Versorgungsanschlüsse",
+            "Ja" if has_util else "Nein",
+            _price(util_price) if has_util and util_price is not None else "—"
+        ))
 
     # --- Înălțime etaje ---
-    inaltime = struct.get("inaltimeEtaje")
-    area_coeff = pc.get("area", {}).get("floor_height_m", {})
-    h_m = area_coeff.get(inaltime) if inaltime else None
-    rows.append((
-        "Struktur",
-        "Geschosshöhe",
-        _fv("structuraCladirii", "inaltimeEtaje", "—"),
-        f"{float(h_m):.2f} m" if h_m is not None else "—"
-    ))
+    if _incl_pd.get("structure_walls"):
+        inaltime = struct.get("inaltimeEtaje")
+        area_coeff = pc.get("area", {}).get("floor_height_m", {})
+        h_m = area_coeff.get(inaltime) if inaltime else None
+        rows.append((
+            "Struktur",
+            "Raumhöhe",
+            _fv("structuraCladirii", "inaltimeEtaje", "—"),
+            f"{float(h_m):.2f} m" if h_m is not None else "—"
+        ))
+
+    roof_c = pc.get("roof", {})
+    _pd_roof_finish = _incl_pd.get("finishes") or _incl_pd.get("utilities")
 
     # --- Acoperiș: tip, material, dämmung, unterdach, dachstuhl ---
-    tip_acop = sist.get("tipAcoperis")
-    rows.append((
-        "Dach",
-        "Dachform",
-        _fv("sistemConstructiv", "tipAcoperis", "—"),
-        "—"
-    ))
-    material_acop = mat.get("materialAcoperis")
-    roof_c = pc.get("roof", {})
-    rows.append((
-        "Dach",
-        "Dachmaterial",
-        _fv("materialeFinisaj", "materialAcoperis", "—"),
-        _price(roof_c.get("tile_price_per_m2") or roof_c.get("metal_price_per_m2") or roof_c.get("membrane_price_per_m2"))
-    ))
-    daemm = dd.get("daemmung")
-    roof_daemm_map = {"Keine": roof_c.get("daemmung_keine_price"), "Zwischensparren": roof_c.get("daemmung_zwischensparren_price"), "Aufsparren": roof_c.get("daemmung_aufsparren_price")}
-    daemm_price = None
-    if daemm:
-        for k, p in roof_daemm_map.items():
-            if k in str(daemm) or (daemm and k.lower() in str(daemm).lower()):
-                daemm_price = p
-                break
-    if daemm_price is None:
-        daemm_price = roof_c.get("daemmung_zwischensparren_price") or roof_c.get("daemmung_aufsparren_price")
-    rows.append((
-        "Dach",
-        "Dämmung",
-        _fv("daemmungDachdeckung", "daemmung", "—"),
-        _price(daemm_price)
-    ))
-    unterdach = dd.get("unterdach")
-    u_price = None
-    if unterdach and "Schalung" in str(unterdach):
-        u_price = roof_c.get("unterdach_schalung_folie_price")
-    if u_price is None:
-        u_price = roof_c.get("unterdach_folie_price") or roof_c.get("unterdach_schalung_folie_price")
-    rows.append((
-        "Dach",
-        "Unterdach",
-        _fv("daemmungDachdeckung", "unterdach", "—"),
-        _price(u_price)
-    ))
-    dachstuhl = dd.get("dachstuhlTyp")
-    dachstuhl_key = None
-    if dachstuhl:
-        s = str(dachstuhl).lower()
-        if "sparren" in s:
+    if _incl_pd.get("roof"):
+        rows.append((
+            "Dach",
+            "Dachform",
+            _fv("sistemConstructiv", "tipAcoperis", "—"),
+            "—"
+        ))
+    if _incl_pd.get("finishes"):
+        rows.append((
+            "Dach",
+            "Dachmaterial",
+            _fv("materialeFinisaj", "materialAcoperis", "—"),
+            _price(roof_c.get("tile_price_per_m2") or roof_c.get("metal_price_per_m2") or roof_c.get("membrane_price_per_m2"))
+        ))
+    if _pd_roof_finish:
+        daemm = dd.get("daemmung")
+        roof_daemm_map = {"Keine": roof_c.get("daemmung_keine_price"), "Zwischensparren": roof_c.get("daemmung_zwischensparren_price"), "Aufsparren": roof_c.get("daemmung_aufsparren_price")}
+        daemm_price = None
+        if daemm:
+            for k, p in roof_daemm_map.items():
+                if k in str(daemm) or (daemm and k.lower() in str(daemm).lower()):
+                    daemm_price = p
+                    break
+        if daemm_price is None:
+            daemm_price = roof_c.get("daemmung_zwischensparren_price") or roof_c.get("daemmung_aufsparren_price")
+        rows.append((
+            "Dach",
+            "Dämmung",
+            _fv("daemmungDachdeckung", "daemmung", "—"),
+            _price(daemm_price)
+        ))
+        unterdach = dd.get("unterdach")
+        u_price = None
+        if unterdach and "Schalung" in str(unterdach):
+            u_price = roof_c.get("unterdach_schalung_folie_price")
+        if u_price is None:
+            u_price = roof_c.get("unterdach_folie_price") or roof_c.get("unterdach_schalung_folie_price")
+        rows.append((
+            "Dach",
+            "Unterdach",
+            _fv("daemmungDachdeckung", "unterdach", "—"),
+            _price(u_price)
+        ))
+        dachstuhl = dd.get("dachstuhlTyp")
+        dachstuhl_key = None
+        if dachstuhl:
+            s = str(dachstuhl).lower()
+            if "sparren" in s:
+                dachstuhl_key = "dachstuhl_sparrendach_price"
+            elif "pfetten" in s:
+                dachstuhl_key = "dachstuhl_pfettendach_price"
+            elif "kehl" in s:
+                dachstuhl_key = "dachstuhl_kehlbalkendach_price"
+            elif "sonder" in s:
+                dachstuhl_key = "dachstuhl_sonderkonstruktion_price"
+        if not dachstuhl_key:
             dachstuhl_key = "dachstuhl_sparrendach_price"
-        elif "pfetten" in s:
-            dachstuhl_key = "dachstuhl_pfettendach_price"
-        elif "kehl" in s:
-            dachstuhl_key = "dachstuhl_kehlbalkendach_price"
-        elif "sonder" in s:
-            dachstuhl_key = "dachstuhl_sonderkonstruktion_price"
-    if not dachstuhl_key:
-        dachstuhl_key = "dachstuhl_sparrendach_price"
-    rows.append((
-        "Dach",
-        "Dachstuhl-Typ",
-        _fv("daemmungDachdeckung", "dachstuhlTyp", "—"),
-        _price(roof_c.get(dachstuhl_key))
-    ))
-    df_im = dd.get("dachfensterImDach")
-    df_typ = (dd.get("dachfensterTyp") or "").strip()
-    df_price = None
-    if df_im and df_typ:
-        _df_map = {
-            "Standard": "dachfenster_stueck_standard",
-            "Velux": "dachfenster_stueck_velux",
-            "Roto": "dachfenster_stueck_roto",
-            "Fakro": "dachfenster_stueck_fakro",
-            "Sonstiges": "dachfenster_stueck_sonstiges",
-        }
-        _pk = _df_map.get(df_typ, "dachfenster_stueck_standard")
-        df_price = roof_c.get(_pk)
-    rows.append((
-        "Dach",
-        "Dachfenster (Stückpreis gewählte Ausführung)",
-        "Ja, " + df_typ if df_im and df_typ else ("Nein" if not df_im else "Ja"),
-        _price(df_price) if df_im and df_typ else "—",
-    ))
+        rows.append((
+            "Dach",
+            "Dachstuhl-Typ",
+            _fv("daemmungDachdeckung", "dachstuhlTyp", "—"),
+            _price(roof_c.get(dachstuhl_key))
+        ))
+    if _incl_pd.get("openings"):
+        df_im = dd.get("dachfensterImDach")
+        df_typ = (dd.get("dachfensterTyp") or "").strip()
+        df_price = None
+        if df_im and df_typ:
+            _df_map = {
+                "Standard": "dachfenster_stueck_standard",
+                "Velux": "dachfenster_stueck_velux",
+                "Roto": "dachfenster_stueck_roto",
+                "Fakro": "dachfenster_stueck_fakro",
+                "Sonstiges": "dachfenster_stueck_sonstiges",
+            }
+            _pk = _df_map.get(df_typ, "dachfenster_stueck_standard")
+            df_price = roof_c.get(_pk)
+        rows.append((
+            "Dach",
+            "Dachfenster (Stückpreis gewählte Ausführung)",
+            "Ja, " + df_typ if df_im and df_typ else ("Nein" if not df_im else "Ja"),
+            _price(df_price) if df_im and df_typ else "—",
+        ))
 
-    # --- Ferestre / uși ---
-    window_qual = fer.get("windowQuality") or mat.get("tamplarie")
-    win_prices = pc.get("openings", {}).get("windows_price_per_m2", {})
-    wp = win_prices.get(window_qual) if window_qual else None
-    rows.append((
-        "Fenster & Türen",
-        "Fensterart (€/m²)",
-        _fv("ferestreUsi", "windowQuality", "materialeFinisaj", "tamplarie", "—"),
-        _price(wp)
-    ))
-    door_int_prices = pc.get("openings", {}).get("door_interior_prices", {})
-    door_ext_prices = pc.get("openings", {}).get("door_exterior_prices", {})
-    door_material_int = (fer.get("doorMaterialInterior") or "Standard").strip()
-    door_material_ext = (fer.get("doorMaterialExterior") or "Standard").strip()
-    price_door_int = door_int_prices.get(door_material_int) if door_int_prices else None
-    price_door_ext = door_ext_prices.get(door_material_ext) if door_ext_prices else None
-    if price_door_int is None and price_door_ext is None:
-        door_int_fb = pc.get("openings", {}).get("door_interior_price_per_m2")
-        door_ext_fb = pc.get("openings", {}).get("door_exterior_price_per_m2")
-        price_door_int = price_door_int if price_door_int is not None else door_int_fb
-        price_door_ext = price_door_ext if price_door_ext is not None else door_ext_fb
-    rows.append((
-        "Fenster & Türen",
-        "Innentüren Material (€/m²)",
-        _fv("ferestreUsi", "doorMaterialInterior", "Standard"),
-        _price(price_door_int)
-    ))
-    rows.append((
-        "Fenster & Türen",
-        "Außentüren Material (€/m²)",
-        _fv("ferestreUsi", "doorMaterialExterior", "Standard"),
-        _price(price_door_ext)
-    ))
+    # --- Ferestre / uși (nur inkl. wenn Angebotsumfang Fenster & Türen) ---
+    if _incl_pd.get("openings"):
+        window_qual = fer.get("windowQuality") or mat.get("tamplarie")
+        win_prices = pc.get("openings", {}).get("windows_price_per_m2", {})
+        wp = win_prices.get(window_qual) if window_qual else None
+        rows.append((
+            "Fenster & Türen",
+            "Fensterart (€/m²)",
+            _fv("ferestreUsi", "windowQuality", "materialeFinisaj", "tamplarie", "—"),
+            _price(wp)
+        ))
+        door_int_prices = pc.get("openings", {}).get("door_interior_prices", {})
+        door_ext_prices = pc.get("openings", {}).get("door_exterior_prices", {})
+        door_material_int = (fer.get("doorMaterialInterior") or "Standard").strip()
+        door_material_ext = (fer.get("doorMaterialExterior") or "Standard").strip()
+        price_door_int = door_int_prices.get(door_material_int) if door_int_prices else None
+        price_door_ext = door_ext_prices.get(door_material_ext) if door_ext_prices else None
+        if price_door_int is None and door_int_prices:
+            price_door_int = door_int_prices.get("Standard")
+        if price_door_ext is None and door_ext_prices:
+            price_door_ext = door_ext_prices.get("Standard")
+        rows.append((
+            "Fenster & Türen",
+            "Innentüren Türtyp (€/Stück)",
+            _fv("ferestreUsi", "doorMaterialInterior", "Standard"),
+            _price(price_door_int)
+        ))
+        rows.append((
+            "Fenster & Türen",
+            "Außentüren Türtyp (€/Stück)",
+            _fv("ferestreUsi", "doorMaterialExterior", "Standard"),
+            _price(price_door_ext)
+        ))
 
     # --- Finisaje (exemple: parter interior/exterior) ---
-    fi_ground = mat.get("finisajInterior_ground") or mat.get("finisajInterior")
-    fa_ground = mat.get("fatada_ground") or mat.get("fatada")
-    fin_c = pc.get("finishes", {})
-    fi_key = _finish_to_key.get((fi_ground or "").strip(), (fi_ground or "").strip())
-    fa_key = _finish_to_key.get((fa_ground or "").strip(), (fa_ground or "").strip())
-    fi_price = fin_c.get("interior", {}).get(fi_key) if fi_key else None
-    fa_price = fin_c.get("exterior", {}).get(fa_key) if fa_key else None
-    rows.append((
-        "Oberflächen",
-        "Innen / Fassade (EG)",
-        f"{_fv('materialeFinisaj', 'finisajInterior_ground', 'finisajInterior', '—')} / {_fv('materialeFinisaj', 'fatada_ground', 'fatada', '—')}",
-        f"{_price(fi_price)} / {_price(fa_price)}"
-    ))
+    if _incl_pd.get("finishes"):
+        fi_ground = mat.get("finisajInterior_ground") or mat.get("finisajInterior")
+        fa_ground = mat.get("fatada_ground") or mat.get("fatada")
+        fin_c = pc.get("finishes", {})
+        fi_key = _finish_to_key.get((fi_ground or "").strip(), (fi_ground or "").strip())
+        fa_key = _finish_to_key.get((fa_ground or "").strip(), (fa_ground or "").strip())
+        fi_price = fin_c.get("interior", {}).get(fi_key) if fi_key else None
+        fa_price = fin_c.get("exterior", {}).get(fa_key) if fa_key else None
+        rows.append((
+            "Oberflächen",
+            "Innen / Fassade (EG)",
+            f"{_fv('materialeFinisaj', 'finisajInterior_ground', 'finisajInterior', '—')} / {_fv('materialeFinisaj', 'fatada_ground', 'fatada', '—')}",
+            f"{_price(fi_price)} / {_price(fa_price)}"
+        ))
 
     # --- Performanță energetică, încălzire, ventilație ---
-    nivel_energ = perf.get("nivelEnergetic")
-    tip_inc = perf.get("tipIncalzire") or (frontend_data or {}).get("incalzire", {}).get("tipIncalzire")
-    rows.append((
-        "Technik",
-        "Nivel energetic",
-        _fv("performantaEnergetica", "nivelEnergetic", "performanta", "nivelEnergetic", "—"),
-        "— (Modifikator)"
-    ))
-    rows.append((
-        "Technik",
-        "Heizsystem",
-        _fv("performantaEnergetica", "tipIncalzire", "performanta", "tipIncalzire", "incalzire", "tipIncalzire", "—"),
-        "— (Modifikator)"
-    ))
-    vent = perf.get("ventilatie")
-    vent_base = pc.get("utilities", {}).get("ventilation", {}).get("coefficient_ventilation_per_m2")
-    rows.append((
-        "Technik",
-        "Ventilation",
-        "Ja" if vent else "Nein",
-        _price(vent_base) if vent and vent_base is not None else "—"
-    ))
+    if _incl_pd.get("utilities"):
+        nivel_energ = perf.get("nivelEnergetic")
+        tip_inc = perf.get("tipIncalzire") or (frontend_data or {}).get("incalzire", {}).get("tipIncalzire")
+        rows.append((
+            "Technik",
+            "Nivel energetic",
+            _fv("performantaEnergetica", "nivelEnergetic", "performanta", "nivelEnergetic", "—"),
+            "— (Modifikator)"
+        ))
+        rows.append((
+            "Technik",
+            "Heizsystem",
+            _fv("performantaEnergetica", "tipIncalzire", "performanta", "tipIncalzire", "incalzire", "tipIncalzire", "—"),
+            "— (Modifikator)"
+        ))
+        vent = perf.get("ventilatie")
+        vent_base = pc.get("utilities", {}).get("ventilation", {}).get("coefficient_ventilation_per_m2")
+        rows.append((
+            "Technik",
+            "Ventilation",
+            "Ja" if vent else "Nein",
+            _price(vent_base) if vent and vent_base is not None else "—"
+        ))
 
     # --- Semineu / Kamin ---
-    tip_sem = perf.get("tipSemineu") or (frontend_data or {}).get("incalzire", {}).get("tipSemineu")
-    fp = pc.get("fireplace", {})
-    fire_prices = fp.get("prices", {})
-    sem_price = fire_prices.get(tip_sem) if tip_sem else None
-    rows.append((
-        "Kamin / Ofen",
-        "Kaminart",
-        _fv("performantaEnergetica", "tipSemineu", "performanta", "tipSemineu", "incalzire", "tipSemineu", "—"),
-        _price(sem_price)
-    ))
-    horn_pf = fp.get("horn_per_floor")
-    rows.append((
-        "Kaminabzug",
-        "Horn pro Geschoss (€)",
-        "—",
-        _price(horn_pf)
-    ))
+    if _incl_pd.get("utilities"):
+        tip_sem = perf.get("tipSemineu") or (frontend_data or {}).get("incalzire", {}).get("tipSemineu")
+        fp = pc.get("fireplace", {})
+        fire_prices = fp.get("prices", {})
+        sem_price = fire_prices.get(tip_sem) if tip_sem else None
+        rows.append((
+            "Kamin / Ofen",
+            "Kaminart",
+            _fv("performantaEnergetica", "tipSemineu", "performanta", "tipSemineu", "incalzire", "tipSemineu", "—"),
+            _price(sem_price)
+        ))
+        horn_pf = fp.get("horn_per_floor")
+        rows.append((
+            "Kaminabzug",
+            "Horn pro Geschoss (€)",
+            "—",
+            _price(horn_pf)
+        ))
 
     # --- Scări ---
-    stair_c = pc.get("stairs", {})
-    p_stair = stair_c.get("price_per_stair_unit")
-    p_rail = stair_c.get("railing_price_per_stair")
-    rows.append((
-        "Treppen",
-        "Preis pro Treppeneinheit / Geländer (€)",
-        "—",
-        f"{_price(p_stair)} / {_price(p_rail)}"
-    ))
+    if _incl_pd.get("floors_ceilings"):
+        stair_c = pc.get("stairs", {})
+        p_stair = stair_c.get("price_per_stair_unit")
+        p_rail = stair_c.get("railing_price_per_stair")
+        rows.append((
+            "Treppen",
+            "Preis pro Treppeneinheit / Geländer (€)",
+            "—",
+            f"{_price(p_stair)} / {_price(p_rail)}"
+        ))
 
     # --- Area (Geschossdecke / Decke) ---
-    area_c = pc.get("area", {})
-    floor_coeff = area_c.get("floor_coefficient_per_m2")
-    ceiling_coeff = area_c.get("ceiling_coefficient_per_m2")
-    rows.append(("Geschossdecken", "Boden (€/m²)", "—", _price(floor_coeff)))
-    rows.append(("Geschossdecken", "Decke (€/m²)", "—", _price(ceiling_coeff)))
+    if _incl_pd.get("floors_ceilings"):
+        area_c = pc.get("area", {})
+        floor_coeff = area_c.get("floor_coefficient_per_m2")
+        ceiling_coeff = area_c.get("ceiling_coefficient_per_m2")
+        rows.append(("Geschossdecken", "Boden (€/m²)", "—", _price(floor_coeff)))
+        rows.append(("Geschossdecken", "Decke (€/m²)", "—", _price(ceiling_coeff)))
 
     # --- Wandaufbau (pereți interiori/exteriori dacă folosit) ---
-    wb = pc.get("wandaufbau", {})
-    wand = (frontend_data or {}).get("wandaufbau", {})
-    wb_aussen = wb.get("aussen", {})
-    wb_innen = wb.get("innen", {})
-    for label, key_aussen, key_innen in [
-        ("EG Außen/Innen", "außenwande_ground", "innenwande_ground"),
-        ("Mansarda Außen/Innen", "außenwandeMansarda", "innenwandeMansarda"),
-        ("Keller Außen/Innen", "außenwandeBeci", "innenwandeBeci"),
-    ]:
-        sel_aussen = (wand.get(key_aussen) or "").strip()
-        sel_innen = (wand.get(key_innen) or "").strip()
-        p_aussen = wb_aussen.get(sel_aussen) if sel_aussen else None
-        p_innen = wb_innen.get(sel_innen) if sel_innen else None
-        form_val = f"{enforcer.get(sel_aussen) if sel_aussen else '—'} / {enforcer.get(sel_innen) if sel_innen else '—'}"
-        rows.append(("Wandaufbau", label, form_val, f"{_price(p_aussen)} / {_price(p_innen)}"))
+    if _incl_pd.get("structure_walls"):
+        wb = pc.get("wandaufbau", {})
+        wand = (frontend_data or {}).get("wandaufbau", {})
+        wb_aussen = wb.get("aussen", {})
+        wb_innen = wb.get("innen", {})
+        for label, key_aussen, key_innen in [
+            ("EG Außen/Innen", "außenwande_ground", "innenwande_ground"),
+            ("Mansarda Außen/Innen", "außenwandeMansarda", "innenwandeMansarda"),
+            ("Keller Außen/Innen", "außenwandeBeci", "innenwandeBeci"),
+        ]:
+            sel_aussen = (wand.get(key_aussen) or "").strip()
+            sel_innen = (wand.get(key_innen) or "").strip()
+            p_aussen = wb_aussen.get(sel_aussen) if sel_aussen else None
+            p_innen = wb_innen.get(sel_innen) if sel_innen else None
+            form_val = f"{enforcer.get(sel_aussen) if sel_aussen else '—'} / {enforcer.get(sel_innen) if sel_innen else '—'}"
+            rows.append(("Wandaufbau", label, form_val, f"{_price(p_aussen)} / {_price(p_innen)}"))
 
     # --- Boden/Decke/Belag (Bodenaufbau, Deckenaufbau, Bodenbelag) ---
-    bdb = pc.get("boden_decke_belag", {})
-    bdb_data = (frontend_data or {}).get("bodenDeckeBelag", {})
-    bodenaufbau_map = bdb.get("bodenaufbau", {})
-    deckenaufbau_map = bdb.get("deckenaufbau", {})
-    bodenbelag_map = bdb.get("bodenbelag", {})
-    for suffix, key_boden, key_decken, key_belag in [
-        ("EG", "bodenaufbau_ground", "deckenaufbau_ground", "bodenbelag_ground"),
-        ("OG1", "bodenaufbau_floor_1", "deckenaufbau_floor_1", "bodenbelag_floor_1"),
-        ("Mansarda", "bodenaufbauMansarda", "deckenaufbauMansarda", "bodenbelagMansarda"),
-        ("Keller", None, "deckenaufbauBeci", "bodenbelagBeci"),
-    ]:
-        opt_b = (bdb_data.get(key_boden) or "").strip() if key_boden else ""
-        opt_d = (bdb_data.get(key_decken) or "").strip() if key_decken else ""
-        opt_bl = (bdb_data.get(key_belag) or "").strip() if key_belag else ""
-        p_b = bodenaufbau_map.get(opt_b) if opt_b else None
-        p_d = deckenaufbau_map.get(opt_d) if opt_d else None
-        p_bl = bodenbelag_map.get(opt_bl) if opt_bl else None
-        form_val = f"{enforcer.get(opt_b) or '—'} / {enforcer.get(opt_d) or '—'} / {enforcer.get(opt_bl) or '—'}"
-        rows.append(("Boden/Decke/Belag", f"Bodenaufbau/Decke/Belag ({suffix})", form_val, f"{_price(p_b)} / {_price(p_d)} / {_price(p_bl)}"))
+    if _incl_pd.get("finishes"):
+        bdb = pc.get("boden_decke_belag", {})
+        bdb_data = (frontend_data or {}).get("bodenDeckeBelag", {})
+        bodenaufbau_map = bdb.get("bodenaufbau", {})
+        deckenaufbau_map = bdb.get("deckenaufbau", {})
+        bodenbelag_map = bdb.get("bodenbelag", {})
+        for suffix, key_boden, key_decken, key_belag in [
+            ("EG", "bodenaufbau_ground", "deckenaufbau_ground", "bodenbelag_ground"),
+            ("OG1", "bodenaufbau_floor_1", "deckenaufbau_floor_1", "bodenbelag_floor_1"),
+            ("Mansarda", "bodenaufbauMansarda", "deckenaufbauMansarda", "bodenbelagMansarda"),
+            ("Keller", None, "deckenaufbauBeci", "bodenbelagBeci"),
+        ]:
+            opt_b = (bdb_data.get(key_boden) or "").strip() if key_boden else ""
+            opt_d = (bdb_data.get(key_decken) or "").strip() if key_decken else ""
+            opt_bl = (bdb_data.get(key_belag) or "").strip() if key_belag else ""
+            p_b = bodenaufbau_map.get(opt_b) if opt_b else None
+            p_d = deckenaufbau_map.get(opt_d) if opt_d else None
+            p_bl = bodenbelag_map.get(opt_bl) if opt_bl else None
+            form_val = f"{enforcer.get(opt_b) or '—'} / {enforcer.get(opt_d) or '—'} / {enforcer.get(opt_bl) or '—'}"
+            rows.append(("Boden/Decke/Belag", f"Bodenaufbau/Decke/Belag ({suffix})", form_val, f"{_price(p_b)} / {_price(p_d)} / {_price(p_bl)}"))
 
     # --- Utilities: Strom, Heizung, Kanalisation (Basispreise + Modifikatoren) ---
-    util = pc.get("utilities", {})
-    elec = util.get("electricity", {})
-    heat = util.get("heating", {})
-    rows.append(("Technik", "Strom Basis (€/m²)", "—", _price(elec.get("coefficient_electricity_per_m2"))))
-    for niv in ["Standard", "KfW 55", "KfW 40", "KfW 40+"]:
-        mod = elec.get("energy_performance_modifiers", {}).get(niv)
-        rows.append(("Technik", f"Strom Modifikator ({niv})", "—", _price(mod) if mod is not None else "—"))
-    rows.append(("Technik", "Heizung Basis (€/m²)", "—", _price(heat.get("coefficient_heating_per_m2"))))
-    for ht in ["Gas", "Wärmepumpe", "Elektrisch", "Gaz"]:
-        tc = heat.get("type_coefficients", {}).get(ht)
-        if tc is not None:
-            rows.append(("Technik", f"Heizung Typ ({ht})", "—", _price(tc) if isinstance(tc, (int, float)) else f"{float(tc):.3f} (Faktor)"))
-    rows.append(("Technik", "Kanalisation (€/m²)", "—", _price(util.get("sewage", {}).get("coefficient_sewage_per_m2"))))
+    if _incl_pd.get("utilities"):
+        util = pc.get("utilities", {})
+        elec = util.get("electricity", {})
+        heat = util.get("heating", {})
+        rows.append(("Technik", "Strom Basis (€/m²)", "—", _price(elec.get("coefficient_electricity_per_m2"))))
+        for niv in ["Standard", "KfW 55", "KfW 40", "KfW 40+"]:
+            mod = elec.get("energy_performance_modifiers", {}).get(niv)
+            rows.append(("Technik", f"Strom Modifikator ({niv})", "—", _price(mod) if mod is not None else "—"))
+        rows.append(("Technik", "Heizung Basis (€/m²)", "—", _price(heat.get("coefficient_heating_per_m2"))))
+        for ht in ["Gas", "Wärmepumpe", "Elektrisch", "Gaz"]:
+            tc = heat.get("type_coefficients", {}).get(ht)
+            if tc is not None:
+                rows.append(("Technik", f"Heizung Typ ({ht})", "—", _price(tc) if isinstance(tc, (int, float)) else f"{float(tc):.3f} (Faktor)"))
+        rows.append(("Technik", "Kanalisation (€/m²)", "—", _price(util.get("sewage", {}).get("coefficient_sewage_per_m2"))))
 
-    # --- Dach: Sichtdachstuhl, Panta (Dachmaterial already above, once) ---
-    rows.append(("Dach", "Sichtdachstuhl Zuschlag (€/m²)", _fv("daemmungDachdeckung", "sichtdachstuhl", "—"), _price(roof_c.get("sichtdachstuhl_zuschlag_price"))))
-    rows.append(("Dach", "Dachneigung Zuschlag (€/Grad)", "—", _price(roof_c.get("panta_acoperis_zuschlag_per_grad"))))
+    # --- Dach: Sichtdachstuhl (finisaj), pantă (structură acoperiș) ---
+    if _pd_roof_finish:
+        rows.append(("Dach", "Sichtdachstuhl Zuschlag (€/m²)", _fv("daemmungDachdeckung", "sichtdachstuhl", "—"), _price(roof_c.get("sichtdachstuhl_zuschlag_price"))))
+    if _incl_pd.get("roof"):
+        rows.append(("Dach", "Dachneigung Zuschlag (€/Grad)", "—", _price(roof_c.get("panta_acoperis_zuschlag_per_grad"))))
 
-    # --- Wintergärten & Balkone ---
-    wg_balk = (frontend_data or {}).get("wintergaertenBalkone", {})
-    wb_coeff = pc.get("wintergaerten_balkone", {})
-    wg_typ = (wg_balk.get("wintergartenTyp") or "").strip()
-    wg_price = (wb_coeff.get("wintergarten") or {}).get(wg_typ) if wg_typ else None
-    rows.append(("Wintergarten", "Typ", _fv("wintergaertenBalkone", "wintergartenTyp", "—"), _price(wg_price)))
-    for btyp, blabel in [("Holzgeländer", "Holz"), ("Stahlgeländer", "Stahl"), ("Glasgeländer", "Glas")]:
-        p = (wb_coeff.get("balkon") or {}).get(btyp)
-        rows.append(("Balkon", f"Balkon {blabel} (€)", "—", _price(p)))
-    balk_typ = (wg_balk.get("balkonTyp") or "").strip()
-    balk_price = (wb_coeff.get("balkon") or {}).get(balk_typ) if balk_typ else None
-    rows.append(("Balkon", "Gewählt", _fv("wintergaertenBalkone", "balkonTyp", "—"), _price(balk_price)))
+    # --- Wintergärten & Balkone (extras tip finisaj / amenajări) ---
+    if _incl_pd.get("finishes"):
+        wg_balk = (frontend_data or {}).get("wintergaertenBalkone", {})
+        wb_coeff = pc.get("wintergaerten_balkone", {})
+        wg_typ = (wg_balk.get("wintergartenTyp") or "").strip()
+        wg_price = (wb_coeff.get("wintergarten") or {}).get(wg_typ) if wg_typ else None
+        rows.append(("Wintergarten", "Typ", _fv("wintergaertenBalkone", "wintergartenTyp", "—"), _price(wg_price)))
+        for btyp, blabel in [("Holzgeländer", "Holz"), ("Stahlgeländer", "Stahl"), ("Glasgeländer", "Glas")]:
+            p = (wb_coeff.get("balkon") or {}).get(btyp)
+            rows.append(("Balkon", f"Balkon {blabel} (€)", "—", _price(p)))
+        balk_typ = (wg_balk.get("balkonTyp") or "").strip()
+        balk_price = (wb_coeff.get("balkon") or {}).get(balk_typ) if balk_typ else None
+        rows.append(("Balkon", "Gewählt", _fv("wintergaertenBalkone", "balkonTyp", "—"), _price(balk_price)))
 
     # --- Angebotsumfang (nur Anzeige, kein Preis) ---
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
@@ -1654,12 +1625,18 @@ def _table_standard(story, styles, title: str, data_dict: dict, enforcer: German
     story.append(KeepTogether([title_para, tbl, Spacer(1, 4*mm)]))
     story.append(Spacer(1, 2*mm))
 
-def _table_roof_quantities(story, styles, pricing_data: dict, enforcer: GermanEnforcer):
+def _table_roof_quantities(
+    story,
+    styles,
+    pricing_data: dict,
+    enforcer: GermanEnforcer,
+    inclusions: dict | None = None,
+):
     roof = pricing_data.get("breakdown", {}).get("roof", {})
     items = roof.get("items", []) or roof.get("detailed_items", [])
-    display_items = [it for it in items if "extra_walls" not in str(it.get("category", ""))]
-    
-    if not display_items: 
+    display_items = _roof_items_for_pdf_table(items, inclusions)
+
+    if not display_items:
         return
     
     # ✅ COLECTEAZĂ
@@ -2177,6 +2154,8 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     sistem_constructiv = frontend_data.get("sistemConstructiv", {})
     materiale_finisaj = frontend_data.get("materialeFinisaj", {})
     performanta = frontend_data.get("performanta", {})
+    nivel_oferta_ov = _normalize_nivel_oferta(frontend_data)
+    inclusions_ov = _get_offer_inclusions(nivel_oferta_ov, frontend_data)
     
     tip_sistem = sistem_constructiv.get("tipSistem", "HOLZRAHMEN")
     acces_santier = sistem_constructiv.get("accesSantier") or frontend_data.get("logistica", {}).get("accesSantier", "—")
@@ -2202,8 +2181,8 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     nivel_finisare = _normalize_nivel_oferta(frontend_data)
     
     # Finisaje per etaj: prioritate date din formular (alese de user), apoi fallback din plans_data (calcul)
-    finishes_per_floor = _finishes_per_floor_from_form(materiale_finisaj)
-    if plans_data:
+    finishes_per_floor = _finishes_per_floor_from_form(materiale_finisaj) if inclusions_ov.get("finishes") else {}
+    if plans_data and inclusions_ov.get("finishes"):
         import re
         for entry in plans_data:
             pricing = entry.get("pricing", {})
@@ -2274,7 +2253,7 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
         print(f"⚠️ [PDF] total_house_area is 0 - nu se afișează suprafața casei")
     
     # Finisaje interioare și exterioare (în loc de pereți)
-    if finishes_per_floor:
+    if inclusions_ov.get("finishes") and finishes_per_floor:
         # Sortăm etajele: Keller (Beci), Erdgeschoss, Obergeschoss 1, 2, etc., Mansardă, Dachgeschoss
         floor_order = ["Keller", "Erdgeschoss"]
         for i in range(1, 10):
@@ -2295,8 +2274,6 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     
     # Suprafețe acoperiș: afișăm atât cu Überstand cât și Dämmzone (fără Überstand) dacă avem roof_pricing.json.
     run_id = str(frontend_data.get("run_id") or "").strip()
-    nivel_oferta_local = _normalize_nivel_oferta(frontend_data)
-    inclusions = _get_offer_inclusions(nivel_oferta_local, frontend_data)
     roof_pricing_path = None
     roof_pricing = {}
     if run_id:
@@ -2313,7 +2290,7 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                 roof_pricing = {}
     roof_area_with_overhang = None
     roof_area_without_overhang = None
-    if roof_pricing_path and roof_pricing_path.exists() and inclusions.get("roof", False):
+    if roof_pricing_path and roof_pricing_path.exists() and inclusions_ov.get("roof", False):
         try:
             rm = (roof_pricing or {}).get("roof_measurements") or {}
             roof_area_with_overhang = rm.get("roof_area_with_overhang_m2")
@@ -2322,13 +2299,14 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
             roof_area_with_overhang = None
             roof_area_without_overhang = None
 
-    if roof_area_with_overhang is not None and float(roof_area_with_overhang) > 0:
-        overview_items.append(f"<b>Dachfläche (mit Überstand):</b> <b>{float(roof_area_with_overhang):.1f} m²</b>")
-    elif total_roof_area > 0:
-        overview_items.append(f"<b>{enforcer.get('Dachfläche')}:</b> <b>{total_roof_area:.1f} m²</b>")
+    if inclusions_ov.get("roof", False):
+        if roof_area_with_overhang is not None and float(roof_area_with_overhang) > 0:
+            overview_items.append(f"<b>Dachfläche (mit Überstand):</b> <b>{float(roof_area_with_overhang):.1f} m²</b>")
+        elif total_roof_area > 0:
+            overview_items.append(f"<b>{enforcer.get('Dachfläche')}:</b> <b>{total_roof_area:.1f} m²</b>")
 
-    if roof_area_without_overhang is not None and float(roof_area_without_overhang) > 0:
-        overview_items.append(f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
+        if roof_area_without_overhang is not None and float(roof_area_without_overhang) > 0:
+            overview_items.append(f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
     
     # Număr de etaje (Stockwerke în loc de Ebenen)
     overview_items.append(f"<b>{enforcer.get('Anzahl der Stockwerke')}:</b> <b>{num_floors}</b>")
@@ -2340,46 +2318,46 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     if tip_fundatie_de != "—":
         overview_items.append(f"<b>{enforcer.get('Tip fundație')}:</b> <b>{tip_fundatie_de}</b>")
     overview_items.append(f"<b>{enforcer.get('Dachtyp')}:</b> <b>{tip_acoperis_de}</b>")
-    if material_acoperis_de != "—":
+    # Învelitoare / material acoperiș: relevant pentru oferte cu finisaje sau pachet acoperiș „complet”; nu la Rohbau fără finisaje
+    if inclusions_ov.get("finishes", False) and material_acoperis_de != "—":
         overview_items.append(f"<b>{enforcer.get('Dachmaterial')}:</b> <b>{material_acoperis_de}</b>")
     
-    # Dämmung & Dachdeckung (din formular)
+    # Dämmung & Dachdeckung — doar când oferta include finisaje sau utilități (nu Rohbau/Tragwerk pur)
     dd = frontend_data.get("daemmungDachdeckung") or {}
     daemmung = dd.get("daemmung")
     dachdeckung = dd.get("dachdeckung")
     unterdach = dd.get("unterdach")
     dachstuhl_typ = dd.get("dachstuhlTyp")
-    if daemmung:
-        overview_items.append(f"<b>{enforcer.get('Dämmung')}:</b> <b>{enforcer.get(daemmung) or daemmung}</b>")
-    if dachdeckung:
-        overview_items.append(f"<b>{enforcer.get('Dachdeckung')}:</b> <b>{enforcer.get(dachdeckung) or dachdeckung}</b>")
-    if unterdach:
-        overview_items.append(f"<b>{enforcer.get('Unterdach')}:</b> <b>{enforcer.get(unterdach) or unterdach}</b>")
-    if dachstuhl_typ:
-        overview_items.append(f"<b>{enforcer.get('Dachstuhl-Typ')}:</b> <b>{enforcer.get(dachstuhl_typ) or dachstuhl_typ}</b>")
+    if inclusions_ov.get("finishes") or inclusions_ov.get("utilities"):
+        if daemmung:
+            overview_items.append(f"<b>{enforcer.get('Dämmung')}:</b> <b>{enforcer.get(daemmung) or daemmung}</b>")
+        if dachdeckung:
+            overview_items.append(f"<b>{enforcer.get('Dachdeckung')}:</b> <b>{enforcer.get(dachdeckung) or dachdeckung}</b>")
+        if unterdach:
+            overview_items.append(f"<b>{enforcer.get('Unterdach')}:</b> <b>{enforcer.get(unterdach) or unterdach}</b>")
+        if dachstuhl_typ:
+            overview_items.append(f"<b>{enforcer.get('Dachstuhl-Typ')}:</b> <b>{enforcer.get(dachstuhl_typ) or dachstuhl_typ}</b>")
     
-    # Semineu și horn - afișăm ce s-a selectat din formular
+    # Semineu, Heizung, Energie, Fertigstellungsgrad — doar pentru oferte care includ utilități / finisaje
     print(f"🔍 [PDF] tip_semineu value: '{tip_semineu}', type: {type(tip_semineu)}")
     tip_semineu_str = str(tip_semineu).strip() if tip_semineu else ""
-    # Afișăm semineul dacă există o valoare (chiar dacă este "Kein Kamin")
-    if tip_semineu_str:
-        semineu_de = enforcer.get(tip_semineu_str) if tip_semineu_str else tip_semineu_str
-        overview_items.append(f"<b>{enforcer.get('Kamin')}:</b> <b>{semineu_de}</b>")
-        # Horn este calculat per etaj, deci îl menționăm doar dacă există semineu (nu este "Kein Kamin")
-        if tip_semineu_str != "Kein Kamin" and tip_semineu_str.lower() != "kein kamin":
-            overview_items.append(f"<b>{enforcer.get('Kaminabzug')}:</b> <b>für {num_floors} Geschosse</b>")
-            print(f"✅ [PDF] Semineu afișat: '{semineu_de}' cu horn pentru {num_floors} etaje")
+    if inclusions_ov.get("utilities"):
+        if tip_semineu_str:
+            semineu_de = enforcer.get(tip_semineu_str) if tip_semineu_str else tip_semineu_str
+            overview_items.append(f"<b>{enforcer.get('Kamin')}:</b> <b>{semineu_de}</b>")
+            if tip_semineu_str != "Kein Kamin" and tip_semineu_str.lower() != "kein kamin":
+                overview_items.append(f"<b>{enforcer.get('Kaminabzug')}:</b> <b>für {num_floors} Geschosse</b>")
+                print(f"✅ [PDF] Semineu afișat: '{semineu_de}' cu horn pentru {num_floors} etaje")
+            else:
+                print(f"✅ [PDF] Semineu afișat: '{semineu_de}' (fără horn)")
         else:
-            print(f"✅ [PDF] Semineu afișat: '{semineu_de}' (fără horn)")
-    else:
-        print(f"⚠️ [PDF] Semineu nu este afișat: tip_semineu este gol")
-    
-    # Sistem de încălzire și nivel energetic
-    if incalzire_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> <b>{incalzire_de}</b>")
-    if nivel_energetic_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Nivel energetic')}:</b> <b>{nivel_energetic_de}</b>")
-    overview_items.append(f"<b>{enforcer.get('Fertigstellungsgrad')}:</b> <b>{nivel_finisare_de}</b>")
+            print(f"⚠️ [PDF] Semineu nu este afișat: tip_semineu este gol")
+        if incalzire_de != "—":
+            overview_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> <b>{incalzire_de}</b>")
+        if nivel_energetic_de != "—":
+            overview_items.append(f"<b>{enforcer.get('Nivel energetic')}:</b> <b>{nivel_energetic_de}</b>")
+    if inclusions_ov.get("finishes"):
+        overview_items.append(f"<b>{enforcer.get('Fertigstellungsgrad')}:</b> <b>{nivel_finisare_de}</b>")
     
     for item in overview_items:
         story.append(Paragraph(item, styles["Body"]))
@@ -2793,11 +2771,18 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         return output_root / "roof" / "roof_3d" / "entire" / "mixed" / "roof_pricing.json"
     roof_pricing_path = _find_roof_pricing_path()
     roof_pricing_total_eur: float | None = None  # Preț acoperiș din workflow nou (roof_metrics + formular)
+    roof_skylight_count = 0
+    roof_skylight_total_cost = 0.0
     if roof_pricing_path and roof_pricing_path.exists() and inclusions.get("roof", False):
         try:
             with open(roof_pricing_path, encoding="utf-8") as f:
                 roof_pricing = json.load(f)
             items = roof_pricing.get("detailed_items") or roof_pricing.get("items", [])
+            form_data = roof_pricing.get("form_data") or {}
+            roof_skylight_count = int(form_data.get("dachfenster_count") or 0)
+            roof_skylight_total_cost = float(
+                sum(float(it.get("cost", 0) or 0) for it in items if str(it.get("category", "")).lower() == "roof_skylights")
+            )
             total_roof = roof_pricing.get("total_cost", 0.0)
             if items and total_roof > 0:
                 roof_pricing_total_eur = total_roof
@@ -2881,7 +2866,8 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     # Structură de cost simplificată (eliminată complet conform cerințelor)
     # _simplified_cost_structure(story, styles, plans_data, inclusions, enforcer)
     
-    # Calculează ferestre și uși la total pentru afișare la planuri (nu pentru ofertă doar acoperiș)
+    # Calculează ferestre și uși la total pentru afișare la planuri.
+    # Dachfenster (din roof editor) se includ explicit la "Fenster".
     total_windows_global = 0
     total_doors_global = 0
     total_doors_interior = 0
@@ -2924,6 +2910,9 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         
         # Debug final
         print(f"🔍 [PDF] Final door counts: total={total_doors_global}, interior={total_doors_interior}, exterior={total_doors_exterior}")
+        # Dachfenster aus roof_pricing nur zur Fenster-Sektion zählen, wenn Angebotsumfang Fenster enthält
+        if inclusions.get("openings") and roof_skylight_count > 0:
+            total_windows_global += roof_skylight_count
     
     # Planuri (side by side) și ferestre/uși — omise pentru ofertă doar Dachstuhl
     if plans_data:
@@ -2944,61 +2933,74 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         if not roof_only:
             story.append(Spacer(1, 4*mm))
             # Titlul "Planungsebenen" a fost eliminat conform cerințelor
-            
-            # Adăugăm informații despre ferestre și uși conform pozei
-            ferestre_usi = frontend_data.get("ferestreUsi", {})
-            turhohe = ferestre_usi.get("turhohe", "Standard")
-            window_quality = ferestre_usi.get("windowQuality", "Standard")
-            
-            ausfuhrung_tur_map = {
-                "Standard (2,0 m)": "Standard",
-                "Erhöht / Sondermaß (2,2+ m)": "Erhöht"
-            }
-            ausfuhrung_tur = ausfuhrung_tur_map.get(turhohe, "Standard")
-            
-            windows_total_price = 0.0
-            doors_total_price = 0.0
-            for entry in plans_data:
-                pricing = entry.get("pricing", {})
-                breakdown = pricing.get("breakdown", {})
-                openings_bd = breakdown.get("openings", {})
-                openings_items = openings_bd.get("items", []) or openings_bd.get("detailed_items", [])
+            if inclusions.get("openings"):
+                # Adăugăm informații despre ferestre și uși doar când oferta include deschideri (nu Rohbau/Tragwerk)
+                ferestre_usi = frontend_data.get("ferestreUsi", {})
+                window_quality = ferestre_usi.get("windowQuality", "Standard")
+                door_mi = (ferestre_usi.get("doorMaterialInterior") or "Standard").strip()
+                door_me = (ferestre_usi.get("doorMaterialExterior") or "Standard").strip()
+                ausfuhrung_tur = f"Innen: {door_mi}; Außen: {door_me}"
                 
-                for op in openings_items:
-                    obj_type = str(op.get("type", "")).lower()
-                    cost = float(op.get("total_cost", op.get("cost", 0.0)))
+                windows_total_price = 0.0
+                doors_total_price = 0.0
+                for entry in plans_data:
+                    pricing = entry.get("pricing", {})
+                    breakdown = pricing.get("breakdown", {})
+                    openings_bd = breakdown.get("openings", {})
+                    openings_items = openings_bd.get("items", []) or openings_bd.get("detailed_items", [])
                     
-                    if "window" in obj_type:
-                        windows_total_price += cost
-                    elif "door" in obj_type:
-                        doors_total_price += cost
-            
-            if total_windows_global > 0:
-                fenster_content = [
-                    Paragraph(f"<b>Fenster & Verglasung</b>", styles["H3"]),
-                    Paragraph(f"Anzahl Fenster (laut Plan): {total_windows_global}", styles["Body"]),
-                    Paragraph(f"Ausführung: {window_quality}", styles["Body"])
-                ]
-                if windows_total_price > 0:
-                    fenster_content.append(Paragraph(f"Gesamtpreis Fenster & Verglasung: {_money(windows_total_price)}", styles["Body"]))
-                fenster_content.append(Spacer(1, 2*mm))
-                story.append(KeepTogether(fenster_content))
-            
-            if total_doors_global > 0:
-                turen_content = [
-                    Paragraph(f"<b>Türen</b>", styles["H3"]),
-                    Paragraph(f"Anzahl Türen (laut Plan): {total_doors_global}", styles["Body"]),
-                    Paragraph(f"Ausführung: {ausfuhrung_tur}", styles["Body"])
-                ]
-                if total_doors_interior > 0:
-                    turen_content.append(Paragraph(f"Innentüren: {total_doors_interior}", styles["Body"]))
-                if total_doors_exterior > 0:
-                    turen_content.append(Paragraph(f"Außentüren / Balkontüren: {total_doors_exterior}", styles["Body"]))
-                if doors_total_price > 0:
-                    turen_content.append(Paragraph(f"Gesamtpreis Türen: {_money(doors_total_price)}", styles["Body"]))
-                turen_content.append(Spacer(1, 2*mm))
-                story.append(KeepTogether(turen_content))
+                    for op in openings_items:
+                        obj_type = str(op.get("type", "")).lower()
+                        cost = float(op.get("total_cost", op.get("cost", 0.0)))
+                        
+                        if "window" in obj_type:
+                            windows_total_price += cost
+                        elif "door" in obj_type:
+                            doors_total_price += cost
+                if roof_skylight_total_cost > 0:
+                    windows_total_price += roof_skylight_total_cost
+                
+                if total_windows_global > 0:
+                    fenster_content = [
+                        Paragraph(f"<b>Fenster & Verglasung</b>", styles["H3"]),
+                        Paragraph(f"Anzahl Fenster (inkl. Dachfenster): {total_windows_global}", styles["Body"]),
+                        Paragraph(f"Ausführung: {window_quality}", styles["Body"])
+                    ]
+                    if windows_total_price > 0:
+                        fenster_content.append(Paragraph(f"Gesamtpreis Fenster & Verglasung: {_money(windows_total_price)}", styles["Body"]))
+                    fenster_content.append(Spacer(1, 2*mm))
+                    story.append(KeepTogether(fenster_content))
+                
+                # Türen nur bei Schlüsselfertig (Casă completă); bei „Rohbau + Fenster“ nur Fenster-Block
+                if inclusions.get("openings_doors") and total_doors_global > 0:
+                    turen_content = [
+                        Paragraph(f"<b>Türen</b>", styles["H3"]),
+                        Paragraph(f"Anzahl Türen (laut Plan): {total_doors_global}", styles["Body"]),
+                        Paragraph(f"Ausführung: {ausfuhrung_tur}", styles["Body"])
+                    ]
+                    if total_doors_interior > 0:
+                        turen_content.append(Paragraph(f"Innentüren: {total_doors_interior}", styles["Body"]))
+                    if total_doors_exterior > 0:
+                        turen_content.append(Paragraph(f"Außentüren / Balkontüren: {total_doors_exterior}", styles["Body"]))
+                    if doors_total_price > 0:
+                        turen_content.append(Paragraph(f"Gesamtpreis Türen: {_money(doors_total_price)}", styles["Body"]))
+                    turen_content.append(Spacer(1, 2*mm))
+                    story.append(KeepTogether(turen_content))
+        if roof_only and roof_skylight_count > 0:
+            # Pentru oferte Dachstuhl-only: afișăm explicit Dachfenster sub secțiunea Fenster.
+            fenster_content = [
+                Paragraph(f"<b>Fenster & Verglasung</b>", styles["H3"]),
+                Paragraph(f"Anzahl Fenster (inkl. Dachfenster): {roof_skylight_count}", styles["Body"]),
+                Paragraph("Ausführung: Dachfenster", styles["Body"]),
+            ]
+            if roof_skylight_total_cost > 0:
+                fenster_content.append(
+                    Paragraph(f"Gesamtpreis Fenster & Verglasung: {_money(roof_skylight_total_cost)}", styles["Body"])
+                )
+            fenster_content.append(Spacer(1, 2 * mm))
+            story.append(KeepTogether(fenster_content))
 
+        if not roof_only:
             plan_images = []
             plan_labels = []
             plan_info_texts = []
@@ -3106,7 +3108,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     pos0_label = (
         "Dachkosten (Dachstuhl)"
         if roof_only
-        else enforcer.get("Baukosten (Konstruktion, Ausbau, Technik)")
+        else _baukosten_position_label_de(inclusions)
     )
     data = [
         [P(pos0_label), P(_money(filtered_total))],
@@ -3281,7 +3283,18 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
     # ADMIN: Folosim aceeași filtrare ca în user PDF pentru același preț
     nivel_oferta = _normalize_nivel_oferta(frontend_data)
     inclusions = _get_offer_inclusions(nivel_oferta, frontend_data)
-    
+    _sec_openings = "section 3" if inclusions.get("openings") else "area calculation"
+    _note_ext_openings = (
+        "<i>Exterior openings = sum of all window areas + exterior door areas (see section 3).</i>"
+        if inclusions.get("openings")
+        else "<i>Exterior openings = sum of window and exterior door areas from the plan (openings not itemized in this offer scope).</i>"
+    )
+    _note_int_openings = (
+        "<i>Interior openings = sum of all interior door areas (see section 3).</i>"
+        if inclusions.get("openings")
+        else "<i>Interior openings = sum of interior door areas from the plan (openings not itemized in this offer scope).</i>"
+    )
+
     for pos, p_data in enumerate(enriched_ordered):
         plan = p_data["plan"]
         pricing_path = plan.stage_work_dir / "pricing_raw.json"
@@ -3314,8 +3327,12 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue
                 
-                # Wintergärten & Balkone: inclus în ADMIN PDF (tot ce intră în calcul) — nu pentru Dachstuhl-only
-                if category_key == "wintergaerten_balkone" and not roof_only:
+                # Wintergärten & Balkone: doar când oferta include finisaje (Altbau-Logik); nu pentru Rohbau-only
+                if (
+                    category_key == "wintergaerten_balkone"
+                    and not roof_only
+                    and inclusions.get("finishes", False)
+                ):
                     filtered_breakdown[category_key] = category_data
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue
@@ -3476,7 +3493,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                     from .tables import create_wall_measurements_table
                     story.append(Spacer(1, 2*mm))
                     story.append(Paragraph(f"<b>{enforcer.get('Măsurători Pereți')} - {plan.plan_id}:</b>", styles["Body"]))
-                    measurements_table = create_wall_measurements_table(area_data, enforcer)
+                    measurements_table = create_wall_measurements_table(area_data, enforcer, inclusions)
                     story.append(measurements_table)
                     story.append(Spacer(1, 3*mm))
             except Exception as e:
@@ -3487,7 +3504,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         if bd.get("stairs"): 
             _table_stairs(story, styles, bd.get("stairs", {}), enforcer)
         if bd.get("roof"): 
-            _table_roof_quantities(story, styles, pricing, enforcer)
+            _table_roof_quantities(story, styles, pricing, enforcer, inclusions=inclusions)
         if bd.get("finishes"): 
             _table_standard(story, styles, "Oberflächen & Ausbau", bd.get("finishes", {}), enforcer, show_mod_column=False)
         if bd.get("wintergaerten_balkone") and (bd.get("wintergaerten_balkone", {}).get("total_cost", 0) or 0) > 0:
@@ -3517,7 +3534,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         P("Betrag", "CellBold")
     ]
     
-    admin_pos0 = "Dachkosten (Dachstuhl)" if roof_only else "Baukosten (Konstruktion, Ausbau, Technik)"
+    admin_pos0 = "Dachkosten (Dachstuhl)" if roof_only else _baukosten_position_label_de(inclusions)
     data = [
         [P(admin_pos0), P(_money(filtered_total))],
         [P("Baustelleneinrichtung, Logistik & Planung"), P(_money(cost_margin_logistics))],
@@ -3779,7 +3796,8 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     pilons = structura_cladirii.get("pilons")
     inaltime_etaje = structura_cladirii.get("inaltimeEtaje")
     window_quality = ferestre_usi.get("windowQuality")
-    turhohe = ferestre_usi.get("turhohe")
+    door_mi_pdf = (ferestre_usi.get("doorMaterialInterior") or "Standard").strip()
+    door_me_pdf = (ferestre_usi.get("doorMaterialExterior") or "Standard").strip()
     nivel_energetic = performanta.get("nivelEnergetic") or performanta_energetica.get("nivelEnergetic")
     tip_incalzire = performanta.get("tipIncalzire") or performanta_energetica.get("tipIncalzire")
     ventilatie = performanta.get("ventilatie", False) or performanta_energetica.get("ventilatie", False)
@@ -3805,23 +3823,28 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     story.append(Paragraph("<b>Step – Roof type</b>", styles["H3"]))
     story.append(Paragraph(f"Roof type: {_en(tip_acoperis)}", styles["Body"]))
     
-    story.append(Paragraph("<b>Step – Windows &amp; Doors</b>", styles["H3"]))
-    story.append(Paragraph(f"Window quality: {_en(window_quality)}", styles["Body"]))
-    story.append(Paragraph(f"Door height: {_en(turhohe)}", styles["Body"]))
+    if inclusions.get("openings"):
+        story.append(Paragraph("<b>Step – Windows &amp; Doors</b>", styles["H3"]))
+        story.append(Paragraph(f"Window quality: {_en(window_quality)}", styles["Body"]))
+        story.append(Paragraph(f"Door types (Innen / Außen): {_en(door_mi_pdf)} / {_en(door_me_pdf)}", styles["Body"]))
     
-    story.append(Paragraph("<b>Step – Materials &amp; finish level</b>", styles["H3"]))
-    story.append(Paragraph(f"Interior finish (basement): {_en(materiale_finisaj.get('finisajInteriorBeci'))}", styles["Body"]))
-    story.append(Paragraph(f"Interior finish (ground floor): {_en(materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
-    story.append(Paragraph(f"Facade (ground floor): {_en(materiale_finisaj.get('fatada_ground'))}", styles["Body"]))
-    story.append(Paragraph(f"Interior finish (attic): {_en(materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
-    story.append(Paragraph(f"Facade (attic): {_en(materiale_finisaj.get('fatadaMansarda'))}", styles["Body"]))
-    story.append(Paragraph(f"Roof material: {_en(material_acoperis)}", styles["Body"]))
+    if inclusions.get("finishes"):
+        story.append(Paragraph("<b>Step – Materials &amp; finish level</b>", styles["H3"]))
+        story.append(Paragraph(f"Interior finish (basement): {_en(materiale_finisaj.get('finisajInteriorBeci'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish (ground floor): {_en(materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
+        story.append(Paragraph(f"Facade (ground floor): {_en(materiale_finisaj.get('fatada_ground'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish (attic): {_en(materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
+        story.append(Paragraph(f"Facade (attic): {_en(materiale_finisaj.get('fatadaMansarda'))}", styles["Body"]))
+    if inclusions.get("roof"):
+        story.append(Paragraph("<b>Step – Roof covering (material)</b>", styles["H3"]))
+        story.append(Paragraph(f"Roof material: {_en(material_acoperis)}", styles["Body"]))
     
-    story.append(Paragraph("<b>Step – Energy efficiency &amp; Heating</b>", styles["H3"]))
-    story.append(Paragraph(f"Energy level: {_en(nivel_energetic)}", styles["Body"]))
-    story.append(Paragraph(f"Heating type: {_en(tip_incalzire)}", styles["Body"]))
-    story.append(Paragraph(f"Ventilation / heat recovery: {'Yes' if ventilatie else 'No'}", styles["Body"]))
-    story.append(Paragraph(f"Fireplace: {_en(tip_semineu) if tip_semineu else 'No'}", styles["Body"]))
+    if inclusions.get("utilities"):
+        story.append(Paragraph("<b>Step – Energy efficiency &amp; Heating</b>", styles["H3"]))
+        story.append(Paragraph(f"Energy level: {_en(nivel_energetic)}", styles["Body"]))
+        story.append(Paragraph(f"Heating type: {_en(tip_incalzire)}", styles["Body"]))
+        story.append(Paragraph(f"Ventilation / heat recovery: {'Yes' if ventilatie else 'No'}", styles["Body"]))
+        story.append(Paragraph(f"Fireplace: {_en(tip_semineu) if tip_semineu else 'No'}", styles["Body"]))
     
     story.append(Spacer(1, 6*mm))
     
@@ -4054,7 +4077,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    f"  • Openings deducted (windows + exterior doors, from section 3): <b>{ext_openings:.2f} m²</b>",
+                    f"  • Openings deducted (windows + exterior doors, from {_sec_openings}): <b>{ext_openings:.2f} m²</b>",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
@@ -4062,7 +4085,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    "<i>Exterior openings = sum of all window areas + exterior door areas (see section 3).</i>",
+                    _note_ext_openings,
                     styles["Small"]
                 ))
                 story.append(Spacer(1, 2*mm))
@@ -4073,7 +4096,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    f"  • Openings deducted (interior doors, from section 3): <b>{int_openings:.2f} m²</b>",
+                    f"  • Openings deducted (interior doors, from {_sec_openings}): <b>{int_openings:.2f} m²</b>",
                     styles["Body"]
                 ))
                 story.append(Paragraph(
@@ -4081,7 +4104,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     styles["Body"]
                 ))
                 story.append(Paragraph(
-                    "<i>Interior openings = sum of all interior door areas (see section 3).</i>",
+                    _note_int_openings,
                     styles["Small"]
                 ))
                 story.append(Spacer(1, 2*mm))
@@ -4091,7 +4114,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     f"  • Surface: Length × Height = {int_length_structure:.2f} m × {wall_height:.2f} m = <b>Gross area: {int_gross_structure:.2f} m²</b>",
                     styles["Body"]
                 ))
-                story.append(Paragraph(f"  • Openings deducted (interior doors, from section 3): <b>{int_openings:.2f} m²</b>", styles["Body"]))
+                story.append(Paragraph(f"  • Openings deducted (interior doors, from {_sec_openings}): <b>{int_openings:.2f} m²</b>", styles["Body"]))
                 story.append(Paragraph(
                     f"  • Net area (interior structure): Gross − Openings = {int_gross_structure:.2f} − {int_openings:.2f} = <b>{int_net_structure:.2f} m²</b>",
                     styles["Body"]
@@ -4120,7 +4143,7 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     ))
                     story.append(Spacer(1, 2*mm))
                 from .tables import create_wall_measurements_table_english
-                measurements_table = create_wall_measurements_table_english(area_data)
+                measurements_table = create_wall_measurements_table_english(area_data, inclusions)
                 story.append(Paragraph("<b>Summary table – wall measurements:</b>", styles["Body"]))
                 story.append(measurements_table)
                 story.append(Spacer(1, 2*mm))
@@ -4165,190 +4188,193 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 ))
         story.append(Spacer(1, 4*mm))
     
-        # 3. OPENINGS (WINDOWS & DOORS) CALCULATION FOR THIS PLAN – always show (formula, settings, list; cost when > 0)
-        openings = breakdown.get("openings", {})
-        story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
-        story.append(Paragraph(
-            "<b>Formula:</b> Cost = Opening Area (m²) × Unit Price per m². "
-            "Area = width (m) × height (m). Height comes from editor/raster when available (or width-based heuristic); Türhöhe remains form-based.",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"<b>Door height (Türhöhe):</b> {_en(turhohe)} → used for area only.",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"<b>Fensterart (window type):</b> {_en(window_quality)} → unit price per m² (2-fach / 3-fach / 3-fach Passiv). Doors: interior vs exterior price per m².",
-            styles["Body"]
-        ))
-        opening_items = openings.get("detailed_items", openings.get("items", [])) if openings else []
-        num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
-        num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
-        # Total areas by category (for explicit deduction in wall sections)
-        total_windows_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "window" in str(it.get("type", "")).lower())
-        total_exterior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() == "exterior")
-        total_interior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() != "exterior")
-        total_openings_area = total_windows_area + total_exterior_doors_area + total_interior_doors_area
-        story.append(Spacer(1, 2*mm))
-        story.append(Paragraph(
-            f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
-        ))
-        if opening_items:
-            for item in opening_items:
-                name = item.get("name", "")
-                area = item.get("area_m2", 0)
-                unit_price = item.get("unit_price", 0)
-                cost = item.get("total_cost", 0)
-                w_m = item.get("width_m")
-                h_m = item.get("height_m")
-                if w_m is not None and h_m is not None:
-                    dim_str = f"{float(w_m):.2f} × {float(h_m):.2f}"
-                else:
-                    dim_str = item.get("dimensions_m", "—")
-                material = _en(item.get("material", "—"))
-                if openings.get("total_cost", 0) > 0 and (unit_price or cost):
-                    story.append(Paragraph(
-                        f"  • {name}: dimensions {dim_str} m → area {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                        styles["Body"]
-                    ))
-                else:
-                    story.append(Paragraph(
-                        f"  • {name}: dimensions {dim_str} m → area <b>{area:.2f} m²</b>",
-                        styles["Body"]
-                    ))
-        else:
-            story.append(Paragraph("<i>No openings detected for this plan.</i>", styles["Body"]))
-        story.append(Spacer(1, 2*mm))
-        story.append(Paragraph("<b>Total area of openings (used for wall surface deductions):</b>", styles["Body"]))
-        story.append(Paragraph(
-            f"  • Windows: <b>{total_windows_area:.2f} m²</b>",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"  • Exterior doors: <b>{total_exterior_doors_area:.2f} m²</b> (deducted from exterior wall finishes and exterior wall structure)",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"  • Interior doors: <b>{total_interior_doors_area:.2f} m²</b> (deducted from interior wall finishes and interior wall structure)",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            f"  • Total openings area: <b>{total_openings_area:.2f} m²</b>",
-            styles["Body"]
-        ))
-        story.append(Paragraph(
-            "In sections 2 and 4, gross wall surfaces are reduced by these opening areas to obtain net wall area for pricing.",
-            styles["Small"]
-        ))
-        if openings and openings.get("total_cost", 0) > 0:
+        if inclusions.get("openings"):
+            # 3. OPENINGS (WINDOWS & DOORS) CALCULATION FOR THIS PLAN – always show (formula, settings, list; cost when > 0)
+            openings = breakdown.get("openings", {})
+            story.append(Paragraph("3. Openings (Windows & Doors) Calculation", styles["H2"]))
             story.append(Paragraph(
-                f"<b>Openings total for this plan: {openings.get('total_cost', 0):.2f} EUR</b>",
+                "<b>Formula:</b> Windows: area (m²) × €/m² by Fensterart. "
+                "Normal doors: €/Stück by selected Türtyp (Innen/Außen). Garage doors: €/Stück by type if „Garagentor gewünscht“. "
+                "Areas for deduction still use width × height from editor when available.",
                 styles["Body"]
             ))
-        story.append(Spacer(1, 4*mm))
-    
-        # 4. FINISHES CALCULATION (wall finishes) – always show section with full data from areas_calculated.json
-        finishes = breakdown.get("finishes", {})
-        story.append(Paragraph("4. Finishes Calculation (Wall Finishes)", styles["H2"]))
-        story.append(Paragraph(
-            "<b>Formula:</b> Cost = Net wall area (m²) × Finish unit price per m². "
-            "Net area = (Length × Height) − Openings (doors/windows) area.",
-            styles["Body"]
-        ))
-        area_data_fin = None
-        try:
-            area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
-            if area_json_path.exists():
-                with open(area_json_path, "r", encoding="utf-8") as f:
-                    area_data_fin = json.load(f)
-        except Exception:
-            pass
-        if area_data_fin:
-            walls_fin = area_data_fin.get("walls", {})
-            int_fin = walls_fin.get("interior", {})
-            ext_fin = walls_fin.get("exterior", {})
-            wall_height_f = area_data_fin.get("wall_height_m")
-            if wall_height_f is None and int_fin.get("length_m"):
-                g = float(int_fin.get("gross_area_m2", 0))
-                L = float(int_fin.get("length_m", 1))
-                wall_height_f = (g / L) if L > 0 else 2.7
-            if wall_height_f is None:
-                wall_height_f = 2.7
-            wall_height_f = float(wall_height_f)
-            len_int = float(int_fin.get("length_m", 0.0))
-            len_ext = float(ext_fin.get("length_m", 0.0))
-            gross_int = float(int_fin.get("gross_area_m2", 0.0))
-            gross_ext = float(ext_fin.get("gross_area_m2", 0.0))
-            open_int = float(int_fin.get("openings_area_m2", 0.0))
-            open_ext = float(ext_fin.get("openings_area_m2", 0.0))
-            net_int = float(int_fin.get("net_area_m2", 0.0))
-            net_ext = float(ext_fin.get("net_area_m2", 0.0))
-            story.append(Paragraph("<b>Wall height used for finishes:</b>", styles["Body"]))
-            story.append(Paragraph(f"  {wall_height_f:.2f} m (from floor height setting).", styles["Body"]))
+            story.append(Paragraph(
+                f"<b>Door types:</b> Innen {_en(door_mi_pdf)}, Außen {_en(door_me_pdf)}.",
+                styles["Body"]
+            ))
+            story.append(Paragraph(
+                f"<b>Fensterart:</b> {_en(window_quality)} → €/m² glass area.",
+                styles["Body"]
+            ))
+            opening_items = openings.get("detailed_items", openings.get("items", [])) if openings else []
+            num_windows = sum(1 for it in opening_items if "window" in str(it.get("type", "")).lower())
+            num_doors = sum(1 for it in opening_items if "door" in str(it.get("type", "")).lower())
+            # Total areas by category (for explicit deduction in wall sections)
+            total_windows_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "window" in str(it.get("type", "")).lower())
+            total_exterior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() == "exterior")
+            total_interior_doors_area = sum(float(it.get("area_m2", 0)) for it in opening_items if "door" in str(it.get("type", "")).lower() and str(it.get("status", "")).lower() != "exterior")
+            total_openings_area = total_windows_area + total_exterior_doors_area + total_interior_doors_area
             story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("<b>Interior wall finishes:</b>", styles["Body"]))
             story.append(Paragraph(
-                f"  • Length (interior walls, outline): <b>{len_int:.2f} m</b>",
+                f"<b>All openings for this plan:</b> {num_windows} window(s), {num_doors} door(s). Detailed list:", styles["Body"]
+            ))
+            if opening_items:
+                for item in opening_items:
+                    name = item.get("name", "")
+                    area = item.get("area_m2", 0)
+                    unit_price = item.get("unit_price", 0)
+                    cost = item.get("total_cost", 0)
+                    w_m = item.get("width_m")
+                    h_m = item.get("height_m")
+                    if w_m is not None and h_m is not None:
+                        dim_str = f"{float(w_m):.2f} × {float(h_m):.2f}"
+                    else:
+                        dim_str = item.get("dimensions_m", "—")
+                    material = _en(item.get("material", "—"))
+                    if openings.get("total_cost", 0) > 0 and (unit_price or cost):
+                        story.append(Paragraph(
+                            f"  • {name}: dimensions {dim_str} m → area {area:.2f} m² × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                            styles["Body"]
+                        ))
+                    else:
+                        story.append(Paragraph(
+                            f"  • {name}: dimensions {dim_str} m → area <b>{area:.2f} m²</b>",
+                            styles["Body"]
+                        ))
+            else:
+                story.append(Paragraph("<i>No openings detected for this plan.</i>", styles["Body"]))
+            story.append(Spacer(1, 2*mm))
+            story.append(Paragraph("<b>Total area of openings (used for wall surface deductions):</b>", styles["Body"]))
+            story.append(Paragraph(
+                f"  • Windows: <b>{total_windows_area:.2f} m²</b>",
                 styles["Body"]
             ))
             story.append(Paragraph(
-                f"  • Surface: Length × Height = {len_int:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_int:.2f} m²</b>",
+                f"  • Exterior doors: <b>{total_exterior_doors_area:.2f} m²</b> (deducted from exterior wall finishes and exterior wall structure)",
                 styles["Body"]
             ))
             story.append(Paragraph(
-                f"  • Openings deducted (interior doors only, from section 3): <b>{open_int:.2f} m²</b>",
+                f"  • Interior doors: <b>{total_interior_doors_area:.2f} m²</b> (deducted from interior wall finishes and interior wall structure)",
                 styles["Body"]
             ))
             story.append(Paragraph(
-                f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
+                f"  • Total openings area: <b>{total_openings_area:.2f} m²</b>",
                 styles["Body"]
             ))
             story.append(Paragraph(
-                "<i>Interior openings = sum of all interior door areas (section 3).</i>",
+                "In sections 2 and 4, gross wall surfaces are reduced by these opening areas to obtain net wall area for pricing.",
                 styles["Small"]
             ))
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
-            story.append(Paragraph(
-                f"  • Length (exterior walls): <b>{len_ext:.2f} m</b>",
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"  • Surface: Length × Height = {len_ext:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_ext:.2f} m²</b>",
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"  • Openings deducted (windows + exterior doors, from section 3): <b>{open_ext:.2f} m²</b>",
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
-                styles["Body"]
-            ))
-            story.append(Paragraph(
-                "<i>Exterior openings = sum of all window areas + exterior door areas (section 3).</i>",
-                styles["Small"]
-            ))
-            story.append(Spacer(1, 4*mm))
-        else:
-            story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
-            story.append(Spacer(1, 2*mm))
-        
-        if finishes and finishes.get("total_cost", 0) > 0:
-            story.append(Paragraph("<b>Cost calculation (net area × unit price):</b>", styles["Body"]))
-            for item in finishes.get("detailed_items", []):
-                area = item.get("area_m2", 0)
-                unit_price = item.get("unit_price", 0)
-                cost = item.get("cost", 0)
-                material = _en(item.get("material", "—"))
+            if openings and openings.get("total_cost", 0) > 0:
                 story.append(Paragraph(
-                    f"  • {material}: Net area <b>{area:.2f} m²</b> × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                    f"<b>Openings total for this plan: {openings.get('total_cost', 0):.2f} EUR</b>",
                     styles["Body"]
                 ))
-        else:
-            story.append(Paragraph("<i>Finishes not included in this offer level or cost is zero.</i>", styles["Body"]))
-        story.append(Spacer(1, 4*mm))
-    
+            story.append(Spacer(1, 4*mm))
+        
+        if inclusions.get("finishes"):
+            # 4. FINISHES CALCULATION (wall finishes) – always show section with full data from areas_calculated.json
+            finishes = breakdown.get("finishes", {})
+            story.append(Paragraph("4. Finishes Calculation (Wall Finishes)", styles["H2"]))
+            story.append(Paragraph(
+                "<b>Formula:</b> Cost = Net wall area (m²) × Finish unit price per m². "
+                "Net area = (Length × Height) − Openings (doors/windows) area.",
+                styles["Body"]
+            ))
+            area_data_fin = None
+            try:
+                area_json_path = plan.stage_work_dir.parent.parent / "area" / plan.plan_id / "areas_calculated.json"
+                if area_json_path.exists():
+                    with open(area_json_path, "r", encoding="utf-8") as f:
+                        area_data_fin = json.load(f)
+            except Exception:
+                pass
+            if area_data_fin:
+                walls_fin = area_data_fin.get("walls", {})
+                int_fin = walls_fin.get("interior", {})
+                ext_fin = walls_fin.get("exterior", {})
+                wall_height_f = area_data_fin.get("wall_height_m")
+                if wall_height_f is None and int_fin.get("length_m"):
+                    g = float(int_fin.get("gross_area_m2", 0))
+                    L = float(int_fin.get("length_m", 1))
+                    wall_height_f = (g / L) if L > 0 else 2.7
+                if wall_height_f is None:
+                    wall_height_f = 2.7
+                wall_height_f = float(wall_height_f)
+                len_int = float(int_fin.get("length_m", 0.0))
+                len_ext = float(ext_fin.get("length_m", 0.0))
+                gross_int = float(int_fin.get("gross_area_m2", 0.0))
+                gross_ext = float(ext_fin.get("gross_area_m2", 0.0))
+                open_int = float(int_fin.get("openings_area_m2", 0.0))
+                open_ext = float(ext_fin.get("openings_area_m2", 0.0))
+                net_int = float(int_fin.get("net_area_m2", 0.0))
+                net_ext = float(ext_fin.get("net_area_m2", 0.0))
+                story.append(Paragraph("<b>Wall height used for finishes:</b>", styles["Body"]))
+                story.append(Paragraph(f"  {wall_height_f:.2f} m (from floor height setting).", styles["Body"]))
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Interior wall finishes:</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Length (interior walls, outline): <b>{len_int:.2f} m</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {len_int:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (interior doors only, from section 3): <b>{open_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area for interior finishes: Gross − Openings = {gross_int:.2f} − {open_int:.2f} = <b>{net_int:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    "<i>Interior openings = sum of all interior door areas (section 3).</i>",
+                    styles["Small"]
+                ))
+                story.append(Spacer(1, 2*mm))
+                story.append(Paragraph("<b>Exterior wall finishes (facade):</b>", styles["Body"]))
+                story.append(Paragraph(
+                    f"  • Length (exterior walls): <b>{len_ext:.2f} m</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Surface: Length × Height = {len_ext:.2f} m × {wall_height_f:.2f} m = <b>Gross area: {gross_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Openings deducted (windows + exterior doors, from section 3): <b>{open_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    f"  • Net area for exterior finishes: Gross − Openings = {gross_ext:.2f} − {open_ext:.2f} = <b>{net_ext:.2f} m²</b>",
+                    styles["Body"]
+                ))
+                story.append(Paragraph(
+                    "<i>Exterior openings = sum of all window areas + exterior door areas (section 3).</i>",
+                    styles["Small"]
+                ))
+                story.append(Spacer(1, 4*mm))
+            else:
+                story.append(Paragraph("<i>No area data (areas_calculated.json) available for this plan.</i>", styles["Body"]))
+                story.append(Spacer(1, 2*mm))
+            
+            if finishes and finishes.get("total_cost", 0) > 0:
+                story.append(Paragraph("<b>Cost calculation (net area × unit price):</b>", styles["Body"]))
+                for item in finishes.get("detailed_items", []):
+                    area = item.get("area_m2", 0)
+                    unit_price = item.get("unit_price", 0)
+                    cost = item.get("cost", 0)
+                    material = _en(item.get("material", "—"))
+                    story.append(Paragraph(
+                        f"  • {material}: Net area <b>{area:.2f} m²</b> × {unit_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
+                        styles["Body"]
+                    ))
+            else:
+                story.append(Paragraph("<i>Finishes not included in this offer level or cost is zero.</i>", styles["Body"]))
+            story.append(Spacer(1, 4*mm))
+        
         # 5. FLOORS & CEILINGS CALCULATION FOR THIS PLAN
         floors = breakdown.get("floors_ceilings", {})
         if floors and floors.get("total_cost", 0) > 0:

@@ -475,12 +475,14 @@ def calculate_pricing_for_plan(
 
     stairs_type_selected = str(_fv("stairs_type") or (frontend_input.get("ferestreUsi", {}) or {}).get("treppeTyp") or "Standard").strip()
     stairs_floors_count = frontend_input.get("_stairs_floors_count")
+    stairs_total_count = frontend_input.get("_stairs_total_count")
     if is_ground_floor:
         cost_stairs = calculate_stairs_details(
             stairs_coeffs,
             total_floors,
             stairs_floors_count=stairs_floors_count if isinstance(stairs_floors_count, int) else None,
             stair_type=stairs_type_selected,
+            stairs_total_count=stairs_total_count if isinstance(stairs_total_count, int) else None,
         )
     else:
         cost_stairs = {"total_cost": 0.0, "detailed_items": []}
@@ -778,8 +780,11 @@ def calculate_pricing_for_plan(
                 items.append({"category": "balkon", "name": f"Balkone ({typ})", "cost": round(price, 2), "total_cost": round(price, 2)})
         if items:
             cost_wintergaerten_balkone = {"total_cost": round(sum(i.get("cost", 0) for i in items), 2), "detailed_items": items}
-            total_plan_cost += cost_wintergaerten_balkone["total_cost"]
-            print(f"✅ [PRICING] Wintergärten & Balkone: {cost_wintergaerten_balkone['total_cost']:,.0f} EUR")
+            if include_finishes:
+                total_plan_cost += cost_wintergaerten_balkone["total_cost"]
+                print(f"✅ [PRICING] Wintergärten & Balkone: {cost_wintergaerten_balkone['total_cost']:,.0f} EUR")
+            else:
+                cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
 
     # Breakdown: componente excluse prin nivel ofertă apar cu cost 0; structura e afișată cu factorii acces × teren aplicați
     def _zero_if_excluded(cost_dict: dict, include: bool) -> dict:
@@ -816,6 +821,6 @@ def calculate_pricing_for_plan(
             "stairs": _zero_if_excluded(cost_stairs, include_stairs),
             "fireplace": _zero_if_excluded(cost_fireplace, include_fireplace),
             "basement": cost_basement,
-            "wintergaerten_balkone": cost_wintergaerten_balkone
+            "wintergaerten_balkone": _zero_if_excluded(cost_wintergaerten_balkone, include_finishes),
         }
     }

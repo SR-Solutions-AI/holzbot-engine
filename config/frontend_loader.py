@@ -68,5 +68,22 @@ def load_frontend_data_for_run(run_id: str, job_root: Path | None = None) -> Dic
             print(f"⚠️ Job specific config NOT found at: {job_file}")
     else:
         print(f"⚠️ No job_root found for run_id: {run_id}")
-    
+
+    # Wizard: nivelOferta rămâne uneori doar în drafts după mergeStepForm — îl promovăm pentru PDF/orchestrator.
+    drafts = data.get("drafts") if isinstance(data.get("drafts"), dict) else None
+    if drafts:
+        for step_key in ("sistemConstructiv", "materialeFinisaj"):
+            sub = drafts.get(step_key)
+            if not isinstance(sub, dict):
+                continue
+            nv = sub.get("nivelOferta")
+            if nv is None or str(nv).strip() == "":
+                continue
+            cur = data.get(step_key)
+            if not isinstance(cur, dict):
+                cur = {}
+                data[step_key] = cur
+            if not cur.get("nivelOferta"):
+                cur["nivelOferta"] = nv
+
     return data

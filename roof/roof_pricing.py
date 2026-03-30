@@ -46,6 +46,22 @@ DACHFENSTER_FALLBACK_EUR: dict[str, float] = {
 }
 
 
+def _rect_overhang_m(rect: Any, fallback_m: float) -> float:
+    """Per-rectangle overhang from editor (roofOverhangM), else pricing default."""
+    if not isinstance(rect, dict):
+        return float(fallback_m)
+    v = rect.get("roofOverhangM")
+    if v is None or (isinstance(v, str) and str(v).strip() == ""):
+        return float(fallback_m)
+    try:
+        o = float(v)
+    except (TypeError, ValueError):
+        return float(fallback_m)
+    if not math.isfinite(o):
+        return float(fallback_m)
+    return max(0.0, min(5.0, o))
+
+
 GEMINI_ROOF_SYSTEM_PROMPT = (
     "Ești un motor de calcul geometric pentru acoperișuri. "
     "Primești date numerice pentru un singur dreptunghi de acoperiș și returnezi EXCLUSIV JSON. "
@@ -75,6 +91,34 @@ def _count_roof_windows(out_root: Path) -> int:
     return n
 
 
+def _sum_roof_window_area_m2_from_editor(out_root: Path) -> float:
+    """Σ (Breite × Länge) din roof_windows_edited.json — width_m × height_m în m² per fereastră."""
+    p = out_root / "roof" / "roof_3d" / "roof_windows_edited.json"
+    if not p.exists():
+        return 0.0
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    total = 0.0
+    for _k, arr in data.items():
+        if not isinstance(arr, list):
+            continue
+        for w in arr:
+            if not isinstance(w, dict):
+                continue
+            try:
+                wm = float(w.get("width_m") or 0.0)
+                hm = float(w.get("height_m") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if wm > 0 and hm > 0:
+                total += wm * hm
+    return round(total, 6)
+
+
 def _point_in_polygon(x: float, y: float, poly: list[list[float]]) -> bool:
     inside = False
     n = len(poly)
@@ -98,6 +142,78 @@ def _read_json(path: Path) -> dict[str, Any] | list[Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _iter_edited_rectangles_roof_order(edited: dict[str, Any], run_id: str) -> list[tuple[int, list[Any]]]:
+    """
+    (roof_floor_idx, rectangles) în aceeași ordine ca roof_3d/rectangles/floor_X/ și jobs._apply_edited_roof_rectangles.
+    Pentru _floor_key_scheme == manifest, cheile din JSON sunt index tab (plans_list), nu index roof.
+    """
+    if not isinstance(edited, dict) or not run_id:
+        return []
+    try:
+        from roof.jobs import _edited_entries_as_roof_indices, resolve_plans_roof_order
+
+        plans_roof, _, plans_list = resolve_plans_roof_order(run_id)
+        pairs = _edited_entries_as_roof_indices(edited, plans_list, plans_roof)
+        return sorted(pairs, key=lambda t: t[0])
+    except Exception:
+        pass
+    out: list[tuple[int, list[Any]]] = []
+    for floor_key, rects in edited.items():
+        sk = str(floor_key)
+        if sk.startswith("_"):
+            continue
+        if not isinstance(rects, list):
+            continue
+        try:
+            k = int(floor_key)
+        except (TypeError, ValueError):
+            continue
+        out.append((k, rects))
+    return sorted(out, key=lambda t: t[0])
+
+
+def _windows_by_roof_floor(
+    win_json: dict[str, Any] | None,
+    edited: dict[str, Any],
+    run_id: str,
+) -> dict[int, list[Any]]:
+    """Mapare aceeași ca la dreptunghiuri: chei manifest → index roof (pentru același plan)."""
+    if not isinstance(win_json, dict):
+        return {}
+    scheme = win_json.get("_floor_key_scheme") or edited.get("_floor_key_scheme")
+    out: dict[int, list[Any]] = {}
+    plans_roof: list[Any] = []
+    plans_list: list[Any] = []
+    if scheme == "manifest" and run_id:
+        try:
+            from roof.jobs import resolve_plans_roof_order
+
+            plans_roof, _, plans_list = resolve_plans_roof_order(run_id)
+        except Exception:
+            plans_roof, plans_list = [], []
+    for floor_key, wins in win_json.items():
+        sk = str(floor_key)
+        if sk.startswith("_"):
+            continue
+        if not isinstance(wins, list):
+            continue
+        try:
+            mk = int(floor_key)
+        except (TypeError, ValueError):
+            continue
+        if scheme == "manifest" and plans_list and plans_roof:
+            if mk < 0 or mk >= len(plans_list):
+                continue
+            pid = plans_list[mk].plan_id
+            ri = next((i for i, p in enumerate(plans_roof) if p.plan_id == pid), None)
+            if ri is None:
+                continue
+        else:
+            ri = mk
+        out[ri] = wins
+    return out
 
 
 def _extract_rectangle_color_mask(mask_img: np.ndarray | None) -> np.ndarray:
@@ -125,14 +241,20 @@ def _extract_rectangle_color_mask(mask_img: np.ndarray | None) -> np.ndarray:
     return (mask > 0).astype(np.uint8)
 
 
-def _load_mpp_by_floor_from_scale(out_root: Path) -> dict[str, float]:
-    """Fallback map floor_idx -> meters_per_pixel from scale/plan_*/scale_result.json."""
+def _load_mpp_by_floor_from_scale(out_root: Path, run_id: str | None = None) -> dict[str, float]:
+    """
+    Map floor_idx -> meters_per_pixel from scale outputs.
+    For roof-only flows, if a floor has invalid room area extraction (area_m2=0 / estimated scale),
+    reuse a valid mpp from floors where rooms were extracted correctly.
+    """
     scale_root = out_root / "scale"
     out: dict[str, float] = {}
     if not scale_root.exists():
         return out
     plan_dirs = sorted([p for p in scale_root.iterdir() if p.is_dir() and p.name.startswith("plan_")], key=lambda p: p.name)
-    floor_idx = 0
+    mpp_by_plan: dict[str, float] = {}
+    valid_room_area_by_plan: dict[str, bool] = {}
+
     for pd in plan_dirs:
         sr = pd / "scale_result.json"
         if not sr.exists():
@@ -144,9 +266,50 @@ def _load_mpp_by_floor_from_scale(out_root: Path) -> dict[str, float]:
             mpp = float(data.get("meters_per_pixel") or 0.0)
         except Exception:
             mpp = 0.0
-        if mpp > 0:
+        if mpp <= 0:
+            continue
+
+        plan_id = pd.name
+        mpp_by_plan[plan_id] = mpp
+
+        estimated_scale = bool(data.get("estimated_scale"))
+        rooms_ok = not estimated_scale
+        rs_path = pd / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+        rs_data = _read_json(rs_path)
+        if isinstance(rs_data, dict):
+            rooms = rs_data.get("room_scales") or rs_data.get("rooms") or {}
+            if isinstance(rooms, dict) and len(rooms) > 0:
+                positive_rooms = 0
+                for rv in rooms.values():
+                    if not isinstance(rv, dict):
+                        continue
+                    try:
+                        if float(rv.get("area_m2") or 0.0) > 0:
+                            positive_rooms += 1
+                    except Exception:
+                        continue
+                rooms_ok = positive_rooms > 0 and not estimated_scale
+            else:
+                rooms_ok = False
+        valid_room_area_by_plan[plan_id] = rooms_ok
+
+    valid_mpps = [mpp_by_plan[pid] for pid, ok in valid_room_area_by_plan.items() if ok and mpp_by_plan.get(pid, 0.0) > 0]
+    fallback_mpp = float(sum(valid_mpps) / len(valid_mpps)) if valid_mpps else 0.0
+
+    floor_map: dict[int, str] = {}
+    if run_id:
+        floor_map = _floor_idx_to_plan_id_map_from_run(out_root, run_id)
+    if not floor_map:
+        floor_map = {i: pd.name for i, pd in enumerate(plan_dirs)}
+
+    for floor_idx, plan_id in sorted(floor_map.items(), key=lambda t: t[0]):
+        mpp = float(mpp_by_plan.get(plan_id) or 0.0)
+        if mpp <= 0:
+            continue
+        if not valid_room_area_by_plan.get(plan_id, False) and fallback_mpp > 0:
+            out[str(floor_idx)] = fallback_mpp
+        else:
             out[str(floor_idx)] = mpp
-            floor_idx += 1
     return out
 
 
@@ -307,25 +470,30 @@ def _compute_rectangle_inputs_for_gemini(
     out_root: Path,
     meters_per_pixel_by_floor: dict[str, Any] | None,
     overhang_m: float,
+    run_id: str,
 ) -> list[dict[str, Any]]:
     rect_json = _read_json(out_root / "roof" / "roof_3d" / "roof_rectangles_edited.json")
-    rect_walls_json = _read_json(out_root / "roof" / "roof_3d" / "roof_rectangles_edited_walls.json")
-    win_json = _read_json(out_root / "roof" / "roof_3d" / "roof_windows_edited.json")
+    rect_walls_json = _read_json(out_root / "roof" / "roof_3d" / "roof_rectangles_edited_walls.json") or {}
+    win_json = _read_json(out_root / "roof" / "roof_3d" / "roof_windows_edited.json") or {}
     rect_root = out_root / "roof" / "roof_3d" / "rectangles"
     if not isinstance(rect_json, dict):
         return []
     out: list[dict[str, Any]] = []
     mpp_fallback_by_floor = _load_mpp_by_floor_from_scale(out_root)
-    for floor_key, rects in rect_json.items():
+    windows_by_roof = _windows_by_roof_floor(
+        win_json if isinstance(win_json, dict) else {},
+        rect_json,
+        run_id,
+    )
+    for floor_idx, rects in _iter_edited_rectangles_roof_order(rect_json, run_id):
         if not isinstance(rects, list):
             continue
-        floor_idx = int(floor_key) if str(floor_key).isdigit() else 0
         raw_mpp = float((meters_per_pixel_by_floor or {}).get(str(floor_idx)) or 0.0)
         if raw_mpp <= 0:
             raw_mpp = float(mpp_fallback_by_floor.get(str(floor_idx)) or 0.0)
         if raw_mpp <= 0:
             raw_mpp = 0.01
-        windows_floor = win_json.get(str(floor_idx), []) if isinstance(win_json, dict) else []
+        windows_floor = windows_by_roof.get(floor_idx, [])
         walls_floor = rect_walls_json.get(str(floor_idx), []) if isinstance(rect_walls_json, dict) else []
         for rect_idx, rect in enumerate(rects):
             if not isinstance(rect, dict):
@@ -375,6 +543,7 @@ def _compute_rectangle_inputs_for_gemini(
             cx = sum(float(p[0]) for p in pts) / len(pts)
             cy = sum(float(p[1]) for p in pts) / len(pts)
             n_ext, n_int = _count_polygon_corner_types(pts)
+            rect_oh = _rect_overhang_m(rect, overhang_m)
 
             windows_for_rect: list[dict[str, Any]] = []
             sum_windows_m2 = 0.0
@@ -414,7 +583,7 @@ def _compute_rectangle_inputs_for_gemini(
                 "meters_per_pixel": round(mpp, 8),
                 "amprenta_fara_overhang_m2": round(area_m2, 4),
                 "perimetru_fara_overhang_m": round(perimeter_m, 4),
-                "overhang_m": round(float(overhang_m), 4),
+                "overhang_m": round(float(rect_oh), 4),
                 "nr_colturi_exterioare": n_ext,
                 "nr_colturi_interioare": n_int,
                 "suprafata_geamuri_m2": round(sum_windows_m2, 4),
@@ -530,7 +699,12 @@ def _get_out_root(run_id: str) -> Path | None:
     return out if out.exists() else None
 
 
-def _extract_rectangle_measurements(out_root: Path, meters_per_pixel_by_floor: dict[str, Any] | None, overhang_m: float = 0.4) -> list[dict[str, Any]]:
+def _extract_rectangle_measurements(
+    out_root: Path,
+    meters_per_pixel_by_floor: dict[str, Any] | None,
+    overhang_m: float = 0.4,
+    run_id: str = "",
+) -> list[dict[str, Any]]:
     """
     Build per-rectangle roof measurements from roof_rectangles_edited.json.
     Returns for each rectangle:
@@ -549,10 +723,22 @@ def _extract_rectangle_measurements(out_root: Path, meters_per_pixel_by_floor: d
         return []
 
     out: list[dict[str, Any]] = []
-    for floor_key, rects in edited.items():
+    floor_rect_pairs = _iter_edited_rectangles_roof_order(edited, run_id) if run_id else []
+    if not floor_rect_pairs:
+        for floor_key, rects in edited.items():
+            sk = str(floor_key)
+            if sk.startswith("_") or not isinstance(rects, list):
+                continue
+            try:
+                fk = int(floor_key)
+            except (TypeError, ValueError):
+                continue
+            floor_rect_pairs.append((fk, rects))
+        floor_rect_pairs.sort(key=lambda t: t[0])
+    for floor_idx, rects in floor_rect_pairs:
         if not isinstance(rects, list):
             continue
-        mpp = float((meters_per_pixel_by_floor or {}).get(str(floor_key)) or 0.0)
+        mpp = float((meters_per_pixel_by_floor or {}).get(str(floor_idx)) or 0.0)
         if mpp <= 0:
             mpp = 0.01
         for idx, rect in enumerate(rects):
@@ -576,7 +762,8 @@ def _extract_rectangle_measurements(out_root: Path, meters_per_pixel_by_floor: d
                 base_area_m2 = (w_px * h_px) * (mpp ** 2)
                 area_without_overhang_m2 = base_area_m2 * slope_factor
 
-                overhang_px = float(overhang_m) / float(mpp)
+                oh_m = _rect_overhang_m(rect, overhang_m)
+                overhang_px = float(oh_m) / float(mpp)
                 w_ov_px = max(0.0, w_px + 2.0 * overhang_px)
                 h_ov_px = max(0.0, h_px + 2.0 * overhang_px)
                 base_area_with_ov_m2 = (w_ov_px * h_ov_px) * (mpp ** 2)
@@ -584,7 +771,7 @@ def _extract_rectangle_measurements(out_root: Path, meters_per_pixel_by_floor: d
 
                 perimeter_with_overhang_m = (2.0 * (w_ov_px + h_ov_px)) * mpp
                 out.append({
-                    "floor_idx": int(floor_key) if str(floor_key).isdigit() else 0,
+                    "floor_idx": int(floor_idx),
                     "rectangle_idx": idx,
                     "roof_type": rect.get("roofType"),
                     "roof_angle_deg": round(angle_deg, 2),
@@ -620,7 +807,11 @@ def _sum_masks_area_contour(folder: Path) -> tuple[float, float]:
     return total_area, total_contour
 
 
-def _extract_rectangle_measurements_from_3d(out_root: Path, meters_per_pixel_by_floor: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _extract_rectangle_measurements_from_3d(
+    out_root: Path,
+    meters_per_pixel_by_floor: dict[str, Any] | None,
+    run_id: str = "",
+) -> list[dict[str, Any]]:
     """
     Preferred path: use per-rectangle 3D unfold masks generated by clean_workflow.
     """
@@ -632,6 +823,11 @@ def _extract_rectangle_measurements_from_3d(out_root: Path, meters_per_pixel_by_
         edited = json.loads(edited_path.read_text(encoding="utf-8"))
     except Exception:
         edited = {}
+    if not isinstance(edited, dict):
+        edited = {}
+    by_roof: dict[int, list[Any]] = {}
+    if run_id:
+        by_roof = {ri: rects for ri, rects in _iter_edited_rectangles_roof_order(edited, run_id)}
     out: list[dict[str, Any]] = []
     for floor_dir in sorted(rect3d_root.glob("floor_*")):
         if not floor_dir.is_dir():
@@ -643,7 +839,9 @@ def _extract_rectangle_measurements_from_3d(out_root: Path, meters_per_pixel_by_
         mpp = float((meters_per_pixel_by_floor or {}).get(str(floor_idx)) or 0.0)
         if mpp <= 0:
             mpp = 0.01
-        floor_rects = edited.get(str(floor_idx)) if isinstance(edited, dict) else None
+        floor_rects = by_roof.get(floor_idx) if by_roof else None
+        if floor_rects is None:
+            floor_rects = edited.get(str(floor_idx)) if isinstance(edited, dict) else None
         for rect_dir in sorted(floor_dir.glob("rectangle_S*")):
             if not rect_dir.is_dir():
                 continue
@@ -680,6 +878,51 @@ def _extract_rectangle_measurements_from_3d(out_root: Path, meters_per_pixel_by_
     return out
 
 
+def _floor_idx_to_plan_id_map_from_run(out_root: Path, run_id: str) -> dict[int, str]:
+    """
+    floor_idx din rectangles/metrics = index în același sistem ca roof_floor_plan_ids.json
+    (scris la etapa roof). Preferăm fișierul de pe disc ca să coincidă cu geometria salvată.
+    """
+    pth = out_root / "roof" / "roof_3d" / "roof_floor_plan_ids.json"
+    if pth.exists():
+        try:
+            raw = json.loads(pth.read_text(encoding="utf-8"))
+            m = {int(k): str(v) for k, v in raw.items()}
+            if m:
+                return m
+        except Exception:
+            pass
+    try:
+        from roof.jobs import resolve_plans_roof_order
+
+        plans_roof, _, _ = resolve_plans_roof_order(run_id)
+        if plans_roof:
+            return {i: p.plan_id for i, p in enumerate(plans_roof)}
+    except Exception:
+        pass
+    return {}
+
+
+def _attach_plan_id_to_rectangle_rows(
+    out_root: Path,
+    run_id: str,
+    rows: list[Any],
+) -> None:
+    m = _floor_idx_to_plan_id_map_from_run(out_root, run_id)
+    if not m:
+        return
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            fi = int(r.get("floor_idx", 0))
+        except (TypeError, ValueError):
+            fi = 0
+        pid = m.get(fi)
+        if pid:
+            r["plan_id"] = str(pid)
+
+
 def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Path | None:
     """
     Generează roof_pricing.json în roof/roof_3d/entire/mixed/.
@@ -697,6 +940,8 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
 
     with open(metrics_path, encoding="utf-8") as f:
         metrics = json.load(f)
+
+    roof_only_offer = bool((frontend_data or {}).get("roof_only_offer"))
 
     # Prefer explicit unfolded metrics to avoid any overlap/double-count issues.
     total = metrics.get("total") or {}
@@ -878,26 +1123,41 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
         })
         subtotal_before_services += cost
 
-    # Dachfenster (Stück): formular „Dachfenster einplanen“ + tip; cantitate din editor (roof_windows_edited.json)
-    roof_only_offer = bool((frontend_data or {}).get("roof_only_offer"))
+    # Dachfenster: preferă suprafață din editor (Breite×Länge în m) × Preis €/m² (dachfenster_m2_price);
+    # altfel Stück × Preis/Stück (roof_windows_edited.json).
     want_dachfenster = bool(dd.get("dachfensterImDach"))
     dachfenster_typ = str(dd.get("dachfensterTyp") or "").strip() or "Standard"
     if want_dachfenster and out_root:
         n_df = _count_roof_windows(out_root)
+        area_df_m2 = _sum_roof_window_area_m2_from_editor(out_root)
+        price_m2 = _price("dachfenster_m2_price", 0.0)
         if n_df > 0:
             pair = DACHFENSTER_TYP_TO_KEYS.get(dachfenster_typ, DACHFENSTER_TYP_TO_KEYS["Standard"])
             pk = pair[1] if roof_only_offer else pair[0]
             fb = float(DACHFENSTER_FALLBACK_EUR.get(dachfenster_typ, DACHFENSTER_FALLBACK_EUR["Standard"]))
-            price_df = _price(pk, fb)
-            if price_df > 0:
-                cost_df = round(n_df * price_df, 2)
+            price_stück = _price(pk, fb)
+            if area_df_m2 > 0 and price_m2 > 0:
+                cost_df = round(area_df_m2 * price_m2, 2)
+                items.append({
+                    "category": "roof_skylights",
+                    "name": "Dachfenster",
+                    "details": f"Ausführung: {dachfenster_typ}; Fläche aus Editor: {area_df_m2:.2f} m²",
+                    "quantity": round(area_df_m2, 4),
+                    "unit": "m²",
+                    "unit_price": price_m2,
+                    "cost": cost_df,
+                    "material": dachfenster_typ,
+                })
+                subtotal_before_services += cost_df
+            elif price_stück > 0:
+                cost_df = round(n_df * price_stück, 2)
                 items.append({
                     "category": "roof_skylights",
                     "name": "Dachfenster",
                     "details": f"Ausführung: {dachfenster_typ} ({n_df} Stück)",
                     "quantity": float(n_df),
                     "unit": "Stück",
-                    "unit_price": price_df,
+                    "unit_price": price_stück,
                     "cost": cost_df,
                     "material": dachfenster_typ,
                 })
@@ -942,24 +1202,58 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
             "area_m2": total_combined.get("area_m2"),
             "contour_m": total_combined.get("contour_m"),
         }
+    mpp_by_floor_for_rectangles: dict[str, Any] = metrics.get("meters_per_pixel_by_floor") or {}
+    if roof_only_offer:
+        mpp_from_scale = _load_mpp_by_floor_from_scale(out_root, run_id=run_id)
+        if mpp_from_scale:
+            mpp_by_floor_for_rectangles = mpp_from_scale
+            print(
+                f"🔸 [ROOF PRICING] roof_only_offer: folosesc m/px din Scale(09_interior) pentru suprafețe roof: {mpp_by_floor_for_rectangles}",
+                flush=True,
+            )
+
     by_rect = _extract_rectangle_measurements_from_3d(
         out_root=out_root,
-        meters_per_pixel_by_floor=metrics.get("meters_per_pixel_by_floor") or {},
+        meters_per_pixel_by_floor=mpp_by_floor_for_rectangles,
+        run_id=run_id,
     )
     if not by_rect:
         by_rect = _extract_rectangle_measurements(
             out_root=out_root,
-            meters_per_pixel_by_floor=metrics.get("meters_per_pixel_by_floor") or {},
+            meters_per_pixel_by_floor=mpp_by_floor_for_rectangles,
             overhang_m=_price("overhang_m", 0.4),
+            run_id=run_id,
         )
     roof_measurements["by_rectangle"] = by_rect
+
+    # roof_only: aria finală pentru pricing vine din poligoane + m/px (09_interior), nu din roof_metrics total.
+    if roof_only_offer and isinstance(by_rect, list) and by_rect:
+        try:
+            area_wo = 0.0
+            area_w = 0.0
+            perim = 0.0
+            for r in by_rect:
+                if not isinstance(r, dict):
+                    continue
+                area_wo += float(r.get("roof_area_without_overhang_m2") or 0.0)
+                area_w += float(r.get("roof_area_with_overhang_m2") or 0.0)
+                perim += float(r.get("roof_perimeter_with_overhang_m") or 0.0)
+            if area_wo > 0 and area_w > 0:
+                area_without_overhang = area_wo
+                area_with_overhang = area_w
+                overhang_area = max(0.0, area_with_overhang - area_without_overhang)
+            if perim > 0:
+                contour_m = perim
+        except Exception:
+            pass
 
     # Rectangle-level inputs and Gemini estimation per rectangle.
     overhang_m = _price("overhang_m", 0.4)
     rect_inputs = _compute_rectangle_inputs_for_gemini(
         out_root=out_root,
-        meters_per_pixel_by_floor=metrics.get("meters_per_pixel_by_floor") or {},
+        meters_per_pixel_by_floor=mpp_by_floor_for_rectangles,
         overhang_m=overhang_m,
+        run_id=run_id,
     )
     roof_measurements["by_rectangle_input"] = rect_inputs
 
@@ -1022,7 +1316,7 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
         by_rect_ai.append(rec)
     if by_rect_ai:
         roof_measurements["by_rectangle"] = by_rect_ai
-    if sum_ai_without > 0 and sum_ai_with > 0:
+    if not roof_only_offer and sum_ai_without > 0 and sum_ai_with > 0:
         area_without_overhang = sum_ai_without
         area_with_overhang = sum_ai_with
         overhang_area = max(0.0, area_with_overhang - area_without_overhang)
@@ -1043,6 +1337,10 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
     roof_measurements["roof_area_overhang_only_m2"] = round(overhang_area, 4)
     roof_measurements["roof_area_with_overhang_m2"] = round(area_with_overhang, 4)
 
+    br_final = roof_measurements.get("by_rectangle")
+    if isinstance(br_final, list):
+        _attach_plan_id_to_rectangle_rows(out_root, run_id, br_final)
+
     items, subtotal_before_services, _tin, total_cost = _recompute_roof_items_costs(
         items=items,
         area_without_overhang=area_without_overhang,
@@ -1060,6 +1358,7 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
             "dachfensterImDach": bool(dd.get("dachfensterImDach")),
             "dachfensterTyp": dachfenster_typ if want_dachfenster else None,
             "dachfenster_count": _count_roof_windows(out_root) if out_root else 0,
+            "dachfenster_area_m2": round(_sum_roof_window_area_m2_from_editor(out_root), 4) if out_root else 0.0,
             "projektumfang": projektumfang,
             "nutzungDachraum": nutzung_dachraum,
             "deckenInnenausbau": decken_innenausbau,

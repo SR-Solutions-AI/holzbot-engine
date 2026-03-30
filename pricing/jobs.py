@@ -84,6 +84,33 @@ def _count_floors_with_stairs(run_id: str, plans: List[PlanInfo]) -> int:
             floors_with_stairs += 1
     return floors_with_stairs
 
+
+def _count_stairs_from_detections_review(run_id: str, plans: List[PlanInfo]) -> int | None:
+    """Număr total deschideri tip „stairs” din detections_review_data.json (toate planurile). None dacă nu există niciun fișier."""
+    run_dir = get_run_dir(run_id)
+    total = 0
+    found_any = False
+    for plan in plans:
+        p = run_dir / "scale" / plan.plan_id / "cubicasa_steps" / "raster" / "detections_review_data.json"
+        if not p.exists():
+            continue
+        found_any = True
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        doors = data.get("doors") if isinstance(data, dict) else []
+        if not isinstance(doors, list):
+            continue
+        for d in doors:
+            if not isinstance(d, dict):
+                continue
+            t = str(d.get("type", "")).lower().strip()
+            if t in ("stairs", "treppe"):
+                total += 1
+    return total if found_any else None
+
+
 def _apply_allowed_categories(result: dict, allowed: list[str] | None) -> dict:
     """
     Filters pricing breakdown based on allowed categories coming from offer_types.allowed_pricing_categories.
@@ -449,6 +476,9 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
 
     total_plans = len(plans)
     frontend_data["_stairs_floors_count"] = _count_floors_with_stairs(run_id, plans)
+    stairs_from_review = _count_stairs_from_detections_review(run_id, plans)
+    if stairs_from_review is not None:
+        frontend_data["_stairs_total_count"] = stairs_from_review
     basement_plan_index = None
     try:
         run_dir = get_run_dir(run_id)

@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 
-def calculate_stairs_details(coeffs: dict, total_floors: int, stairs_floors_count: int | None = None, stair_type: str | None = None) -> dict:
+def calculate_stairs_details(
+    coeffs: dict,
+    total_floors: int,
+    stairs_floors_count: int | None = None,
+    stair_type: str | None = None,
+    stairs_total_count: int | None = None,
+) -> dict:
     """
-    Calculează costul scărilor bazat pe numărul de etaje.
-    Formula: (Număr Etaje - 1) * Preț Unitar.
-    
-    Exemplu:
-      - 1 etaj (Parter) -> 0 scări
-      - 2 etaje (P+1) -> 1 scară
-      - 3 etaje (P+2) -> 2 scări
+    Cost scări: număr bucăți × (preț structură + balustradă).
+    Prioritate: `stairs_total_count` = număr total deschideri „stairs” din editor (detections_review),
+    apoi `stairs_floors_count` (etaje cu cel puțin o scară din măsurători raster),
+    altfel max(0, total_floors - 1).
     """
-    # Numărul de scări: etaje care conțin efectiv "stairs" (dacă e disponibil), altfel fallback clasic.
-    num_stairs = int(stairs_floors_count) if isinstance(stairs_floors_count, int) and stairs_floors_count >= 0 else max(0, total_floors - 1)
+    if isinstance(stairs_total_count, int) and stairs_total_count >= 0:
+        num_stairs = stairs_total_count
+    elif isinstance(stairs_floors_count, int) and stairs_floors_count >= 0:
+        num_stairs = int(stairs_floors_count)
+    else:
+        num_stairs = max(0, total_floors - 1)
     
     if num_stairs == 0:
         return {"total_cost": 0.0, "detailed_items": []}

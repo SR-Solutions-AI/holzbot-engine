@@ -11,56 +11,54 @@ def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float
 
 def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data: dict | None = None) -> dict:
     """
-    Cost deschideri: arie = lățime × înălțime.
-    Pentru ferestre: folosim height_m din editor/raster când există, altfel euristică din lățime.
-    Uși: un preț €/m² interior, unul exterior. Ferestre: preț 2-fach sau 3-fach (din formular Fensterart).
+    Ferestre: cost = suprafață (m²) × preț €/m² (Fensterart din formular).
+    Uși normale: cost = preț €/Stück după tipul Innen/Außen selectat (o bucată = o deschidere în plan).
+    Garagentor: cost = preț €/Stück după tip, doar dacă „Garagentor gewünscht“ e bifat în formular.
     """
     items = []
     total = 0.0
 
     ferestre_usi = frontend_data.get("ferestreUsi", {}) if frontend_data else {}
-    # Înălțimi doar pentru calculul ariei (nu pentru preț)
-    door_height_m = 2.05
-
-    if frontend_data and ferestre_usi:
-        # Türhöhe → înălțime uși (doar pentru suprafață)
-        turhohe = ferestre_usi.get("turhohe", "")
-        if turhohe == "Erhöht / Sondermaß (2,2+ m)":
-            door_height_m = 2.2
-        elif turhohe == "Standard (2m)":
-            door_height_m = 2.0
-
-    # Prețuri: uși interior/exterior (€/m²) – per material dacă e selectat, altfel fallback la un singur preț
-    door_int_prices = coeffs.get("door_interior_prices", {})
-    door_ext_prices = coeffs.get("door_exterior_prices", {})
-    door_int_price = float(coeffs.get("door_interior_price_per_m2", 0))
-    door_ext_price = float(coeffs.get("door_exterior_price_per_m2", 0))
+    door_int_prices = coeffs.get("door_interior_prices", {}) or {}
+    door_ext_prices = coeffs.get("door_exterior_prices", {}) or {}
     door_material_int = (ferestre_usi.get("doorMaterialInterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
     door_material_ext = (ferestre_usi.get("doorMaterialExterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
-    if door_int_prices and door_material_int in door_int_prices:
-        door_int_price = float(door_int_prices[door_material_int])
-    if door_ext_prices and door_material_ext in door_ext_prices:
-        door_ext_price = float(door_ext_prices[door_material_ext])
+    door_price_int = float(door_int_prices.get(door_material_int, 0))
+    door_price_ext = float(door_ext_prices.get(door_material_ext, 0))
 
     windows_prices = coeffs.get("windows_price_per_m2", {})
     window_quality = (ferestre_usi.get("windowQuality", "3-fach verglast") if frontend_data else "3-fach verglast")
     window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
-    garage_prices = coeffs.get("garage_door_prices", {})
+
+    garage_prices = coeffs.get("garage_door_prices", {}) or {}
     garage_type = (ferestre_usi.get("garageDoorType", "Sektionaltor Standard") if frontend_data else "Sektionaltor Standard")
-    has_garage = bool((frontend_data or {}).get("structuraCladirii", {}).get("hasGarage")) if frontend_data else False
-    garage_price_per_m2 = float(garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", door_ext_price)))
+    wants_garage_door = bool(ferestre_usi.get("garagentorGewuenscht")) if frontend_data else False
+    garage_price_piece = float(
+        garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", 0)),
+    )
 
     for op in openings_list:
         obj_type = op.get("type", "unknown")
+        ot = str(obj_type).lower()
         width = float(op.get("width_m", 0.0))
-        if obj_type == "garage_door":
+        if ot == "garage_door":
             explicit_h = op.get("height_m")
             if explicit_h is not None and float(explicit_h) > 0:
                 height = float(explicit_h)
             else:
                 height = 2.1
-        elif "door" in obj_type:
-            height = door_height_m
+        elif "window" in ot:
+            explicit_h = op.get("height_m")
+            if explicit_h is not None and float(explicit_h) > 0:
+                height = float(explicit_h)
+            else:
+                height = _infer_window_height_from_width(width, obj_type)
+        elif "door" in ot:
+            explicit_h = op.get("height_m")
+            if explicit_h is not None and float(explicit_h) > 0:
+                height = float(explicit_h)
+            else:
+                height = 2.05
         else:
             explicit_h = op.get("height_m")
             if explicit_h is not None and float(explicit_h) > 0:
@@ -69,30 +67,35 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
                 height = _infer_window_height_from_width(width, obj_type)
         area = width * height
 
-        if obj_type == "garage_door":
-            is_exterior = True
-            price_per_m2 = garage_price_per_m2 if has_garage else door_ext_price
+        if ot == "garage_door":
+            if not wants_garage_door:
+                continue
+            cost = garage_price_piece
+            unit_label = "€/Stück"
+            price_factor = garage_price_piece
+            material_label = garage_type
             door_status = "exterior"
-        elif "door" in obj_type:
+            is_exterior = True
+        elif "door" in ot:
             is_exterior = op.get("status") == "exterior"
-            price_per_m2 = door_ext_price if is_exterior else door_int_price
+            cost = door_price_ext if is_exterior else door_price_int
+            unit_label = "€/Stück"
+            price_factor = cost
+            material_label = door_material_ext if is_exterior else door_material_int
             door_status = op.get("status", "interior")
         else:
             is_exterior = True
-            price_per_m2 = window_price_per_m2
+            cost = area * window_price_per_m2
+            unit_label = "€/m²"
+            price_factor = window_price_per_m2
+            material_label = window_quality
             door_status = None
 
-        cost = area * price_per_m2
         total += cost
 
-        material_label = "Interior" if not is_exterior and "door" in obj_type else ("Exterior" if "door" in obj_type else window_quality)
-        if obj_type == "garage_door":
-            material_label = garage_type
-        elif "door" in obj_type:
-            material_label = door_material_int if not is_exterior else door_material_ext
         items.append({
             "id": op.get("id"),
-            "name": f"{obj_type.replace('_', ' ').title()} #{op.get('id')}",
+            "name": f"{str(obj_type).replace('_', ' ').title()} #{op.get('id')}",
             "type": obj_type,
             "location": "Exterior" if is_exterior else "Interior",
             "status": door_status if door_status else ("exterior" if is_exterior else "interior"),
@@ -101,8 +104,9 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
             "height_m": round(height, 2),
             "dimensions_m": f"{width:.2f} x {height:.2f}",
             "area_m2": round(area, 2),
-            "unit_price": price_per_m2,
-            "total_cost": round(cost, 2)
+            "unit_price": round(price_factor, 2),
+            "price_unit": unit_label,
+            "total_cost": round(cost, 2),
         })
 
     return {

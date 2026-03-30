@@ -140,6 +140,8 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "roofonly_dachfenster_stueck_roto": data_map.get("roofonly_dachfenster_stueck_roto", 820),
             "roofonly_dachfenster_stueck_fakro": data_map.get("roofonly_dachfenster_stueck_fakro", 850),
             "roofonly_dachfenster_stueck_sonstiges": data_map.get("roofonly_dachfenster_stueck_sonstiges", 750),
+            # Dachfenster €/m² (Fläche aus Editor: Breite×Länge); wenn 0 → Fallback Stückpreis
+            "dachfenster_m2_price": float(data_map.get("dachfenster", 0) or 0),
         },
         "finishes": {
             "interior": {
@@ -169,37 +171,42 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             }
         },
         "openings": {
-            # Uși: preț per m² per material (interior / exterior); fallback la un singur preț dacă opțiunea lipsește
-            "door_interior_price_per_m2": data_map.get("door_interior_price", data_map.get("door_standard_2m_price", 0)),
-            "door_exterior_price_per_m2": data_map.get("door_exterior_price", data_map.get("door_standard_2m_price", 0)),
+            # Uși normale: preț €/Stück per tip (Innen/Außen) – același câmp în formular ca „Türtyp“
             "door_interior_prices": {
-                "Standard": data_map.get("door_interior_standard", data_map.get("door_interior_price", 380)),
-                "Holz": data_map.get("door_interior_holz", 420),
-                "Glas": data_map.get("door_interior_glas", 520),
-                "Weiß lackiert": data_map.get("door_interior_weiss_lackiert", 400),
+                "Standard": float(data_map.get("door_interior_standard", data_map.get("door_interior_price", 320))),
+                "Holz": float(data_map.get("door_interior_holz", 580)),
+                "Glas": float(data_map.get("door_interior_glas", 890)),
+                "Weiß lackiert": float(data_map.get("door_interior_weiss_lackiert", 420)),
             },
             "door_exterior_prices": {
-                "Standard": data_map.get("door_exterior_standard", data_map.get("door_exterior_price", 480)),
-                "Holz": data_map.get("door_exterior_holz", 550),
-                "Aluminium": data_map.get("door_exterior_aluminium", 620),
-                "Kunststoff": data_map.get("door_exterior_kunststoff", 420),
+                "Standard": float(data_map.get("door_exterior_standard", data_map.get("door_exterior_price", 1450))),
+                "Holz": float(data_map.get("door_exterior_holz", 2200)),
+                "Aluminium": float(data_map.get("door_exterior_aluminium", 2800)),
+                "Kunststoff": float(data_map.get("door_exterior_kunststoff", 1600)),
             },
-            # Ferestre: doar 2 straturi sau 3 straturi (alegere din formular Fensterart)
+            # Ferestre: €/m² (Fensterart)
             "windows_price_per_m2": {
                 "2-fach verglast": data_map.get("window_2_fach_price", data_map.get("window_3fach_verglast_price", 320)),
                 "3-fach verglast": data_map.get("window_3_fach_price", data_map.get("window_3fach_verglast_price", 420)),
                 "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
             },
+            # Garagentor: €/Stück (doar dacă formular: Garagentor gewünscht)
             "garage_door_prices": {
-                "Sektionaltor Standard": data_map.get("garage_door_standard_price", 360),
-                "Sektionaltor Premium": data_map.get("garage_door_premium_price", 470),
-                "Rolltor": data_map.get("garage_door_rolltor_price", 420),
+                "Sektionaltor Standard": float(
+                    data_map.get("garage_door_sektional_standard_stueck", data_map.get("garage_door_standard_price", 2400))
+                ),
+                "Sektionaltor Premium": float(
+                    data_map.get("garage_door_sektional_premium_stueck", data_map.get("garage_door_premium_price", 3200))
+                ),
+                "Rolltor": float(data_map.get("garage_door_rolltor_stueck", data_map.get("garage_door_rolltor_price", 2100))),
+                "Schwingtor": float(data_map.get("garage_door_schwingtor_stueck", 2600)),
+                "Seiten-Sektionaltor": float(data_map.get("garage_door_seiten_sektional_stueck", 3800)),
             },
         },
         "area": {
             "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0),
             "ceiling_coefficient_per_m2": data_map.get("ceiling_coeff_per_m2", 0),
-            # Geschosshöhe: înălțimi (m) per opțiune – folosite la calculul ariilor pereți, nu la preț
+            # Raumhöhe (floor_height): înălțimi (m) per opțiune – folosite la calculul ariilor pereți, nu la preț
             "floor_height_m": {
                 "Standard (2,50 m)": float(data_map.get("inaltime_etaje_standard_m", 2.5)),
                 "Komfort (2,70 m)": float(data_map.get("inaltime_etaje_komfort_m", 2.7)),

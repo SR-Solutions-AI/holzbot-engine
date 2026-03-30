@@ -405,7 +405,7 @@ _ROOF_SECTION_COLORS_BGR: List[tuple[int, int, int]] = [
 
 
 _ROOF_TYPE_IDS = frozenset({"0_w", "1_w", "2_w", "4_w", "4.5_w"})
-_DEFAULT_ROOF_ANGLE_DEG = 30.0
+_DEFAULT_ROOF_ANGLE_DEG = 16.0
 _DEFAULT_ROOF_TYPE = "2_w"
 
 
@@ -431,10 +431,49 @@ def _normalize_roof_type(r: Any) -> str:
     return _DEFAULT_ROOF_TYPE
 
 
+def _edited_entries_as_roof_indices(
+    edited: dict,
+    plans_list: List[PlanInfo],
+    plans_roof: List[PlanInfo],
+) -> list[tuple[int, list[Any]]]:
+    """
+    Chei din roof_rectangles_edited.json:
+    - _floor_key_scheme == \"manifest\": k = index tab / plans_list (ca în manifest), mapat la index plans_roof.
+    - altfel (legacy): k este deja index în plans_roof (comportament vechi API: plan_id → acel index).
+    """
+    scheme = edited.get("_floor_key_scheme")
+    out: list[tuple[int, list[Any]]] = []
+    for floor_key, rects in edited.items():
+        sk = str(floor_key)
+        if sk.startswith("_"):
+            continue
+        if not isinstance(rects, list):
+            continue
+        try:
+            k = int(floor_key)
+        except Exception:
+            continue
+        if scheme == "manifest":
+            if k < 0 or k >= len(plans_list):
+                continue
+            pid = plans_list[k].plan_id
+            roof_i = next((i for i, p in enumerate(plans_roof) if p.plan_id == pid), None)
+            if roof_i is None:
+                continue
+            out.append((roof_i, rects))
+        else:
+            if k < 0 or k >= len(plans_roof):
+                continue
+            out.append((k, rects))
+    return out
+
+
 def derive_floor_roof_settings_from_edited(
     edited: dict,
     num_floors: int,
     basement_idx: Optional[int],
+    plans_list: List[PlanInfo],
+    plans_roof: List[PlanInfo],
 ) -> tuple[dict[int, float], dict[int, Optional[str]]]:
     """
     Din roof_rectangles_edited.json: unghi mediu ponderat (suprafață) și tip dominant (suprafață max)
@@ -443,11 +482,7 @@ def derive_floor_roof_settings_from_edited(
     floor_angles: dict[int, float] = {}
     floor_types: dict[int, Optional[str]] = {}
 
-    for floor_key, rects in edited.items():
-        try:
-            floor_idx = int(floor_key)
-        except Exception:
-            continue
+    for floor_idx, rects in _edited_entries_as_roof_indices(edited, plans_list, plans_roof):
         if floor_idx < 0 or floor_idx >= num_floors:
             continue
         if floor_idx == basement_idx:
@@ -525,10 +560,14 @@ def _write_floor_roof_json_from_edited(
     roof_3d_dir: Path,
     edited: dict,
     num_floors: int,
+    plans_list: List[PlanInfo],
+    plans_roof: List[PlanInfo],
 ) -> None:
     """Sincronizează floor_roof_angles.json / floor_roof_types.json cu editorul."""
     bi = _basement_floor_index_from_roof_3d(roof_3d_dir)
-    angles, types = derive_floor_roof_settings_from_edited(edited, num_floors, bi)
+    angles, types = derive_floor_roof_settings_from_edited(
+        edited, num_floors, bi, plans_list, plans_roof
+    )
     fra_path = roof_3d_dir / "floor_roof_angles.json"
     frt_path = roof_3d_dir / "floor_roof_types.json"
     try:
@@ -569,7 +608,12 @@ def _blend_polygon_over_wall_mask(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: List[PlanInfo]) -> bool:
+def _apply_edited_roof_rectangles(
+    run_id: str,
+    roof_3d_dir: Path,
+    plans_roof: List[PlanInfo],
+    plans_list: List[PlanInfo],
+) -> bool:
     """
     Aplică editările din roof_rectangles_edited.json peste roof_3d/rectangles/floor_X
     și recalculează metrici aggregate (entire/mixed/roof_metrics.json) pe noile dreptunghiuri.
@@ -595,14 +639,8 @@ def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: Li
     # Also persist a walls-coordinate version of the edited polygons for holzbot-roof (3D + overhang).
     edited_walls: dict[str, list[dict]] = {}
 
-    for floor_key, rects in edited.items():
-        try:
-            floor_idx = int(floor_key)
-        except Exception:
-            continue
+    for floor_idx, rects in _edited_entries_as_roof_indices(edited, plans_list, plans_roof):
         if floor_idx < 0 or floor_idx >= len(plans_roof):
-            continue
-        if not isinstance(rects, list):
             continue
 
         wall_mask = OUTPUT_ROOT / run_id / "scale" / plans_roof[floor_idx].plan_id / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "01_walls_from_coords.png"
@@ -663,6 +701,8 @@ def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: Li
                     row["roofAngleDeg"] = r.get("roofAngleDeg")
                 if r.get("roofType") is not None:
                     row["roofType"] = r.get("roofType")
+                if r.get("roofOverhangM") is not None:
+                    row["roofOverhangM"] = r.get("roofOverhangM")
                 if r.get("roomName") is not None:
                     row["roomName"] = r.get("roomName")
             edited_walls[str(floor_idx)].append(row)
@@ -707,7 +747,7 @@ def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: Li
     mixed_dir = roof_3d_dir / "entire" / "mixed"
     mixed_dir.mkdir(parents=True, exist_ok=True)
     (mixed_dir / "roof_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    _write_floor_roof_json_from_edited(roof_3d_dir, edited, len(plans_roof))
+    _write_floor_roof_json_from_edited(roof_3d_dir, edited, len(plans_roof), plans_list, plans_roof)
 
     # Save walls-coordinate polygons for holzbot-roof (expects same coordinates as wall masks).
     try:
@@ -721,7 +761,9 @@ def _apply_edited_roof_rectangles(run_id: str, roof_3d_dir: Path, plans_roof: Li
     # are recalculated from the editor geometry, not kept from a previous run.
     try:
         basement_idx = _basement_floor_index_from_roof_3d(roof_3d_dir)
-        edited_angles, edited_types = derive_floor_roof_settings_from_edited(edited, len(plans_roof), basement_idx)
+        edited_angles, edited_types = derive_floor_roof_settings_from_edited(
+            edited, len(plans_roof), basement_idx, plans_list, plans_roof
+        )
         rerun_dir = _run_roof_3d_workflow(
             run_id,
             plans_roof,
@@ -802,11 +844,11 @@ def apply_roof_edits_from_disk(run_id: str) -> bool:
     if not (roof_3d_dir / "roof_rectangles_edited.json").exists():
         return False
     try:
-        plans_roof, _, _ = resolve_plans_roof_order(run_id)
+        plans_roof, _, plans_list = resolve_plans_roof_order(run_id)
     except Exception as e:
         print(f"       ⚠️ [roof] apply_roof_edits_from_disk: {e}", flush=True)
         return False
-    return _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+    return _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof, plans_list)
 
 
 def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_events: bool = True) -> List[RoofJobResult]:
@@ -988,7 +1030,7 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
             edited_ov = json.loads(roof_3d_edits.read_text(encoding="utf-8"))
             if isinstance(edited_ov, dict) and edited_ov:
                 d_ang, d_typ = derive_floor_roof_settings_from_edited(
-                    edited_ov, num_floors_roof, basement_idx
+                    edited_ov, num_floors_roof, basement_idx, plans, plans_roof
                 )
                 floor_roof_angles = {i: float(d_ang[i]) for i in range(num_floors_roof)}
                 floor_roof_types = {i: d_typ[i] for i in range(num_floors_roof)}
@@ -1027,7 +1069,7 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
                 )
             except Exception:
                 pass
-        _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+        _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof, plans)
         print("       [roof] Sărit clean_workflow (poligoane doar din editor).", flush=True)
     else:
         roof_3d_dir = _run_roof_3d_workflow(
@@ -1035,7 +1077,7 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
             basement_floor_index_override=basement_idx,
         )
         if roof_3d_dir:
-            _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof)
+            _apply_edited_roof_rectangles(run_id, roof_3d_dir, plans_roof, plans)
     if roof_3d_dir and notify_ui_events:
         try:
             from orchestrator import notify_ui

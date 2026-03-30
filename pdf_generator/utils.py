@@ -104,3 +104,30 @@ def resolve_plan_image_for_pdf(plan_image: Path, plan_id: str, output_root: Path
     if p:
         return p
     return None
+
+
+# Aceeași bază ca în raster_api._load_review_base_image + detections_review_base.png (LiveFeed / editor).
+_EDITOR_BLUEPRINT_CANDIDATES = (
+    "detections_review_base.png",
+    "input_resized_no_filter.png",
+    "input_resized.jpg",
+    "raster_request.png",
+)
+
+
+def resolve_editor_blueprint_for_pdf(
+    plan_image: Path,
+    plan_id: str,
+    output_root: Path,
+    job_root: Path | None,
+) -> Path | None:
+    """
+    Imaginea folosită în editorul de verificare (aceleași pixeli ca detections_review_base /
+    input_resized_no_filter înainte de filtrul API). Fallback la resolve_plan_image_for_pdf.
+    """
+    raster_dir = output_root / "scale" / plan_id / "cubicasa_steps" / "raster"
+    for name in _EDITOR_BLUEPRINT_CANDIDATES:
+        p = raster_dir / name
+        if p.exists():
+            return p
+    return resolve_plan_image_for_pdf(plan_image, plan_id, output_root, job_root)

@@ -40,6 +40,7 @@ from cubicasa_detector.manual_blueprint import (
     prepare_manual_blueprint_workspace,
     run_walls_pipeline_after_manual_editor,
     ensure_roof_3d_floor_manifest,
+    seed_roof_only_rooms_from_roof_polygons,
     apply_roof_only_synthetic_walls_and_scale,
 )
 from scale import run_scale_detection_for_run
@@ -90,18 +91,40 @@ ROOF_REVIEW_WAIT_TIMEOUT_SEC = 3600
 ROOF_REVIEW_POLL_INTERVAL_SEC = 1.5
 
 
-def _wait_detections_review_approval(job_root: Path) -> None:
-    """Blochează până când API-ul scrie flag-ul de aprobare (utilizatorul a confirmat detecțiile) sau timeout."""
+def _wait_detections_review_approval(job_root: Path, set_progress) -> None:
+    """Blochează până când API-ul scrie flag-ul de aprobare (utilizatorul a confirmat detecțiile) sau timeout.
+    În timpul așteptării, crește ușor progresul (cap sub raster_end-1) ca Live Feed-ul să nu rămână înghețat."""
     flag_path = job_root / DETECTIONS_REVIEW_FLAG
     if flag_path.exists():
         return
     print(f"⏸️ [Pipeline] Aștept confirmarea detecțiilor în UI (max {DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC}s)...", flush=True)
     deadline = time.time() + DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC
-    while time.time() < deadline:
-        if flag_path.exists():
-            print(f"✅ [Pipeline] Detecții confirmate, continuăm.", flush=True)
-            return
-        time.sleep(DETECTIONS_REVIEW_POLL_INTERVAL_SEC)
+    # Creep lin: ~8 → max ~54 (sub raster_end-1 = 57), ca utilizatorul să vadă mișcare în timpul editării
+    creep_cap = float(_PROGRESS_WEIGHTS["raster_end"] - 3)
+    creep_step = 0.28
+    creep_interval_sec = 8.0
+    stop_creep = threading.Event()
+
+    creep_next = [float(_PROGRESS_WEIGHTS["raster_start"])]
+
+    def _creep_worker():
+        while not stop_creep.is_set() and time.time() < deadline:
+            if stop_creep.wait(creep_interval_sec):
+                break
+            if flag_path.exists():
+                break
+            creep_next[0] = min(creep_cap, creep_next[0] + creep_step)
+            set_progress(creep_next[0])
+    creep_th = threading.Thread(target=_creep_worker, name="det-review-creep", daemon=True)
+    creep_th.start()
+    try:
+        while time.time() < deadline:
+            if flag_path.exists():
+                print(f"✅ [Pipeline] Detecții confirmate, continuăm.", flush=True)
+                return
+            time.sleep(DETECTIONS_REVIEW_POLL_INTERVAL_SEC)
+    finally:
+        stop_creep.set()
     print(f"⚠️ [Pipeline] Timeout așteptare confirmare detecții; continuăm fără confirmare.", flush=True)
 
 
@@ -120,9 +143,13 @@ def _wait_roof_review_approval(job_root: Path) -> None:
     print("⚠️ [Pipeline] Timeout așteptare confirmare acoperiș; continuăm fără confirmare.", flush=True)
 
 
-def notify_progress(percent: int):
-    """Trimite procentul de progres către Backend/Frontend pentru progress bar."""
-    msg = f">>> UI:PROGRESS:{percent}"
+def notify_progress(percent: float):
+    """Trimite procentul de progres către Backend/Frontend pentru progress bar (0–100, zecimale ok)."""
+    p = max(0.0, min(100.0, float(percent)))
+    if abs(p - round(p)) < 1e-6:
+        msg = f">>> UI:PROGRESS:{int(round(p))}"
+    else:
+        msg = f">>> UI:PROGRESS:{p:.2f}"
     print(msg, flush=True)
     sys.stdout.flush()
 
@@ -148,11 +175,11 @@ def _make_progress_sender():
     set_progress(pct) trimite doar dacă pct > ultimul trimis (monoton).
     get_raster_progress_fn(num_plans) returnează on_raster_tick() pentru RasterScan.
     """
-    max_sent = [0]
+    max_sent = [0.0]
 
-    def set_progress(pct: int):
-        pct = max(0, min(100, pct))
-        if pct > max_sent[0]:
+    def set_progress(pct: float):
+        pct = max(0.0, min(100.0, float(pct)))
+        if pct > max_sent[0] + 1e-9:
             max_sent[0] = pct
             notify_progress(pct)
 
@@ -165,7 +192,7 @@ def _make_progress_sender():
             pct = _PROGRESS_WEIGHTS["raster_start"] + (
                 _PROGRESS_WEIGHTS["raster_end"] - _PROGRESS_WEIGHTS["raster_start"]
             ) * min(raster_done[0], total_ticks) / total_ticks
-            set_progress(round(pct))
+            set_progress(pct)
         return on_raster_tick
 
     return set_progress, get_raster_progress_fn
@@ -370,7 +397,7 @@ def run_segmentation_and_classification_for_document(
                 pct = _PROGRESS_WEIGHTS["seg_end"] + (
                     _PROGRESS_WEIGHTS["floor_end"] - _PROGRESS_WEIGHTS["seg_end"]
                 ) * (done / total) * 0.9  # 90% din segmentare, 10% la final
-                set_progress(round(pct))
+                set_progress(pct)
         seg_results = run_segmentation_for_documents(
             input_path=input_path,
             output_base_dir=segmentation_out_base,
@@ -599,28 +626,51 @@ def run_segmentation_and_classification_for_document(
 
                 notify_ui_batch("detections_review", review_paths)
                 # UI unificat: la Confirm se scriu detections_review_approved.flag și roof_review_approved.flag.
-                _wait_detections_review_approval(job_root)
+                _wait_detections_review_approval(job_root, set_progress)
+
+                for plan in plans:
+                    raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                    apply_detections_edited(raster_dir)
 
                 if roof_only_offer:
-                    print("🔸 [Pipeline] roof_only_offer: walls_from_coords sintetic + mpp default.", flush=True)
-                    for plan in plans:
-                        if not apply_roof_only_synthetic_walls_and_scale(plan):
-                            raster_scan_failed = True
-                else:
-                    for plan in plans:
-                        raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-                        apply_detections_edited(raster_dir)
-                    max_w = max(1, min(3, len(plans)))
+                    seeded = seed_roof_only_rooms_from_roof_polygons(run_id, plans)
+                    if seeded:
+                        print("🔸 [Pipeline] roof_only_offer: 09_interior + rooms din poligoanele roof editor.", flush=True)
+                        for p in plans:
+                            print(f"   - {p.plan_id}: {seeded.get(p.plan_id, 0)} poligoane", flush=True)
+                    else:
+                        print(
+                            "⚠️ [Pipeline] roof_only_offer: nu am găsit poligoane roof editor pentru seed 09_interior; continuăm cu fallback-urile existente.",
+                            flush=True,
+                        )
 
-                    def _walls_one(p):
-                        return run_walls_pipeline_after_manual_editor(p)
+                max_w = max(1, min(3, len(plans)))
 
-                    with ThreadPoolExecutor(max_workers=max_w) as ex:
-                        results = list(ex.map(_walls_one, plans))
-                    if not all(results):
+                def _walls_one(p):
+                    return run_walls_pipeline_after_manual_editor(p, roof_only_offer)
+
+                set_progress(55.5)
+                with ThreadPoolExecutor(max_workers=max_w) as ex:
+                    results = list(ex.map(_walls_one, plans))
+
+                if not all(results):
+                    if roof_only_offer:
+                        print(
+                            "🔸 [Pipeline] roof_only_offer: walls_from_coords + room_scales (Gemini) eșuat pe unele planuri; fallback sintetic per plan.",
+                            flush=True,
+                        )
+                        fallback_failed = False
+                        for plan, ok in zip(plans, results):
+                            if ok:
+                                continue
+                            if not apply_roof_only_synthetic_walls_and_scale(plan):
+                                fallback_failed = True
+                        raster_scan_failed = fallback_failed
+                    else:
                         raster_scan_failed = True
+                set_progress(56.5)
 
-            set_progress(_PROGRESS_WEIGHTS["raster_end"] - 1)
+            set_progress(float(_PROGRESS_WEIGHTS["raster_end"] - 1))
 
             raster_ok, failed_plan_ids = _check_raster_complete(plans, job_root)
             if failed_plan_ids:
@@ -678,7 +728,9 @@ def run_segmentation_and_classification_for_document(
 
             set_progress(_PROGRESS_WEIGHTS["offer_end"] - 2)
             with Timer("STEP 16-17: Offer Generation") as t:
-                nivel_oferta = frontend_data.get("materialeFinisaj", {}).get("nivelOferta")
+                mf = frontend_data.get("materialeFinisaj") or {}
+                sc = frontend_data.get("sistemConstructiv") or {}
+                nivel_oferta = sc.get("nivelOferta") or mf.get("nivelOferta")
                 if not nivel_oferta:
                     cm = (frontend_data.get("calc_mode") or "").lower()
                     if cm in ("structure", "structura"):
