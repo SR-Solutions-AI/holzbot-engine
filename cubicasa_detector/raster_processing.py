@@ -33,6 +33,132 @@ def _log(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+
+def _contour_to_point_list(contour: np.ndarray) -> list[np.ndarray]:
+    arr = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+    return [pt.copy() for pt in arr]
+
+
+def _point_list_to_contour(points: list[np.ndarray]) -> np.ndarray:
+    if len(points) < 3:
+        return np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
+    out: list[np.ndarray] = []
+    for pt in points:
+        if not out or np.linalg.norm(pt - out[-1]) > 0.5:
+            out.append(pt.copy())
+    if len(out) >= 2 and np.linalg.norm(out[0] - out[-1]) <= 0.5:
+        out.pop()
+    return np.round(np.asarray(out, dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
+
+
+def _project_point_to_segment(
+    pt: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> tuple[float, np.ndarray, float]:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-6:
+        return float(np.linalg.norm(pt - a)), a.copy(), 0.0
+    t = float(np.dot(pt - a, ab) / denom)
+    t_clamped = max(0.0, min(1.0, t))
+    proj = a + t_clamped * ab
+    return float(np.linalg.norm(pt - proj)), proj.astype(np.float32), t_clamped
+
+
+def _find_existing_point_index(points: list[np.ndarray], pt: np.ndarray, tol: float = 0.5) -> int:
+    for idx, cur in enumerate(points):
+        if float(np.linalg.norm(cur - pt)) <= tol:
+            return idx
+    return -1
+
+
+def stitch_nearby_room_polygons(
+    rooms_polygons: list[np.ndarray],
+    image_h: int,
+    image_w: int,
+    snap_ratio: float = 0.03,
+    max_iterations: int = 4,
+) -> list[np.ndarray]:
+    """Aliniază poligoanele apropiate ca să împartă aceleași puncte/laturi."""
+    if len(rooms_polygons) < 2:
+        return rooms_polygons
+
+    snap_px = max(3.0, float(min(image_h, image_w)) * float(snap_ratio))
+    polygons = [_contour_to_point_list(poly) for poly in rooms_polygons if len(poly) >= 3]
+    if len(polygons) < 2:
+        return rooms_polygons
+
+    for _ in range(max_iterations):
+        changed = False
+        for poly_idx, points in enumerate(polygons):
+            if len(points) < 3:
+                continue
+            vertex_idx = 0
+            while vertex_idx < len(points):
+                pt = points[vertex_idx]
+                best_kind: str | None = None
+                best_dist = snap_px + 1e-6
+                best_data: tuple[int, int, np.ndarray] | tuple[int, int, np.ndarray, float] | None = None
+
+                for other_idx, other_points in enumerate(polygons):
+                    if other_idx == poly_idx or len(other_points) < 2:
+                        continue
+
+                    for other_vertex_idx, other_pt in enumerate(other_points):
+                        dist = float(np.linalg.norm(pt - other_pt))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_kind = "vertex"
+                            best_data = (other_idx, other_vertex_idx, ((pt + other_pt) / 2.0).astype(np.float32))
+
+                    for edge_idx in range(len(other_points)):
+                        a = other_points[edge_idx]
+                        b = other_points[(edge_idx + 1) % len(other_points)]
+                        dist, proj, t = _project_point_to_segment(pt, a, b)
+                        if t <= 1e-3 or t >= 1.0 - 1e-3:
+                            continue
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_kind = "edge"
+                            best_data = (other_idx, edge_idx, proj, t)
+
+                if best_kind == "vertex" and best_data is not None:
+                    other_idx, other_vertex_idx, snap_pt = best_data
+                    if float(np.linalg.norm(points[vertex_idx] - snap_pt)) > 0.5:
+                        points[vertex_idx] = snap_pt.copy()
+                        changed = True
+                    if float(np.linalg.norm(polygons[other_idx][other_vertex_idx] - snap_pt)) > 0.5:
+                        polygons[other_idx][other_vertex_idx] = snap_pt.copy()
+                        changed = True
+                elif best_kind == "edge" and best_data is not None:
+                    other_idx, edge_idx, snap_pt, _ = best_data
+                    if float(np.linalg.norm(points[vertex_idx] - snap_pt)) > 0.5:
+                        points[vertex_idx] = snap_pt.copy()
+                        changed = True
+                    other_points = polygons[other_idx]
+                    existing_idx = _find_existing_point_index(other_points, snap_pt)
+                    if existing_idx < 0:
+                        other_points.insert(edge_idx + 1, snap_pt.copy())
+                        changed = True
+                    elif float(np.linalg.norm(other_points[existing_idx] - snap_pt)) > 0.5:
+                        other_points[existing_idx] = snap_pt.copy()
+                        changed = True
+                vertex_idx += 1
+
+        if not changed:
+            break
+
+    stitched: list[np.ndarray] = []
+    poly_cursor = 0
+    for poly in rooms_polygons:
+        if len(poly) < 3:
+            stitched.append(poly)
+            continue
+        stitched.append(_point_list_to_contour(polygons[poly_cursor]))
+        poly_cursor += 1
+    return stitched
+
 # Import notify_ui pentru UI notifications
 try:
     from orchestrator import notify_ui
@@ -808,6 +934,8 @@ def generate_walls_from_room_coordinates(
             _log(f"      💾 Salvat: 09_interior.png (skip path, aceleași camere ca pentru Gemini)")
         # Poligoanele sunt cele de la rooms (boss); după modificări le folosim pentru walls_from_coords
         if rooms_from_response and len(rooms_polygons) > 0:
+            rooms_polygons = stitch_nearby_room_polygons(rooms_polygons, h_orig, w_orig, snap_ratio=0.03)
+            _log(f"      🧩 Stitch poligoane camere: {len(rooms_polygons)} camere, prag {max(3, int(min(h_orig, w_orig) * 0.03))} px")
             # După editor refacem 01_walls_from_coords DOAR din camerele noi (schelet nou),
             # fără OR cu scheletul vechi.
             walls_from_rooms = np.zeros((h_orig, w_orig), dtype=np.uint8)
