@@ -206,9 +206,12 @@ def _run_for_single_plan(
                 if width_m > 0 and opening_type:
                     # Normalizăm tipul (door/double_door -> door, window/double_window -> window)
                     normalized_type = opening_type
-                    if "door" in opening_type.lower():
+                    lower_type = opening_type.lower()
+                    if "sliding_door" in lower_type or "schiebetur" in lower_type or "schiebetür" in lower_type:
+                        normalized_type = "sliding_door"
+                    elif "door" in lower_type:
                         normalized_type = "door" if "double" not in opening_type.lower() else "double_door"
-                    elif "window" in opening_type.lower():
+                    elif "window" in lower_type:
                         normalized_type = "window" if "double" not in opening_type.lower() else "double_window"
                     
                     # Determinăm status-ul (exterior/interior)

@@ -50,6 +50,12 @@ def calculate_pricing_for_plan(
                                                                     walls_data.get("interior", {}).get("net_area_m2", 0.0)))
     # Pentru finisaje: folosim net_area_m2 pentru interior
     w_int_net_finish = float(walls_data.get("interior", {}).get("net_area_m2", 0.0))
+    w_int_net_finish_inner = float(
+        walls_data.get("interior", {}).get("net_area_m2_finish_interior_walls", w_int_net_finish)
+    )
+    w_int_net_finish_outer = float(
+        walls_data.get("interior", {}).get("net_area_m2_finish_exterior_walls", 0.0)
+    )
     # Exterior: separăm structură vs finisaje
     w_ext_net_structure = float(walls_data.get("exterior", {}).get("net_area_m2_structure",
                                                                     walls_data.get("exterior", {}).get("net_area_m2", 0.0)))
@@ -169,8 +175,8 @@ def calculate_pricing_for_plan(
             items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net_structure, 2), "unit_price": round(_p_ext, 2), "cost": round(_cost_b_ext, 2)})
         cost_walls_b = {"total_cost": round(_cost_b_int + _cost_b_ext, 2), "detailed_items": items_walls_b}
         cost_finishes_b = calculate_finishes_details(
-            finish_coeffs, w_int_net_finish, 0.0,
-            type_int=finish_int_beci, type_ext="Tencuială",
+            finish_coeffs, w_int_net_finish, 0.0, 0.0,
+            type_int_inner=finish_int_beci, type_int_outer=finish_int_beci, type_ext="Tencuială",
             floor_label="Beci"
         )
         cost_floors_b = calculate_floors_details(area_coeffs, floor_area, ceiling_area)
@@ -295,12 +301,16 @@ def calculate_pricing_for_plan(
     if is_ground_floor:
         # Ground floor
         finish_int_key = "finisajInterior_ground"
+        finish_int_inner_key = "finisajInteriorInnen_ground"
+        finish_int_outer_key = "finisajInteriorAussen_ground"
         finish_ext_key = "fatada_ground"
     elif is_top_floor_plan:
         # Top floor - verificăm dacă este mansardă sau pod
         if is_mansarda:
             # Mansardă - folosim finisajele pentru mansardă
             finish_int_key = "finisajInteriorMansarda"
+            finish_int_inner_key = "finisajInteriorInnenMansarda"
+            finish_int_outer_key = "finisajInteriorAussenMansarda"
             finish_ext_key = "fatadaMansarda"
         else:
             # Pod - folosim ultimul index din totalFloors (din frontend)
@@ -310,16 +320,28 @@ def calculate_pricing_for_plan(
             # ground + 2 intermediare + pod → totalFloors = 3 → floor_3
             floor_idx = total_floors_frontend  # Ultimul index (ground=0, primul intermediar=1, pod=totalFloors)
             finish_int_key = f"finisajInterior_floor_{floor_idx}"
+            finish_int_inner_key = f"finisajInteriorInnen_floor_{floor_idx}"
+            finish_int_outer_key = f"finisajInteriorAussen_floor_{floor_idx}"
             finish_ext_key = f"fatada_floor_{floor_idx}"
     else:
         # Etaj intermediar - folosim intermediate_floor_index + 1 pentru floor_X
         floor_idx = intermediate_floor_index + 1  # floor_1, floor_2, etc.
         finish_int_key = f"finisajInterior_floor_{floor_idx}"
+        finish_int_inner_key = f"finisajInteriorInnen_floor_{floor_idx}"
+        finish_int_outer_key = f"finisajInteriorAussen_floor_{floor_idx}"
         finish_ext_key = f"fatada_floor_{floor_idx}"
     
     # Fallback la valorile vechi dacă nu există valorile noi per etaj
     finish_int = _norm_finish(
-        mat_finisaj.get(finish_int_key) or mat_finisaj.get("finisajInterior", "Tencuială"), 
+        mat_finisaj.get(finish_int_key) or mat_finisaj.get("finisajInterior", "Tencuială"),
+        "Tencuială"
+    )
+    finish_int_inner = _norm_finish(
+        mat_finisaj.get(finish_int_inner_key) or mat_finisaj.get(finish_int_key) or mat_finisaj.get("finisajInterior", "Tencuială"),
+        "Tencuială"
+    )
+    finish_int_outer = _norm_finish(
+        mat_finisaj.get(finish_int_outer_key) or mat_finisaj.get(finish_int_key) or mat_finisaj.get("finisajInterior", "Tencuială"),
         "Tencuială"
     )
     finish_ext = _norm_finish(
@@ -341,8 +363,8 @@ def calculate_pricing_for_plan(
     
     # Debug: afișăm valorile finale folosite
     floor_type_str = "ground" if is_ground_floor else ("top" if is_top_floor_plan else f"intermediate_{intermediate_floor_index + 1}")
-    print(f"✅ [PRICING] Plan {plan_index} ({floor_type_str}): Final finishes - Interior: {finish_int}, Exterior: {finish_ext}")
-    print(f"   Used keys: {finish_int_key}, {finish_ext_key}")
+    print(f"✅ [PRICING] Plan {plan_index} ({floor_type_str}): Final finishes - Innenwände: {finish_int_inner}, Außenwände: {finish_int_outer}, Fassade: {finish_ext}")
+    print(f"   Used keys: {finish_int_inner_key}, {finish_int_outer_key}, {finish_ext_key}")
     print(f"   Floor label: {floor_label}")
     
     # Pentru beci locuibil, calculăm separat finisajele interioare
@@ -404,8 +426,8 @@ def calculate_pricing_for_plan(
         )
     
     cost_finishes = calculate_finishes_details(
-        finish_coeffs, w_int_net_finish, w_ext_net_finish,
-        type_int=finish_int, type_ext=finish_ext,
+        finish_coeffs, w_int_net_finish_inner, w_int_net_finish_outer, w_ext_net_finish,
+        type_int_inner=finish_int_inner, type_int_outer=finish_int_outer, type_ext=finish_ext,
         floor_label=floor_label
     )
     
@@ -665,8 +687,8 @@ def calculate_pricing_for_plan(
         
         # Finisaje interioare pentru basement (folosim ariile calculate cu coeficienții)
         cost_finishes_basement = calculate_finishes_details(
-            finish_coeffs, w_int_net_finish_basement, 0.0,  # Nu avem fațadă pentru basement
-            type_int=finish_int_beci, type_ext="Tencuială",  # Nu contează type_ext pentru basement
+            finish_coeffs, w_int_net_finish_basement, 0.0, 0.0,  # Nu avem fațadă pentru basement
+            type_int_inner=finish_int_beci, type_int_outer=finish_int_beci, type_ext="Tencuială",  # Nu contează type_ext pentru basement
             floor_label="Beci"
         )
         

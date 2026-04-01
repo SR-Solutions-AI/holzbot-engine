@@ -144,7 +144,7 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "dachfenster_m2_price": float(data_map.get("dachfenster", 0) or 0),
         },
         "finishes": {
-            "interior": {
+            "interior_inner": {
                 "Tencuială": data_map.get("interior_tencuiala", 0),
                 "Lemn": data_map.get("interior_lemn", 0),
                 "Fibrociment": data_map.get("interior_fibrociment", 0),
@@ -155,6 +155,17 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Placare OSB aparent": data_map.get("interior_osb_aparent", 0),
                 "Lambriu (molid/larice)": data_map.get("interior_lambriu", 0),
                 "Placare cu panouri acustice": data_map.get("interior_panouri_acustice", 0),
+            },
+            "interior_outer": {
+                "Tencuială": data_map.get("interior_outer_tencuiala", data_map.get("interior_tencuiala", 0)),
+                "Lemn": data_map.get("interior_outer_lemn", data_map.get("interior_lemn", 0)),
+                "Fibrociment": data_map.get("interior_outer_fibrociment", data_map.get("interior_fibrociment", 0)),
+                "Mix": data_map.get("interior_outer_mix", data_map.get("interior_mix", 0)),
+                "Rigips + glet + lavabil": data_map.get("interior_outer_rigips_glet_lavabil", data_map.get("interior_rigips_glet_lavabil", 0)),
+                "Plăci gips-fibră (Fermacell)": data_map.get("interior_outer_fermacell", data_map.get("interior_fermacell", 0)),
+                "Placare OSB aparent": data_map.get("interior_outer_osb_aparent", data_map.get("interior_osb_aparent", 0)),
+                "Lambriu (molid/larice)": data_map.get("interior_outer_lambriu", data_map.get("interior_lambriu", 0)),
+                "Placare cu panouri acustice": data_map.get("interior_outer_panouri_acustice", data_map.get("interior_panouri_acustice", 0)),
             },
             "exterior": { 
                 "Tencuială": data_map.get("exterior_tencuiala", 0), 
@@ -189,6 +200,12 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "2-fach verglast": data_map.get("window_2_fach_price", data_map.get("window_3fach_verglast_price", 320)),
                 "3-fach verglast": data_map.get("window_3_fach_price", data_map.get("window_3fach_verglast_price", 420)),
                 "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
+            },
+            "sliding_door_prices_per_m2": {
+                "Standard": float(data_map.get("sliding_door_standard_price", 690)),
+                "Hebeschiebetür": float(data_map.get("sliding_door_hebeschiebetuer_price", 880)),
+                "Panorama": float(data_map.get("sliding_door_panorama_price", 1040)),
+                "Aluminium Premium": float(data_map.get("sliding_door_aluminium_premium_price", 980)),
             },
             # Garagentor: €/Stück (doar dacă formular: Garagentor gewünscht)
             "garage_door_prices": {
@@ -339,6 +356,12 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                     out.setdefault("sistem_constructiv", {}).setdefault("teren_factor", {})[label] = val
                 elif tag == "foundation_type":
                     out.setdefault("foundation", {}).setdefault("unit_price_per_m2", {})[label] = val
+                elif tag == "interior_finish_interior_walls":
+                    out.setdefault("finishes", {}).setdefault("interior_inner", {})[label] = val
+                elif tag == "interior_finish_exterior_walls":
+                    out.setdefault("finishes", {}).setdefault("interior_outer", {})[label] = val
+                elif tag == "sliding_door_type":
+                    out.setdefault("openings", {}).setdefault("sliding_door_prices_per_m2", {})[label] = val
                 elif tag == "garage_door_type":
                     out.setdefault("openings", {}).setdefault("garage_door_prices", {})[label] = val
     except Exception:

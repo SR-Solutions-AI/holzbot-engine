@@ -86,7 +86,11 @@ def calculate_areas_for_plan(
     h_structure_and_ext_finish = wall_height_m + _h_extra
     
     # Arii brute pentru finisaje (folosim outline)
+    interior_finish_exterior_length_m = max(0.0, exterior_length_m)
+    interior_finish_interior_length_m = max(0.0, interior_length_m_finish - interior_finish_exterior_length_m)
     interior_walls_gross_m2_finish = interior_length_m_finish * h_finish_interior
+    interior_finish_interior_walls_gross_m2 = interior_finish_interior_length_m * h_finish_interior
+    interior_finish_exterior_walls_gross_m2 = interior_finish_exterior_length_m * h_finish_interior
     exterior_walls_gross_m2 = exterior_length_m * h_structure_and_ext_finish
     
     # Arii brute pentru structură (skeleton interior; înălțime cu același adaos ca structura exterioară)
@@ -161,6 +165,9 @@ def calculate_areas_for_plan(
     
     # Pentru interior finisaje: folosim outline verde
     interior_walls_net_m2_finish = max(0.0, interior_walls_gross_m2_finish - area_doors_interior_m2)
+    interior_finish_interior_walls_net_m2 = max(0.0, interior_finish_interior_walls_gross_m2 - area_doors_interior_m2)
+    # Innenausbau Außenwände: same interior finish height, but subtract only structural exterior openings (>2.5 m²).
+    interior_finish_exterior_walls_net_m2 = max(0.0, interior_finish_exterior_walls_gross_m2 - exterior_openings_m2_structure)
     
     # Pentru interior structură: folosim skeleton (nu scădem deschiderile pentru structură)
     # Structura pereților interiori se calculează pe baza skeleton-ului, fără să scădem deschiderile
@@ -214,10 +221,16 @@ def calculate_areas_for_plan(
                 "length_m_structure": round(interior_length_m_structure, 2),  # Pentru structură (skeleton)
                 "gross_area_m2": round(interior_walls_gross_m2_finish, 2),  # Pentru finisaje
                 "gross_area_m2_structure": round(interior_walls_gross_m2_structure, 2),  # Pentru structură
+                "finish_interior_walls_length_m": round(interior_finish_interior_length_m, 2),
+                "finish_exterior_walls_length_m": round(interior_finish_exterior_length_m, 2),
+                "gross_area_m2_finish_interior_walls": round(interior_finish_interior_walls_gross_m2, 2),
+                "gross_area_m2_finish_exterior_walls": round(interior_finish_exterior_walls_gross_m2, 2),
                 "openings_area_m2": round(area_doors_interior_m2, 2),
                 "openings_area_m2_structure": round(area_doors_interior_structure_m2, 2),
                 "net_area_m2": round(interior_walls_net_m2_finish, 2),  # Pentru finisaje
-                "net_area_m2_structure": round(interior_walls_net_m2_structure, 2)  # Pentru structură
+                "net_area_m2_structure": round(interior_walls_net_m2_structure, 2),  # Pentru structură
+                "net_area_m2_finish_interior_walls": round(interior_finish_interior_walls_net_m2, 2),
+                "net_area_m2_finish_exterior_walls": round(interior_finish_exterior_walls_net_m2, 2),
             },
             "exterior": {
                 "length_m": round(exterior_length_m, 2),

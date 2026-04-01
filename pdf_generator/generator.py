@@ -38,6 +38,7 @@ from .offer_scope import (
     roof_items_for_pdf_table as _roof_items_for_pdf_table,
     baukosten_position_label_de as _baukosten_position_label_de,
 )
+from .project_overview_fields import build_selected_form_overview_items
 
 # ---------- 1. DICTIONAR STATIC EXTINS (CONSTANTE) ----------
 STATIC_TRANSLATIONS = {
@@ -918,18 +919,21 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
 
     # --- Finisaje (exemple: parter interior/exterior) ---
     if _incl_pd.get("finishes"):
-        fi_ground = mat.get("finisajInterior_ground") or mat.get("finisajInterior")
+        fi_ground_inner = mat.get("finisajInteriorInnen_ground") or mat.get("finisajInterior_ground") or mat.get("finisajInterior")
+        fi_ground_outer = mat.get("finisajInteriorAussen_ground") or mat.get("finisajInterior_ground") or mat.get("finisajInterior")
         fa_ground = mat.get("fatada_ground") or mat.get("fatada")
         fin_c = pc.get("finishes", {})
-        fi_key = _finish_to_key.get((fi_ground or "").strip(), (fi_ground or "").strip())
+        fi_inner_key = _finish_to_key.get((fi_ground_inner or "").strip(), (fi_ground_inner or "").strip())
+        fi_outer_key = _finish_to_key.get((fi_ground_outer or "").strip(), (fi_ground_outer or "").strip())
         fa_key = _finish_to_key.get((fa_ground or "").strip(), (fa_ground or "").strip())
-        fi_price = fin_c.get("interior", {}).get(fi_key) if fi_key else None
+        fi_inner_price = fin_c.get("interior_inner", {}).get(fi_inner_key) if fi_inner_key else None
+        fi_outer_price = fin_c.get("interior_outer", {}).get(fi_outer_key) if fi_outer_key else None
         fa_price = fin_c.get("exterior", {}).get(fa_key) if fa_key else None
         rows.append((
             "Oberflächen",
-            "Innen / Fassade (EG)",
-            f"{_fv('materialeFinisaj', 'finisajInterior_ground', 'finisajInterior', '—')} / {_fv('materialeFinisaj', 'fatada_ground', 'fatada', '—')}",
-            f"{_price(fi_price)} / {_price(fa_price)}"
+            "Innenwände / Außenwände / Fassade (EG)",
+            f"{_fv('materialeFinisaj', 'finisajInteriorInnen_ground', 'finisajInterior_ground', 'finisajInterior', '—')} / {_fv('materialeFinisaj', 'finisajInteriorAussen_ground', 'finisajInterior_ground', 'finisajInterior', '—')} / {_fv('materialeFinisaj', 'fatada_ground', 'fatada', '—')}",
+            f"{_price(fi_inner_price)} / {_price(fi_outer_price)} / {_price(fa_price)}"
         ))
 
     # --- Performanță energetică, încălzire, ventilație ---
@@ -1086,24 +1090,27 @@ def _finishes_per_floor_from_form(materiale_finisaj: dict) -> dict:
     # Ordine etaje: Parter, Etaj 1, 2, 3, Mansardă, Beci
     out = {}
     # Parter / Erdgeschoss
-    fi_ground = m.get("finisajInterior_ground") or m.get("finisajInterior")
+    fi_ground = m.get("finisajInteriorInnen_ground") or m.get("finisajInterior_ground") or m.get("finisajInterior")
+    fi_ground_outer = m.get("finisajInteriorAussen_ground") or m.get("finisajInterior_ground") or m.get("finisajInterior")
     fa_ground = m.get("fatada_ground") or m.get("fatada")
-    if fi_ground or fa_ground:
-        out["Erdgeschoss"] = {"interior": fi_ground, "exterior": fa_ground}
+    if fi_ground or fi_ground_outer or fa_ground:
+        out["Erdgeschoss"] = {"interior_inner": fi_ground, "interior_outer": fi_ground_outer, "exterior": fa_ground}
     for i in range(1, 4):
-        fi = m.get(f"finisajInterior_floor_{i}")
+        fi = m.get(f"finisajInteriorInnen_floor_{i}") or m.get(f"finisajInterior_floor_{i}")
+        fo = m.get(f"finisajInteriorAussen_floor_{i}") or m.get(f"finisajInterior_floor_{i}")
         fa = m.get(f"fatada_floor_{i}")
-        if fi or fa:
-            out[f"Obergeschoss {i}"] = {"interior": fi, "exterior": fa}
+        if fi or fo or fa:
+            out[f"Obergeschoss {i}"] = {"interior_inner": fi, "interior_outer": fo, "exterior": fa}
     # Mansardă
-    fi_mans = m.get("finisajInteriorMansarda")
+    fi_mans = m.get("finisajInteriorInnenMansarda") or m.get("finisajInteriorMansarda")
+    fo_mans = m.get("finisajInteriorAussenMansarda") or m.get("finisajInteriorMansarda")
     fa_mans = m.get("fatadaMansarda")
-    if fi_mans or fa_mans:
-        out["Mansardă"] = {"interior": fi_mans, "exterior": fa_mans}
+    if fi_mans or fo_mans or fa_mans:
+        out["Mansardă"] = {"interior_inner": fi_mans, "interior_outer": fo_mans, "exterior": fa_mans}
     # Beci
     fi_beci = m.get("finisajInteriorBeci")
     if fi_beci:
-        out["Keller"] = {"interior": fi_beci, "exterior": None}
+        out["Keller"] = {"interior_inner": fi_beci, "interior_outer": None, "exterior": None}
     return out
 
 
@@ -1342,23 +1349,34 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     story.append(Paragraph("<br/>".join(lines), _styles()["Cell"]))
     story.append(Spacer(1, 6*mm))
 
-def _intro(story, styles, client: dict, enforcer: GermanEnforcer, offer_title: str | None = None):
+def _intro(
+    story,
+    styles,
+    client: dict,
+    enforcer: GermanEnforcer,
+    offer_title: str | None = None,
+    intro_content: str | None = None,
+):
     title = offer_title or enforcer.get("Angebot für Ihr Holzhaus")
     title = enforcer.get(title) if title else enforcer.get("Angebot für Ihr Holzhaus")
     if title and "Chiemgauer" in title:
         title = "Angebot für Ihr Holzhaus"
-    story.append(Paragraph(title, styles["H2"]))
-    story.append(Paragraph(enforcer.get("Sehr geehrte Damen und Herren,"), styles["Body"]))
-    
-    story.append(Paragraph(
-        enforcer.get("Vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung, basierend auf den übermittelten Planunterlagen."), 
-        styles["Body"]
-    ))
-    story.append(Paragraph(
-        enforcer.get("Diese Dokumentation soll Ihnen eine klare Übersicht der notwendigen Investition bieten. Sollten Sie Fragen zur Kalkulation, den Komponenten oder wünschen Sie eine individuelle Anpassung, stehen wir Ihnen jederzeit gerne zur Verfügung."), 
-        styles["Body"]
-    ))
-    
+    intro_block = [Paragraph(title, styles["H2"])]
+
+    intro_paragraphs = [
+        enforcer.get("Sehr geehrte Damen und Herren,"),
+        enforcer.get("Vielen Dank für Ihre Anfrage. Nachfolgend erhalten Sie unsere detaillierte Kostenschätzung, basierend auf den übermittelten Planunterlagen."),
+        enforcer.get("Diese Dokumentation soll Ihnen eine klare Übersicht der notwendigen Investition bieten. Sollten Sie Fragen zur Kalkulation, den Komponenten oder wünschen Sie eine individuelle Anpassung, stehen wir Ihnen jederzeit gerne zur Verfügung."),
+    ]
+    if intro_content:
+        custom_paragraphs = [part.strip() for part in str(intro_content).split("\n\n") if part.strip()]
+        if custom_paragraphs:
+            intro_paragraphs = [enforcer.get(part) for part in custom_paragraphs]
+
+    for paragraph in intro_paragraphs:
+        intro_block.append(Paragraph(paragraph, styles["Body"]))
+
+    story.append(KeepTogether(intro_block))
     story.append(Spacer(1, 6*mm))
 
 # ---------- TABLES (TRADUCERE DIRECTĂ) ----------
@@ -1867,8 +1885,9 @@ def _table_global_openings(story, styles, all_openings: list, enforcer: GermanEn
     
     groups = {}
     
-    kw_window = ["fenster", "window", "glass", "fereastra"]
+    kw_window = ["fenster", "window", "glass", "fereastra", "schiebetür", "schiebetur", "sliding_door", "sliding door"]
     kw_door = ["tür", "door", "usa", "ușă"]
+    kw_sliding = ["schiebetür", "schiebetur", "sliding_door", "sliding door"]
     kw_ext = ["aussen", "außen", "exterior", "entrance", "haustür", "main"]
     kw_double = ["doppel", "double", "dublu", "zwei", "2-"]
     
@@ -1885,12 +1904,13 @@ def _table_global_openings(story, styles, all_openings: list, enforcer: GermanEn
         
         is_window = any(x in full_text for x in kw_window)
         is_door = any(x in full_text for x in kw_door)
+        is_sliding = any(x in full_text for x in kw_sliding)
         
         if not (is_window or is_door): 
             continue
             
         is_ext = any(x in full_text for x in kw_ext)
-        loc_str = "Außentür" if is_door and is_ext else "Innentür" if is_door else "Fenster"
+        loc_str = "Fenster" if is_sliding else ("Außentür" if is_door and is_ext else "Innentür" if is_door else "Fenster")
         
         is_double = any(x in full_text for x in kw_double)
         type_str = translations["Zweiflügelig"] if is_double else translations["Einflügelig"]
@@ -2107,10 +2127,10 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                 obj_type = str(op.get("type", "")).lower()
                 area_m2 = float(op.get("area_m2", 0.0))
                 
-                if "window" in obj_type:
+                if "window" in obj_type or obj_type == "sliding_door":
                     total_windows += 1
                     total_windows_area += area_m2
-                elif "door" in obj_type:
+                elif "door" in obj_type and obj_type != "sliding_door":
                     total_doors += 1
                     total_doors_area += area_m2
             
@@ -2215,12 +2235,16 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                     if not floor_label:
                         continue
                     if floor_label not in finishes_per_floor:
-                        finishes_per_floor[floor_label] = {"interior": None, "exterior": None}
+                        finishes_per_floor[floor_label] = {"interior_inner": None, "interior_outer": None, "exterior": None}
                     category = item.get("category", "")
                     material = item.get("material", "")
                     # Completați doar dacă formularul nu a furnizat deja valoarea
-                    if "interior" in category and finishes_per_floor[floor_label]["interior"] is None:
-                        finishes_per_floor[floor_label]["interior"] = material
+                    if category == "finish_interior_inner" and finishes_per_floor[floor_label]["interior_inner"] is None:
+                        finishes_per_floor[floor_label]["interior_inner"] = material
+                    elif category == "finish_interior_outer" and finishes_per_floor[floor_label]["interior_outer"] is None:
+                        finishes_per_floor[floor_label]["interior_outer"] = material
+                    elif "interior" in category and finishes_per_floor[floor_label]["interior_inner"] is None:
+                        finishes_per_floor[floor_label]["interior_inner"] = material
                     elif "exterior" in category and finishes_per_floor[floor_label]["exterior"] is None:
                         finishes_per_floor[floor_label]["exterior"] = material
     
@@ -2235,6 +2259,29 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     tamplarie_de = enforcer.get(tamplarie) if tamplarie else "—"
     nivel_finisare_de = enforcer.get(nivel_finisare) if nivel_finisare else "Schlüsselfertig"
     
+    def _append_overview_value(label: str, value, *, translate: bool = True, force_bool: bool = False):
+        if force_bool:
+            if value is None or value == "":
+                return
+            rendered = "Ja" if bool(value) else "Nein"
+        else:
+            if value is None:
+                return
+            rendered = str(value).strip()
+            if rendered == "" or rendered == "—":
+                return
+            if translate:
+                rendered = enforcer.get(rendered) or rendered
+        overview_items.append(f"<b>{label}:</b> <b>{rendered}</b>")
+
+    def _append_floor_values(prefix: str, mapping: list[tuple[str, str]], values: dict, *, translate: bool = True):
+        for key, label in mapping:
+            value = values.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            rendered = enforcer.get(str(value)) if translate else str(value)
+            overview_items.append(f"<b>{prefix} ({label}):</b> <b>{rendered}</b>")
+
     # DOAR informații comune (nu per etaj)
     overview_items = []
     # Suprafața brută totală a casei (suma tuturor etajelor)
@@ -2251,26 +2298,6 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
         print(f"✅ [PDF] Suprafața brută totală a casei afișată: {total_house_area:.0f} m²")
     else:
         print(f"⚠️ [PDF] total_house_area is 0 - nu se afișează suprafața casei")
-    
-    # Finisaje interioare și exterioare (în loc de pereți)
-    if inclusions_ov.get("finishes") and finishes_per_floor:
-        # Sortăm etajele: Keller (Beci), Erdgeschoss, Obergeschoss 1, 2, etc., Mansardă, Dachgeschoss
-        floor_order = ["Keller", "Erdgeschoss"]
-        for i in range(1, 10):
-            floor_order.append(f"Obergeschoss {i}")
-        floor_order.extend(["Mansardă", "Dachgeschoss"])
-        
-        for floor_label in floor_order:
-            if floor_label in finishes_per_floor:
-                floor_finishes = finishes_per_floor[floor_label]
-                fin_int = floor_finishes.get("interior")
-                fin_ext = floor_finishes.get("exterior")
-                if fin_int:
-                    fin_int_de = enforcer.get(fin_int) if fin_int else "—"
-                    overview_items.append(f"<b>{enforcer.get('Finisaj interior')} ({floor_label}):</b> <b>{fin_int_de}</b>")
-                if fin_ext:
-                    fin_ext_de = enforcer.get(fin_ext) if fin_ext else "—"
-                    overview_items.append(f"<b>{enforcer.get('Fațadă')} ({floor_label}):</b> <b>{fin_ext_de}</b>")
     
     # Suprafețe acoperiș: afișăm atât cu Überstand cât și Dämmzone (fără Überstand) dacă avem roof_pricing.json.
     run_id = str(frontend_data.get("run_id") or "").strip()
@@ -2308,56 +2335,24 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
         if roof_area_without_overhang is not None and float(roof_area_without_overhang) > 0:
             overview_items.append(f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
     
-    # Număr de etaje (Stockwerke în loc de Ebenen)
-    overview_items.append(f"<b>{enforcer.get('Anzahl der Stockwerke')}:</b> <b>{num_floors}</b>")
-    
-    # Informații despre sistem constructiv
-    overview_items.append(f"<b>{enforcer.get('Bausystem')}:</b> <b>{tip_sistem_de}</b>")
-    if acces_santier_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Baustellenzufahrt')}:</b> <b>{acces_santier_de}</b>")
-    if tip_fundatie_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Tip fundație')}:</b> <b>{tip_fundatie_de}</b>")
-    overview_items.append(f"<b>{enforcer.get('Dachtyp')}:</b> <b>{tip_acoperis_de}</b>")
-    # Învelitoare / material acoperiș: relevant pentru oferte cu finisaje sau pachet acoperiș „complet”; nu la Rohbau fără finisaje
-    if inclusions_ov.get("finishes", False) and material_acoperis_de != "—":
-        overview_items.append(f"<b>{enforcer.get('Dachmaterial')}:</b> <b>{material_acoperis_de}</b>")
-    
-    # Dämmung & Dachdeckung — doar când oferta include finisaje sau utilități (nu Rohbau/Tragwerk pur)
-    dd = frontend_data.get("daemmungDachdeckung") or {}
-    daemmung = dd.get("daemmung")
-    dachdeckung = dd.get("dachdeckung")
-    unterdach = dd.get("unterdach")
-    dachstuhl_typ = dd.get("dachstuhlTyp")
-    if inclusions_ov.get("finishes") or inclusions_ov.get("utilities"):
-        if daemmung:
-            overview_items.append(f"<b>{enforcer.get('Dämmung')}:</b> <b>{enforcer.get(daemmung) or daemmung}</b>")
-        if dachdeckung:
-            overview_items.append(f"<b>{enforcer.get('Dachdeckung')}:</b> <b>{enforcer.get(dachdeckung) or dachdeckung}</b>")
-        if unterdach:
-            overview_items.append(f"<b>{enforcer.get('Unterdach')}:</b> <b>{enforcer.get(unterdach) or unterdach}</b>")
-        if dachstuhl_typ:
-            overview_items.append(f"<b>{enforcer.get('Dachstuhl-Typ')}:</b> <b>{enforcer.get(dachstuhl_typ) or dachstuhl_typ}</b>")
-    
-    # Semineu, Heizung, Energie, Fertigstellungsgrad — doar pentru oferte care includ utilități / finisaje
-    print(f"🔍 [PDF] tip_semineu value: '{tip_semineu}', type: {type(tip_semineu)}")
-    tip_semineu_str = str(tip_semineu).strip() if tip_semineu else ""
-    if inclusions_ov.get("utilities"):
-        if tip_semineu_str:
-            semineu_de = enforcer.get(tip_semineu_str) if tip_semineu_str else tip_semineu_str
-            overview_items.append(f"<b>{enforcer.get('Kamin')}:</b> <b>{semineu_de}</b>")
-            if tip_semineu_str != "Kein Kamin" and tip_semineu_str.lower() != "kein kamin":
-                overview_items.append(f"<b>{enforcer.get('Kaminabzug')}:</b> <b>für {num_floors} Geschosse</b>")
-                print(f"✅ [PDF] Semineu afișat: '{semineu_de}' cu horn pentru {num_floors} etaje")
-            else:
-                print(f"✅ [PDF] Semineu afișat: '{semineu_de}' (fără horn)")
-        else:
-            print(f"⚠️ [PDF] Semineu nu este afișat: tip_semineu este gol")
-        if incalzire_de != "—":
-            overview_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> <b>{incalzire_de}</b>")
-        if nivel_energetic_de != "—":
-            overview_items.append(f"<b>{enforcer.get('Nivel energetic')}:</b> <b>{nivel_energetic_de}</b>")
-    if inclusions_ov.get("finishes"):
-        overview_items.append(f"<b>{enforcer.get('Fertigstellungsgrad')}:</b> <b>{nivel_finisare_de}</b>")
+    overview_items.extend(
+        build_selected_form_overview_items(
+            frontend_data,
+            enforcer,
+            inclusions_ov,
+            finishes_per_floor,
+            num_floors,
+            acces_santier_de=acces_santier_de,
+            tip_fundatie_de=tip_fundatie_de,
+            tip_sistem_de=tip_sistem_de,
+            tip_acoperis_de=tip_acoperis_de,
+            material_acoperis_de=material_acoperis_de,
+            incalzire_de=incalzire_de,
+            nivel_energetic_de=nivel_energetic_de,
+            nivel_finisare_de=nivel_finisare_de,
+            tip_semineu=tip_semineu,
+        )
+    )
     
     for item in overview_items:
         story.append(Paragraph(item, styles["Body"]))
@@ -2468,42 +2463,73 @@ def _precision_section(story, styles, enforcer: GermanEnforcer):
     ))
     story.append(Spacer(1, 3*mm))
 
-def _legal_disclaimer(story, styles, enforcer: GermanEnforcer):
+def _legal_disclaimer(story, styles, enforcer: GermanEnforcer, pdf_texts: dict | None = None):
     """Legal disclaimer complet"""
+    pdf_texts = pdf_texts or {}
+    legal_title = str(pdf_texts.get("legal_title") or enforcer.get("Rechtlicher Hinweis / Haftungsausschluss"))
+    legal_content_raw = str(pdf_texts.get("legal_content_raw") or "").strip()
+    legal_paragraph_1 = str(
+        pdf_texts.get("legal_paragraph_1")
+        or enforcer.get("Dieses Dokument ist eine unverbindliche Kostenschätzung zur ersten Budgetorientierung und ersetzt kein verbindliches Angebot.")
+    )
+    legal_paragraph_2 = str(
+        pdf_texts.get("legal_paragraph_2")
+        or enforcer.get("Die dargestellten Werte basieren auf den vom Nutzer bereitgestellten Informationen und typischen Erfahrungswerten der jeweiligen Holzbaufirma.")
+    )
+    legal_paragraph_3 = str(
+        pdf_texts.get("legal_paragraph_3")
+        or enforcer.get("Abweichungen durch Planänderungen, Ausführungsdetails, Grundstücksgegebenheiten, behördliche Auflagen oder individuelle Wünsche sind möglich.")
+    )
+    legal_exclusions_intro = str(
+        pdf_texts.get("legal_exclusions_intro")
+        or enforcer.get("Nicht Bestandteil dieser Schätzung sind insbesondere:")
+    )
+    legal_exclusions = pdf_texts.get("legal_exclusions")
+    if isinstance(legal_exclusions, str):
+        legal_exclusions = [ln.strip() for ln in legal_exclusions.splitlines() if ln.strip()]
+    if not isinstance(legal_exclusions, list) or not legal_exclusions:
+        legal_exclusions = [
+            enforcer.get("Außenanlagen (z. B. Einfriedungen, Einfahrten, Garten- und Landschaftsgestaltung)"),
+            enforcer.get("statische Berechnungen"),
+            enforcer.get("bauphysikalische Nachweise"),
+            enforcer.get("Grundstücks- und Bodenbeschaffenheit"),
+            enforcer.get("Förderungen, Gebühren und Abgaben"),
+            enforcer.get("behördliche oder rechtliche Prüfungen"),
+        ]
+    legal_final_paragraph = str(
+        pdf_texts.get("legal_final_paragraph")
+        or enforcer.get("Die endgültige Preisfestlegung erfolgt ausschließlich im Rahmen eines individuellen Angebots nach detaillierter Planung und Prüfung durch die ausführende Holzbaufirma.")
+    )
+
     # Adaugă PageBreak doar dacă e necesar (nu automat)
     story.append(Spacer(1, 5*mm))
-    story.append(Paragraph(enforcer.get("Rechtlicher Hinweis / Haftungsausschluss"), styles["H1"]))
-    story.append(Spacer(1, 2*mm))
-    
-    story.append(Paragraph(
-        enforcer.get("Dieses Dokument ist eine unverbindliche Kostenschätzung zur ersten Budgetorientierung und ersetzt kein verbindliches Angebot."),
-        styles["Body"]
-    ))
-    story.append(Paragraph(
-        enforcer.get("Die dargestellten Werte basieren auf den vom Nutzer bereitgestellten Informationen und typischen Erfahrungswerten der jeweiligen Holzbaufirma."),
-        styles["Body"]
-    ))
-    story.append(Spacer(1, 2*mm))
-    
-    story.append(Paragraph(
-        enforcer.get("Abweichungen durch Planänderungen, Ausführungsdetails, Grundstücksgegebenheiten, behördliche Auflagen oder individuelle Wünsche sind möglich."),
-        styles["Body"]
-    ))
-    story.append(Spacer(1, 2*mm))
-    
-    story.append(Paragraph(enforcer.get("Nicht Bestandteil dieser Schätzung sind insbesondere:"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("Außenanlagen (z. B. Einfriedungen, Einfahrten, Garten- und Landschaftsgestaltung)"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("statische Berechnungen"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("bauphysikalische Nachweise"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("Grundstücks- und Bodenbeschaffenheit"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("Förderungen, Gebühren und Abgaben"), styles["Body"]))
-    story.append(Paragraph("• " + enforcer.get("behördliche oder rechtliche Prüfungen"), styles["Body"]))
-    story.append(Spacer(1, 2*mm))
-    
-    story.append(Paragraph(
-        enforcer.get("Die endgültige Preisfestlegung erfolgt ausschließlich im Rahmen eines individuellen Angebots nach detaillierter Planung und Prüfung durch die ausführende Holzbaufirma."),
-        styles["Body"]
-    ))
+    legal_block = [Paragraph(legal_title, styles["H1"]), Spacer(1, 2*mm)]
+
+    if legal_content_raw:
+        blocks = [block.strip() for block in legal_content_raw.split("\n\n") if block.strip()]
+        for block in blocks:
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if lines and all(line.startswith(("-", "*", "•")) for line in lines):
+                for line in lines:
+                    legal_block.append(Paragraph("• " + line.lstrip("-*• ").strip(), styles["Body"]))
+                legal_block.append(Spacer(1, 2*mm))
+            else:
+                legal_block.append(Paragraph("<br/>".join(lines), styles["Body"]))
+                legal_block.append(Spacer(1, 2*mm))
+        story.append(KeepTogether(legal_block))
+        return
+
+    legal_block.append(Paragraph(legal_paragraph_1, styles["Body"]))
+    legal_block.append(Paragraph(legal_paragraph_2, styles["Body"]))
+    legal_block.append(Spacer(1, 2*mm))
+    legal_block.append(Paragraph(legal_paragraph_3, styles["Body"]))
+    legal_block.append(Spacer(1, 2*mm))
+    legal_block.append(Paragraph(legal_exclusions_intro, styles["Body"]))
+    for item in legal_exclusions:
+        legal_block.append(Paragraph("• " + str(item), styles["Body"]))
+    legal_block.append(Spacer(1, 2*mm))
+    legal_block.append(Paragraph(legal_final_paragraph, styles["Body"]))
+    story.append(KeepTogether(legal_block))
 
 
 def _roof_only_intro(story, styles, client: dict, enforcer: GermanEnforcer):
@@ -2603,6 +2629,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     branding = _apply_branding(tenant_slug)
     assets = (branding.get("assets") or {}) if isinstance(branding, dict) else {}
     company_overrides = (branding.get("company") or {}) if isinstance(branding, dict) else {}
+    pdf_text_overrides = (branding.get("texts") or {}) if isinstance(branding, dict) else {}
     # Prefer logo and company from job (Preisdatenbank) – signed logo URL and company data sent by API
     if isinstance(frontend_data, dict):
         job_pdf_assets = frontend_data.get("pdf_assets")
@@ -2612,6 +2639,9 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         if isinstance(job_pdf_company, dict) and job_pdf_company:
             company_overrides = {**company_overrides, **job_pdf_company}
             print(f"🔍 [PDF] pdf_company from job: name={job_pdf_company.get('name')!r}, addr_lines={job_pdf_company.get('addr_lines')!r}, phone={job_pdf_company.get('phone')!r}, email={job_pdf_company.get('email')!r}, keys={list(job_pdf_company.keys())}", flush=True)
+        job_pdf_texts = frontend_data.get("pdf_texts")
+        if isinstance(job_pdf_texts, dict) and job_pdf_texts:
+            pdf_text_overrides = {**pdf_text_overrides, **job_pdf_texts}
     offer_prefix = (branding.get("offer_prefix") or "CHH") if isinstance(branding, dict) else "CHH"
     client_id = (branding.get("client_id") or offer_prefix) if isinstance(branding, dict) else offer_prefix
     handler = (branding.get("handler_name") or "Florian Siemer") if isinstance(branding, dict) else "Florian Siemer"
@@ -2858,7 +2888,14 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             except Exception as _e:
                 pass
     else:
-        _intro(story, styles, client_data_untranslated, enforcer, offer_title)
+        _intro(
+            story,
+            styles,
+            client_data_untranslated,
+            enforcer,
+            offer_title,
+            str(pdf_text_overrides.get("intro_content") or ""),
+        )
         # Secțiunea 2: Prezentare generală proiect (doar informații comune)
         frontend_data_with_run_id = {**frontend_data, "run_id": run_id}
         _project_overview(story, styles, frontend_data_with_run_id, enforcer, plans_data)
@@ -2886,10 +2923,10 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 obj_type = str(op.get("type", "")).lower()
                 area_m2 = float(op.get("area_m2", 0.0))
                 
-                if "window" in obj_type:
+                if "window" in obj_type or obj_type == "sliding_door":
                     total_windows_global += 1
                     total_windows_area_global += area_m2
-                elif "door" in obj_type:
+                elif "door" in obj_type and obj_type != "sliding_door":
                     total_doors_global += 1
                     total_doors_area_global += area_m2
                     # Status poate fi în status sau location (pentru compatibilitate)
@@ -2953,9 +2990,9 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                         obj_type = str(op.get("type", "")).lower()
                         cost = float(op.get("total_cost", op.get("cost", 0.0)))
                         
-                        if "window" in obj_type:
+                        if "window" in obj_type or obj_type == "sliding_door":
                             windows_total_price += cost
-                        elif "door" in obj_type:
+                        elif "door" in obj_type and obj_type != "sliding_door":
                             doors_total_price += cost
                 if roof_skylight_total_cost > 0:
                     windows_total_price += roof_skylight_total_cost
@@ -3133,7 +3170,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     if roof_only:
         _legal_disclaimer_roof_only(story, styles, enforcer)
     else:
-        _legal_disclaimer(story, styles, enforcer)
+        _legal_disclaimer(story, styles, enforcer, pdf_text_overrides)
     
     doc.build(
         story, 
@@ -3831,9 +3868,11 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     if inclusions.get("finishes"):
         story.append(Paragraph("<b>Step – Materials &amp; finish level</b>", styles["H3"]))
         story.append(Paragraph(f"Interior finish (basement): {_en(materiale_finisaj.get('finisajInteriorBeci'))}", styles["Body"]))
-        story.append(Paragraph(f"Interior finish (ground floor): {_en(materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish inner walls (ground floor): {_en(materiale_finisaj.get('finisajInteriorInnen_ground') or materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish exterior walls (ground floor): {_en(materiale_finisaj.get('finisajInteriorAussen_ground') or materiale_finisaj.get('finisajInterior_ground'))}", styles["Body"]))
         story.append(Paragraph(f"Facade (ground floor): {_en(materiale_finisaj.get('fatada_ground'))}", styles["Body"]))
-        story.append(Paragraph(f"Interior finish (attic): {_en(materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish inner walls (attic): {_en(materiale_finisaj.get('finisajInteriorInnenMansarda') or materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
+        story.append(Paragraph(f"Interior finish exterior walls (attic): {_en(materiale_finisaj.get('finisajInteriorAussenMansarda') or materiale_finisaj.get('finisajInteriorMansarda'))}", styles["Body"]))
         story.append(Paragraph(f"Facade (attic): {_en(materiale_finisaj.get('fatadaMansarda'))}", styles["Body"]))
     if inclusions.get("roof"):
         story.append(Paragraph("<b>Step – Roof covering (material)</b>", styles["H3"]))

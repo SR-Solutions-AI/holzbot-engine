@@ -78,6 +78,32 @@ def _build_coeffs_from_data_map(data_map: dict) -> dict:
                 "3-fach verglast": data_map.get("window_3_fach_price", 420),
                 "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
             },
+            "sliding_door_prices_per_m2": {
+                "Standard": data_map.get("sliding_door_standard_price", 690),
+                "Hebeschiebetür": data_map.get("sliding_door_hebeschiebetuer_price", 880),
+                "Panorama": data_map.get("sliding_door_panorama_price", 1040),
+                "Aluminium Premium": data_map.get("sliding_door_aluminium_premium_price", 980),
+            },
+        },
+        "finishes": {
+            "interior_inner": {
+                "Tencuială": data_map.get("interior_tencuiala", 0),
+                "Lemn": data_map.get("interior_lemn", 0),
+                "Fibrociment": data_map.get("interior_fibrociment", 0),
+                "Mix": data_map.get("interior_mix", 0),
+            },
+            "interior_outer": {
+                "Tencuială": data_map.get("interior_outer_tencuiala", data_map.get("interior_tencuiala", 0)),
+                "Lemn": data_map.get("interior_outer_lemn", data_map.get("interior_lemn", 0)),
+                "Fibrociment": data_map.get("interior_outer_fibrociment", data_map.get("interior_fibrociment", 0)),
+                "Mix": data_map.get("interior_outer_mix", data_map.get("interior_mix", 0)),
+            },
+            "exterior": {
+                "Tencuială": data_map.get("exterior_tencuiala", 0),
+                "Lemn": data_map.get("exterior_lemn", 0),
+                "Fibrociment": data_map.get("exterior_fibrociment", 0),
+                "Mix": data_map.get("exterior_mix", 0),
+            },
         },
         "utilities": {
             "electricity": {
@@ -178,6 +204,8 @@ class TestPreisdatenbankMapping:
             "window_2_fach_price": 320.0,
             "window_3_fach_price": 420.0,
             "window_3fach_passiv_price": 580.0,
+            "sliding_door_standard_price": 690.0,
+            "sliding_door_panorama_price": 1040.0,
             "electricity_base_price": 62.0,
             "heating_base_price": 72.0,
             "sewage_base_price": 46.0,
@@ -189,6 +217,8 @@ class TestPreisdatenbankMapping:
         assert out["openings"]["windows_price_per_m2"]["2-fach verglast"] == 320.0
         assert out["openings"]["windows_price_per_m2"]["3-fach verglast"] == 420.0
         assert out["openings"]["windows_price_per_m2"]["3-fach verglast, Passiv"] == 580.0
+        assert out["openings"]["sliding_door_prices_per_m2"]["Standard"] == 690.0
+        assert out["openings"]["sliding_door_prices_per_m2"]["Panorama"] == 1040.0
         assert out["utilities"]["electricity"]["coefficient_electricity_per_m2"] == 62.0
         assert out["utilities"]["heating"]["coefficient_heating_per_m2"] == 72.0
         assert out["utilities"]["sewage"]["coefficient_sewage_per_m2"] == 46.0
@@ -266,3 +296,33 @@ class TestPreisdatenbankPricesApplied:
         assert result["total_cost"] == 2 * (4800.0 + 750.0)
         struct = next(i for i in result["detailed_items"] if i["category"] == "stairs_structure")
         assert struct["unit_price"] == 4800.0
+
+    def test_sliding_door_priced_per_m2_and_kept_in_openings(self):
+        from pricing.modules.openings import calculate_openings_details
+
+        coeffs = {
+            "door_interior_prices": {"Standard": 320.0},
+            "door_exterior_prices": {"Standard": 1450.0},
+            "windows_price_per_m2": {"3-fach verglast": 420.0},
+            "sliding_door_prices_per_m2": {"Standard": 690.0, "Panorama": 1040.0},
+        }
+        frontend = {
+            "ferestreUsi": {
+                "windowQuality": "3-fach verglast",
+                "doorMaterialInterior": "Standard",
+                "doorMaterialExterior": "Standard",
+                "slidingDoorType": "Panorama",
+            }
+        }
+
+        result = calculate_openings_details(
+            coeffs,
+            [{"id": 1, "type": "sliding_door", "width_m": 2.4, "height_m": 2.1, "status": "exterior"}],
+            frontend,
+        )
+
+        assert result["total_cost"] == round(2.4 * 2.1 * 1040.0, 2)
+        item = result["items"][0]
+        assert item["type"] == "sliding_door"
+        assert item["material"] == "Panorama"
+        assert item["price_unit"] == "€/m²"

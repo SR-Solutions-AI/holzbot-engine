@@ -83,12 +83,14 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
                 ext_net += a
         fin = bd.get("finishes", {}) or {}
         items_fin = fin.get("detailed_items", []) or fin.get("items", [])
-        fin_int = fin_ext = 0.0
+        fin_int_inner = fin_int_outer = fin_ext = 0.0
         for it in items_fin:
             cat = str(it.get("category", "")).lower()
             a = float(it.get("area_m2", 0) or 0)
-            if cat == "finish_interior":
-                fin_int += a
+            if cat in {"finish_interior", "finish_interior_inner"}:
+                fin_int_inner += a
+            elif cat == "finish_interior_outer":
+                fin_int_outer += a
             elif cat == "finish_exterior":
                 fin_ext += a
         fc = bd.get("floors_ceilings", {}) or {}
@@ -170,7 +172,9 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
             "plan_id": plan_dir.name,
             "structure_int_net_m2": round(int_net, 2),
             "structure_ext_net_m2": round(ext_net, 2),
-            "finish_int_net_m2": round(fin_int, 2),
+            "finish_int_inner_net_m2": round(fin_int_inner, 2),
+            "finish_int_outer_net_m2": round(fin_int_outer, 2),
+            "finish_int_net_m2": round(fin_int_inner + fin_int_outer, 2),
             "finish_ext_net_m2": round(fin_ext, 2),
             "floor_area_m2": round(floor_area, 2),
             "ceiling_area_m2": round(ceiling_area, 2),
@@ -215,6 +219,26 @@ def _roof_floor_mapping_for_pdf(run_id: str, out_root: Path) -> tuple[dict[int, 
     return disk, plan_to_idx
 
 
+def _read_manifest_plan_ids(run_id: str) -> dict[int, str]:
+    """Ordinea tab-urilor din review UI (manifest): 0 = primul blueprint afișat în editor."""
+    manifest_path = JOBS_ROOT / run_id / "detections_review_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    plan_ids = raw.get("rasterPlanIds") if isinstance(raw, dict) else None
+    if not isinstance(plan_ids, list):
+        return {}
+    out: dict[int, str] = {}
+    for idx, value in enumerate(plan_ids):
+        pid = str(value or "").strip()
+        if pid:
+            out[idx] = pid
+    return out
+
+
 def _load_roof_windows_by_plan(out_root: Path, run_id: str) -> dict[str, dict[str, float]]:
     """
     Returnează agregare per plan pentru Dachfenster din roof_windows_edited.json:
@@ -231,8 +255,14 @@ def _load_roof_windows_by_plan(out_root: Path, run_id: str) -> dict[str, dict[st
         return out
     if not isinstance(raw, dict):
         return out
-    idx_to_plan, _ = _roof_floor_mapping_for_pdf(run_id, out_root)
+    key_scheme = str(raw.get("_floor_key_scheme") or "").strip().lower()
+    if key_scheme == "manifest":
+        idx_to_plan = _read_manifest_plan_ids(run_id)
+    else:
+        idx_to_plan, _ = _roof_floor_mapping_for_pdf(run_id, out_root)
     for floor_key, windows in raw.items():
+        if str(floor_key).startswith("_"):
+            continue
         try:
             floor_idx = int(floor_key)
         except (TypeError, ValueError):
@@ -378,7 +408,8 @@ def _append_building_measurements_table(
         ["Strukturen Außenwände (netto)", f"{fd['structure_ext_net_m2']:.2f}", "m²"],
     ]
     if show_finish:
-        rows.append(["Innenausbau (netto)", f"{fd['finish_int_net_m2']:.2f}", "m²"])
+        rows.append(["Innenausbau Innenwände (netto)", f"{fd.get('finish_int_inner_net_m2', 0.0):.2f}", "m²"])
+        rows.append(["Innenausbau Außenwände (netto)", f"{fd.get('finish_int_outer_net_m2', 0.0):.2f}", "m²"])
         rows.append(["Außenfassade (netto)", f"{fd['finish_ext_net_m2']:.2f}", "m²"])
     rows.extend(
         [
