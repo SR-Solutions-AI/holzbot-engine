@@ -3353,6 +3353,23 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                         pass
             if order_from_bottom is not None and basement_plan_index is not None:
                 break
+
+        if order_from_bottom is None:
+            mp = JOBS_ROOT / run_id / "detections_review_manifest.json"
+            if mp.exists():
+                try:
+                    mdata = json.loads(mp.read_text(encoding="utf-8"))
+                    fpo = mdata.get("floorPlanOrder")
+                    n_pi = len(plan_infos)
+                    if (
+                        isinstance(fpo, list)
+                        and len(fpo) == n_pi
+                        and n_pi > 0
+                        and {int(x) for x in fpo} == set(range(n_pi))
+                    ):
+                        order_from_bottom = [int(x) for x in fpo]
+                except Exception:
+                    pass
         
         # Ordine finală: folosim order_from_bottom dacă există, altfel păstrăm sortarea ground_floor apoi restul
         enriched_by_idx = {p["index"]: p for p in enriched_plans}

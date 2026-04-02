@@ -31,6 +31,39 @@ from area.config import STANDARD_DOOR_HEIGHT_M, STANDARD_WINDOW_HEIGHT_M
 from area.calculator import _infer_window_height_from_width
 
 
+def _load_floor_plan_order_and_labels_from_manifest(
+    run_id: str, job_root: Path | None
+) -> tuple[list[int] | None, list[str] | None]:
+    """
+    floorPlanOrder: order_from_bottom[pos] = original plan index (0 = lowest floor).
+    floorLabels: one label per original plan index.
+    """
+    candidates: list[Path] = []
+    if job_root:
+        candidates.append(job_root / "detections_review_manifest.json")
+    candidates.append(JOBS_ROOT / run_id / "detections_review_manifest.json")
+    for mp in candidates:
+        if not mp.exists():
+            continue
+        try:
+            data = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        order_raw = data.get("floorPlanOrder")
+        labels_raw = data.get("floorLabels")
+        labels: list[str] | None = None
+        if isinstance(labels_raw, list):
+            labels = [str(x) if x is not None else "" for x in labels_raw]
+        if not isinstance(order_raw, list) or not order_raw:
+            return None, labels
+        try:
+            order = [int(x) for x in order_raw]
+        except (TypeError, ValueError):
+            return None, labels
+        return order, labels
+    return None, None
+
+
 def _opening_area_m2_from_row(o: dict) -> float:
     """Pentru measurements_plan: obiectele au adesea doar width_m, nu area_m2."""
     if not isinstance(o, dict):
@@ -467,11 +500,31 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     except PlansListError:
         plan_infos = []
 
-    # Aceeași ordine ca în plans_list.json și în orchestrator (review_paths → manifest → editor).
-    plans_ordered = list(plan_infos)
+    # floorPlanOrder / floor_perm: poziție 0 = cel mai jos etaj (Keller/EG). PDF: aceeași ordine (prima pagină = cel mai jos).
+    plans_orig = list(plan_infos)
+    n_plans = len(plans_orig)
+    floor_perm, manifest_labels = _load_floor_plan_order_and_labels_from_manifest(run_id, job_root)
+    if (
+        floor_perm
+        and n_plans > 0
+        and len(floor_perm) == n_plans
+        and sorted(floor_perm) == list(range(n_plans))
+    ):
+        plans_ordered = [plans_orig[i] for i in floor_perm]
+    else:
+        plans_ordered = plans_orig
+        floor_perm = None
+    plans_pdf_sequence = plans_ordered
 
     plan_id_to_stockwerk: dict[str, str] = {}
     for i, p in enumerate(plans_ordered):
+        if floor_perm is not None and manifest_labels:
+            oi = floor_perm[i]
+            if 0 <= oi < len(manifest_labels):
+                lbl = (manifest_labels[oi] or "").strip()
+                if lbl:
+                    plan_id_to_stockwerk[p.plan_id] = lbl
+                    continue
         plan_id_to_stockwerk[p.plan_id] = f"Stockwerk {i + 1}"
 
     roof_floor_idx_to_plan, plan_id_to_roof_floor_idx = _roof_floor_mapping_for_pdf(run_id, out_root)
@@ -554,8 +607,8 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     story.append(Paragraph("Mengenermittlung", title_style))
     story.append(Spacer(1, 3 * mm))
 
-    if plans_ordered:
-        for si, plan in enumerate(plans_ordered):
+    if plans_pdf_sequence:
+        for si, plan in enumerate(plans_pdf_sequence):
             if si > 0:
                 story.append(PageBreak())
             sw = plan_id_to_stockwerk[plan.plan_id]
