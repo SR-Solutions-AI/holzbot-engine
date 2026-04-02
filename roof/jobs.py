@@ -932,10 +932,10 @@ def run_roof_for_run(run_id: str, max_parallel: int | None = None, notify_ui_eve
     num_floors_roof = len(plans_roof)
     num_floors_for_gemini = (num_floors_roof - 1) if basement_idx is not None else num_floors_roof
 
-    # Tip acoperiș ȘI unghi per etaj: din Gemini (side_view); beciul primește 2_w și default angle
+    # Tip acoperiș / unghi: nu mai trimitem Ansichten la Gemini (doar fallback 2_w + unghi default din pipeline).
     floor_roof_types: dict | None = None
     floor_roof_angles: dict | None = None
-    side_views = _collect_side_views(job_root)
+    side_views: List[Path] = []
     if not side_views or num_floors_for_gemini < 1:
         print(f"\n>>> PAS ROOF GEMINI: NU RULEAZĂ (side_views={len(side_views) if side_views else 0}, num_floors_for_gemini={num_floors_for_gemini}) – folosesc fallback 2_w + default unghi <<<\n", flush=True)
     if side_views and num_floors_for_gemini >= 1:

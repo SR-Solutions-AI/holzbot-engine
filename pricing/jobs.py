@@ -308,6 +308,7 @@ def _run_for_single_plan(
                     frontend_data=frontend_data,
                     is_top_floor=is_top_floor_plan,
                     floor_height_m_by_option=pricing_coeffs.get("area", {}).get("floor_height_m"),
+                    door_height_m_by_option=pricing_coeffs.get("openings", {}).get("door_height_m"),
                 )
                 area_data["surface_area_source"] = area_source
                 if area_source == "09_interior_mask":

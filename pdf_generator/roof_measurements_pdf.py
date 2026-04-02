@@ -361,6 +361,14 @@ def _roof_rect_table_rows(rec: dict[str, Any]) -> list[list[str]]:
     return rows
 
 
+def _append_dachfenster_rows(rows: list[list[str]], roof_windows_count: int, roof_windows_area_m2: float) -> None:
+    """Append Dachfenster directly to the roof table rows."""
+    if roof_windows_count > 0:
+        rows.append(["Anzahl Dachfenster (Öffnungen)", str(max(0, int(roof_windows_count))), "Stk."])
+    if roof_windows_area_m2 > 0:
+        rows.append(["Dachfensterfläche", f"{max(0.0, float(roof_windows_area_m2)):.2f}", "m²"])
+
+
 def _style_data_table(t: Table) -> None:
     t.setStyle(
         TableStyle(
@@ -398,9 +406,10 @@ def _append_building_measurements_table(
     show_win = bool(inc.get("openings"))
     show_doors = bool(inc.get("openings_doors"))
 
-    total_windows = int(fd["num_windows"]) + int(max(0, roof_windows_count))
-    base_oa = float(fd["openings_area_m2"])
-    total_openings_area = base_oa + max(0.0, float(roof_windows_area_m2))
+    # Fenster / Öffnungsfläche: Dachfenster werden im Dach-Tabellenblock ausgewiesen.
+    total_windows = max(0, int(fd["num_windows"]) - int(roof_windows_count))
+    base_oa = max(0.0, float(fd["openings_area_m2"]) - float(roof_windows_area_m2))
+    total_openings_area = base_oa
     story.append(Paragraph(f"<b>{_measurements_section_title_stockwerk(sw)}</b>", heading_style))
     rows = [
         ["Element", "Wert", "Einheit"],
@@ -420,30 +429,9 @@ def _append_building_measurements_table(
     if show_doors:
         rows.append(["Anzahl Türen", str(fd["num_doors"]), "Stk."])
     if show_win:
-        rows.append(["Anzahl Fenster (inkl. Dachfenster)", str(total_windows), "Stk."])
+        rows.append(["Anzahl Fenster", str(total_windows), "Stk."])
     # Gesamtfläche aller Öffnungen pro Geschoss – immer (Angebotsumfang steuert nur Stückzahlen/Zuschläge, nicht die Mengenermittlung)
     rows.append(["Gesamtfläche Öffnungen", f"{total_openings_area:.2f}", "m²"])
-    t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
-    _style_data_table(t)
-    story.append(t)
-    story.append(Spacer(1, 8 * mm))
-
-
-def _append_roof_openings_table(
-    story: list,
-    sw: str,
-    heading_style: ParagraphStyle,
-    roof_windows_count: int,
-    roof_windows_area_m2: float,
-) -> None:
-    if roof_windows_count <= 0 and roof_windows_area_m2 <= 0:
-        return
-    story.append(Paragraph(f"<b>{sw} – Öffnungen</b>", heading_style))
-    rows = [
-        ["Element", "Wert", "Einheit"],
-        ["Anzahl Fenster (inkl. Dachfenster)", str(max(0, int(roof_windows_count))), "Stk."],
-        ["Dachfensterfläche", f"{max(0.0, float(roof_windows_area_m2)):.2f}", "m²"],
-    ]
     t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
     _style_data_table(t)
     story.append(t)
@@ -595,7 +583,15 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                 rect_idx = int(rec.get("rectangle_idx", 0))
                 roof_name = "Dach" if rect_idx == 0 else f"Dach {rect_idx + 1}"
                 story.append(Paragraph(f"<b>{sw} – {roof_name}</b>", heading_style))
-                t_rect = Table(_roof_rect_table_rows(rec), colWidths=[90 * mm, 50 * mm, 25 * mm])
+                rows_rect = _roof_rect_table_rows(rec)
+                if rect_idx == 0:
+                    rw = roof_windows_by_plan.get(plan.plan_id, {})
+                    _append_dachfenster_rows(
+                        rows_rect,
+                        int(rw.get("count", 0) or 0),
+                        float(rw.get("area_m2", 0.0) or 0.0),
+                    )
+                t_rect = Table(rows_rect, colWidths=[90 * mm, 50 * mm, 25 * mm])
                 _style_data_table(t_rect)
                 story.append(t_rect)
                 story.append(Spacer(1, 6 * mm))
@@ -627,6 +623,12 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                             ["Fläche Innenausbau (Innenverkleidung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"]
                         )
                     rows.append(["Fläche Unterspannbahn / Folie", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"])
+                    rw = roof_windows_by_plan.get(plan.plan_id, {})
+                    _append_dachfenster_rows(
+                        rows,
+                        int(rw.get("count", 0) or 0),
+                        float(rw.get("area_m2", 0.0) or 0.0),
+                    )
                     t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
                     _style_data_table(t)
                     story.append(t)
@@ -645,8 +647,6 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     roof_windows_area_m2=rw_area,
                     inc=pdf_inclusions,
                 )
-            elif roof_only:
-                _append_roof_openings_table(story, sw, heading_style, rw_count, rw_area)
 
     else:
         # Kein plans_list: nur Dachtabellen nach roof_floor_idx
@@ -657,7 +657,16 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                 fl = label_for_roof_floor_idx(floor_idx)
                 roof_name = "Dach" if rect_idx == 0 else f"Dach {rect_idx + 1}"
                 story.append(Paragraph(f"<b>{fl} – {roof_name}</b>", heading_style))
-                t_rect = Table(_roof_rect_table_rows(rec), colWidths=[90 * mm, 50 * mm, 25 * mm])
+                rows_rect = _roof_rect_table_rows(rec)
+                pid = plan_id_for_roof_floor_idx(floor_idx)
+                if rect_idx == 0 and pid:
+                    rw = roof_windows_by_plan.get(pid, {})
+                    _append_dachfenster_rows(
+                        rows_rect,
+                        int(rw.get("count", 0) or 0),
+                        float(rw.get("area_m2", 0.0) or 0.0),
+                    )
+                t_rect = Table(rows_rect, colWidths=[90 * mm, 50 * mm, 25 * mm])
                 _style_data_table(t_rect)
                 story.append(t_rect)
                 story.append(Spacer(1, 8 * mm))
@@ -679,6 +688,14 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                         ["Fläche Innenausbau (Innenverkleidung)", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"]
                     )
                 rows.append(["Fläche Unterspannbahn / Folie", f"{area_m2:.2f}" if area_m2 is not None else "—", "m²"])
+                pid = plan_id_for_roof_floor_idx(idx)
+                if pid:
+                    rw = roof_windows_by_plan.get(pid, {})
+                    _append_dachfenster_rows(
+                        rows,
+                        int(rw.get("count", 0) or 0),
+                        float(rw.get("area_m2", 0.0) or 0.0),
+                    )
                 t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
                 _style_data_table(t)
                 story.append(t)

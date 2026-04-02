@@ -219,6 +219,11 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Schwingtor": float(data_map.get("garage_door_schwingtor_stueck", 2600)),
                 "Seiten-Sektionaltor": float(data_map.get("garage_door_seiten_sektional_stueck", 3800)),
             },
+            "door_height_m": {
+                "Standard (2,01 m)": float(data_map.get("door_height_standard_m", 2.01)),
+                "Komfort (2,10 m)": float(data_map.get("door_height_komfort_m", 2.10)),
+                "Hoch (2,20 m)": float(data_map.get("door_height_hoch_m", 2.20)),
+            },
         },
         "area": {
             "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0),
@@ -364,6 +369,8 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                     out.setdefault("openings", {}).setdefault("sliding_door_prices_per_m2", {})[label] = val
                 elif tag == "garage_door_type":
                     out.setdefault("openings", {}).setdefault("garage_door_prices", {})[label] = val
+                elif tag == "door_height":
+                    out.setdefault("openings", {}).setdefault("door_height_m", {})[label] = val
     except Exception:
         pass
 

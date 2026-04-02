@@ -471,6 +471,7 @@ def run_segmentation_and_classification_for_document(
     # ---------- Verificare număr etaje vs formular (chiar după ce știm ce e blueprint) ----------
     frontend_data = load_frontend_data_for_run(job_root.name, job_root)
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
+    measurements_only_offer = bool(frontend_data.get("measurements_only_offer"))
     our_floors = len(house_plans)
     floors_number = frontend_data.get("floorsNumber")
     basement = frontend_data.get("basement", False)
@@ -509,7 +510,7 @@ def run_segmentation_and_classification_for_document(
     if isinstance(lista_etaje, list) and has_mansarda_wohnflaeche:
         _extra_suffix += ", Dachgeschoss (Wohnfläche)"
     print(f"   📋 Formular: etaje așteptate (cu beci{_extra_suffix}) = {user_expected}  |  Planuri blueprint = {our_floors}")
-    if not roof_only_offer and our_floors != user_expected:
+    if not roof_only_offer and not measurements_only_offer and our_floors != user_expected:
         print(f"\n⛔ Număr etaje: plan încărcat={our_floors}, formular (cu beci)={user_expected}")
         print(">>> ERROR: Numărul de etaje din planul încărcat nu coincide cu cel ales din formular.")
         sys.exit(1)
@@ -761,6 +762,7 @@ def run_segmentation_and_classification_for_document(
                 admin_pdf_path = None
                 calc_method_pdf_path = None
                 roof_pdf_path = None
+                measurements_only = bool(frontend_data.get("measurements_only_offer"))
                 try:
                     # Generează roof_pricing.json înainte de PDF (pentru ofertă cu prețuri acoperiș)
                     try:
@@ -768,25 +770,31 @@ def run_segmentation_and_classification_for_document(
                     except Exception as rp_err:
                         print(f"⚠️ Roof pricing Error: {rp_err}")
                     set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 12)  # început PDF
-                    pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
-                    print(f"✅ [PDF] User PDF generated: {pdf_path}")
-                    notify_ui("pdf_generation", pdf_path)
-                    set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 8)
-                    admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
-                    print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
-                    notify_ui("pdf_generation", admin_pdf_path)
-                    set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 4)
-                    if not bool(frontend_data.get("roof_only_offer")):
-                        try:
-                            calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None, job_root=job_root)
-                            print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
-                            notify_ui("pdf_generation", calc_method_pdf_path)
-                        except Exception as calc_err:
-                            print(f"⚠️ Calculation Method PDF Error: {calc_err}")
-                            import traceback
-                            traceback.print_exc()
+                    if measurements_only:
+                        print(
+                            "🔸 [PDF] measurements_only_offer: skip Kunden-/Admin-/Berechnungs-PDF; nur Mengen-/Maß-PDF.",
+                            flush=True,
+                        )
                     else:
-                        print("🔸 [PDF] roof_only_offer: skip calculation method PDF (full-house doc)")
+                        pdf_path = generate_complete_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
+                        print(f"✅ [PDF] User PDF generated: {pdf_path}")
+                        notify_ui("pdf_generation", pdf_path)
+                        set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 8)
+                        admin_pdf_path = generate_admin_offer_pdf(run_id=run_id, output_path=None, job_root=job_root)
+                        print(f"✅ [PDF] Admin PDF generated: {admin_pdf_path}")
+                        notify_ui("pdf_generation", admin_pdf_path)
+                        set_progress(_PROGRESS_WEIGHTS["pdf_end"] - 4)
+                        if not bool(frontend_data.get("roof_only_offer")):
+                            try:
+                                calc_method_pdf_path = generate_admin_calculation_method_pdf(run_id=run_id, output_path=None, job_root=job_root)
+                                print(f"✅ [PDF] Calculation Method PDF generated: {calc_method_pdf_path}")
+                                notify_ui("pdf_generation", calc_method_pdf_path)
+                            except Exception as calc_err:
+                                print(f"⚠️ Calculation Method PDF Error: {calc_err}")
+                                import traceback
+                                traceback.print_exc()
+                        else:
+                            print("🔸 [PDF] roof_only_offer: skip calculation method PDF (full-house doc)")
                 except Exception as e:
                     print(f"⚠️ PDF Error: {e}")
                     import traceback

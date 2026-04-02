@@ -1,3 +1,6 @@
+import re
+
+
 def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float:
     t = str(obj_type or "").lower()
     if "double" in t:
@@ -7,6 +10,18 @@ def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float
     if width_m >= 1.35:
         return 1.5
     return 1.0
+
+
+def _parse_height_from_label(label: str | None) -> float | None:
+    if not label:
+        return None
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m", str(label).lower())
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return None
 
 
 def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data: dict | None = None) -> dict:
@@ -40,6 +55,18 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", 0)),
     )
 
+    door_height_map = coeffs.get("door_height_m", {}) or {}
+    door_height_label = (
+        (ferestre_usi.get("doorHeightOption") or ferestre_usi.get("turhohe") or "Standard (2,01 m)")
+        if frontend_data
+        else "Standard (2,01 m)"
+    )
+    selected_door_height_m = float(door_height_map.get(door_height_label, 2.05))
+    if door_height_label not in door_height_map:
+        parsed_h = _parse_height_from_label(door_height_label)
+        if parsed_h and parsed_h > 0:
+            selected_door_height_m = parsed_h
+
     for op in openings_list:
         obj_type = op.get("type", "unknown")
         ot = str(obj_type).lower()
@@ -63,7 +90,7 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
             if explicit_h is not None and float(explicit_h) > 0:
                 height = float(explicit_h)
             else:
-                height = 2.05
+                height = selected_door_height_m
         else:
             explicit_h = op.get("height_m")
             if explicit_h is not None and float(explicit_h) > 0:

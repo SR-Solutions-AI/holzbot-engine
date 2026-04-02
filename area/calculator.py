@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from typing import Dict
+import re
 
 from .config import (
     STANDARD_WALL_HEIGHT_M,
@@ -30,6 +31,18 @@ def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float
     return 1.0
 
 
+def _parse_height_from_label(label: str | None) -> float | None:
+    if not label:
+        return None
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m", str(label).lower())
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return None
+
+
 def calculate_areas_for_plan(
     plan_id: str,
     floor_type: str,
@@ -42,6 +55,7 @@ def calculate_areas_for_plan(
     frontend_data: dict | None = None,
     is_top_floor: bool = False,
     floor_height_m_by_option: dict | None = None,
+    door_height_m_by_option: dict | None = None,
 ) -> dict:
     """
     Folosește direct valorile de arie (Net și Gross) furnizate, fără a le recalcula 
@@ -115,6 +129,23 @@ def calculate_areas_for_plan(
     # Determinăm înălțimile; pentru ferestre NU mai folosim bodentiefe din formular.
     # Prioritate: height_m din detecție/editor, fallback pe euristică din lățime.
     window_height_m_default = STANDARD_WINDOW_HEIGHT_M  # fallback final
+
+    selected_door_height_m = STANDARD_DOOR_HEIGHT_M
+    if frontend_data:
+        fu = frontend_data.get("ferestreUsi") if isinstance(frontend_data.get("ferestreUsi"), dict) else frontend_data
+        selected_door_height_label = (
+            fu.get("doorHeightOption") or fu.get("turhohe")
+        ) if isinstance(fu, dict) else None
+        if (
+            door_height_m_by_option
+            and selected_door_height_label
+            and selected_door_height_label in door_height_m_by_option
+        ):
+            selected_door_height_m = float(door_height_m_by_option[selected_door_height_label])
+        else:
+            parsed_h = _parse_height_from_label(selected_door_height_label)
+            if parsed_h and parsed_h > 0:
+                selected_door_height_m = parsed_h
     
     for opening in openings_all:
         obj_type = opening.get("type", "").lower()
@@ -143,7 +174,7 @@ def calculate_areas_for_plan(
             counts["doors_exterior"] += 1
         elif "door" in obj_type:
             explicit_h = opening.get("height_m")
-            dh = float(explicit_h) if explicit_h is not None and float(explicit_h) > 0 else STANDARD_DOOR_HEIGHT_M
+            dh = float(explicit_h) if explicit_h is not None and float(explicit_h) > 0 else selected_door_height_m
             area = width_m * dh
             status = opening.get("status", "").lower()
             if status == "exterior":

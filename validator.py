@@ -1,5 +1,5 @@
 # holzbot-engine/validator.py
-# Validare plan(uri): floor plan + side view în cel puțin una dintre pagini (PDF) sau în document.
+# Validare plan(uri): cel puțin un Grundriss (floor plan); Ansicht/Schnitt e opțional (informativ în JSON).
 import sys
 import json
 import os
@@ -16,16 +16,16 @@ MAX_PDF_PAGES = 20  # limită pentru numărul de imagini trimise într-un singur
 
 SYSTEM_PROMPT = """You are an architect assistant. You will receive one or more images (e.g. pages of a PDF or a single image).
 Your task: determine across ALL provided images:
-1. Is there at least one image that shows a FLOOR PLAN (Grundriss) – room labels, walls, clear structure?
-2. Is there at least one image that shows a SIDE VIEW / ELEVATION / SECTION (Ansicht, Schnitt, Fassade) – a view showing the building from the side or a cross-section (needed for roof type and pitch)?
+1. Is there at least one image that shows a FLOOR PLAN (Grundriss) – room labels, walls, clear top-down structure?
+2. Optionally: is there a SIDE VIEW / ELEVATION / SECTION (Ansicht, Schnitt, Fassade)? This is informational only.
 
 Return JSON with exactly these keys:
 - "has_floor_plan": true if at least one image is a floor plan, else false.
 - "has_side_view": true if at least one image is a side view / elevation / section, else false.
-- "valid": true only if BOTH has_floor_plan and has_side_view are true. Otherwise false.
-- "reason": short explanation in the same language as the document (e.g. if valid=false and no side view: explain that a side view / Ansicht / Schnitt is required for roof classification).
+- "valid": true if has_floor_plan is true. Side views are NOT required for validity.
+- "reason": short explanation in the same language as the document (e.g. if valid=false: no recognizable floor plan).
 
-If the content looks like a photo, generic sketch without structure, or unrelated, set has_floor_plan and/or has_side_view accordingly and valid=false.
+If the content looks like a photo, generic sketch without structure, or unrelated, set has_floor_plan false and valid=false.
 Return ONLY this JSON object, no markdown, no code block."""
 
 
@@ -59,16 +59,16 @@ def _run_vision(client, content_list, num_images):
     hp = data.get("has_floor_plan", False)
     hv = data.get("has_side_view", False)
     if "valid" not in data:
-        data["valid"] = bool(hp and hv)
+        data["valid"] = bool(hp)
     if "reason" not in data:
-        data["reason"] = "OK" if data["valid"] else ("Missing floor plan or side view across the provided pages." if num_images > 1 else "Missing floor plan or side view.")
+        data["reason"] = "OK" if data["valid"] else ("No floor plan (Grundriss) found in the provided pages." if num_images > 1 else "No floor plan (Grundriss) found.")
     return data
 
 
 def validate_plan(file_url):
     """
     Validează un singur document (URL): PDF (toate paginile, până la MAX_PDF_PAGES) sau o imagine.
-    Cerință: în cel puțin una dintre pagini/imagine să existe un floor plan ȘI în cel puțin una un side view.
+    Cerință: în cel puțin una dintre pagini/imagine să existe un floor plan (Grundriss). Ansicht/Schnitt nu e obligatoriu.
     Returnează: { "valid": bool, "reason": str, "has_floor_plan": bool, "has_side_view": bool }
     """
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -101,7 +101,7 @@ def validate_plan(file_url):
 
         text = (
             f"Validate these {len(images_for_api)} image(s). "
-            "Across all of them, there must be at least one FLOOR PLAN (Grundriss) AND at least one SIDE VIEW / section / elevation (Ansicht, Schnitt) for roof classification."
+            "Across all of them, there must be at least one FLOOR PLAN (Grundriss). Side views are optional."
         )
         content_list = [{"type": "text", "text": text}]
         for buf, _w, _h in images_for_api:
@@ -113,7 +113,7 @@ def validate_plan(file_url):
         result = _run_vision(client, content_list, len(images_for_api))
         result.setdefault("has_floor_plan", False)
         result.setdefault("has_side_view", False)
-        result["valid"] = bool(result.get("has_floor_plan") and result.get("has_side_view"))
+        result["valid"] = bool(result.get("has_floor_plan"))
         return result
 
     except Exception as e:
