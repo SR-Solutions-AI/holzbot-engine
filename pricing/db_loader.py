@@ -33,14 +33,19 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
     _heat_base = float(data_map.get("heating_base_price", 70.0))
 
+    _nutz = data_map.get("unit_price_keller_nutzkeller", 145)
+    _k_ausbau = data_map.get("unit_price_keller_ausbau", 185)
     out = {
         "_raw_params": data_map,
         "foundation": {
             "unit_price_per_m2": {
-                # Form: Untergeschoss / Fundament
+                # Form: Untergeschoss / Fundament (neu + Legacy gespeicherte Angebote)
                 "Kein Keller (nur Bodenplatte)": data_map.get("unit_price_placa", 120),
-                "Keller (unbeheizt / Nutzkeller)": data_map.get("unit_price_keller_nutzkeller", 145),
-                "Keller (mit einfachem Ausbau)": data_map.get("unit_price_keller_ausbau", 185),
+                "Keller (ohne Ausbau)": _nutz,
+                "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": _nutz,
+                "Keller (mit Ausbau)": _k_ausbau,
+                "Keller (unbeheizt / Nutzkeller)": _nutz,
+                "Keller (mit einfachem Ausbau)": _k_ausbau,
                 # Legacy / Pfahlgründung (când pilons=True se aplică în plus)
                 "Placă": data_map.get("unit_price_placa", 120),
                 "Piloți": data_map.get("unit_price_piloti", 180),

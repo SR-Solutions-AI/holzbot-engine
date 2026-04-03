@@ -19,7 +19,7 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
                 "tipAcoperis": "Satteldach",
             },
             "structuraCladirii": {
-                "tipFundatieBeci": "Keller (mit einfachem Ausbau)",
+                "tipFundatieBeci": "Keller (mit Ausbau)",
                 "inaltimeEtaje": "Komfort (2,70 m)",
                 "treppeTyp": "Holz",
             },

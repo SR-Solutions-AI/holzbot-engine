@@ -142,7 +142,10 @@ def calculate_pricing_for_plan(
     # Verificăm dacă avem beci locuibil din frontend_data (și din câmpul basementUse)
     structura_cladirii = frontend_input.get("structuraCladirii", {})
     tip_fundatie_beci = _fv("foundation_type") or structura_cladirii.get("tipFundatieBeci", "")
-    has_basement_livable = frontend_input.get("basementUse", False) or ("mit einfachem Ausbau" in str(tip_fundatie_beci))
+    _tfb = str(tip_fundatie_beci)
+    has_basement_livable = frontend_input.get("basementUse", False) or (
+        "mit einfachem Ausbau" in _tfb or "Keller (mit Ausbau)" in _tfb
+    )
     
     # ---------- Plan dedicat beci: structură pereți interiori + exteriori; finisaje doar interior; podele, utilități (fără fundație/acoperiș) ----------
     if is_basement_plan:
@@ -174,8 +177,10 @@ def calculate_pricing_for_plan(
             _cost_b_ext = w_ext_net_structure * _p_ext
             items_walls_b.append({"category": "walls_structure_ext", "name": f"Pereți Exteriori Beci ({system_constructie})", "area_m2": round(w_ext_net_structure, 2), "unit_price": round(_p_ext, 2), "cost": round(_cost_b_ext, 2)})
         cost_walls_b = {"total_cost": round(_cost_b_int + _cost_b_ext, 2), "detailed_items": items_walls_b}
+        # Keller: keine Fassade (area_ext=0), aber Innenausbau Außenwände = Außenseite der Innenwände
+        # (w_int_net_finish_outer), nicht mit „Außenfassade“ verwechseln — daher getrennte Flächen wie im Area-JSON.
         cost_finishes_b = calculate_finishes_details(
-            finish_coeffs, w_int_net_finish, 0.0, 0.0,
+            finish_coeffs, w_int_net_finish_inner, w_int_net_finish_outer, 0.0,
             type_int_inner=finish_int_beci, type_int_outer=finish_int_beci, type_ext="Tencuială",
             floor_label="Beci"
         )

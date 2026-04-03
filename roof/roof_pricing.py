@@ -431,6 +431,7 @@ def _recompute_roof_items_costs(
     area_without_overhang: float,
     area_with_overhang: float,
     tinichigerie_percent: float,
+    area_daemmung_m2: float | None = None,
 ) -> tuple[list[dict[str, Any]], float, float, float]:
     subtotal = 0.0
     skylights_cost = 0.0
@@ -447,7 +448,13 @@ def _recompute_roof_items_costs(
         unit = str(it.get("unit") or "")
         if unit == "m²":
             applied = str(it.get("applied_area") or "")
-            q = area_with_overhang if applied == "with_overhang" else area_without_overhang
+            cat = str(it.get("category") or "")
+            if cat == "roof_insulation" and area_daemmung_m2 is not None:
+                q = float(area_daemmung_m2)
+            elif applied == "with_overhang":
+                q = area_with_overhang
+            else:
+                q = area_without_overhang
             up = float(it.get("unit_price") or 0.0)
             it["quantity"] = round(q, 2)
             it["cost"] = round(q * up, 2)
@@ -1338,14 +1345,46 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
     roof_measurements["roof_area_with_overhang_m2"] = round(area_with_overhang, 4)
 
     br_final = roof_measurements.get("by_rectangle")
+    sum_insulated: float | None = None
     if isinstance(br_final, list):
         _attach_plan_id_to_rectangle_rows(out_root, run_id, br_final)
+        try:
+            from roof.insulated_area import apply_roof_insulated_m2_to_rows
+
+            apply_roof_insulated_m2_to_rows(
+                out_root,
+                run_id,
+                br_final,
+                mpp_by_floor_for_rectangles,
+            )
+            sum_insulated = 0.0
+            for row in br_final:
+                if not isinstance(row, dict) or "roof_area_insulated_m2" not in row:
+                    continue
+                try:
+                    sum_insulated += float(row.get("roof_area_insulated_m2") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        except Exception as e:
+            print(f"⚠️ [ROOF PRICING] insulated area skip: {e}", flush=True)
+        if sum_insulated is not None:
+            roof_measurements["roof_area_insulated_m2"] = round(sum_insulated, 4)
+
+    area_daemmung_m2: float | None = None
+    if isinstance(br_final, list) and br_final:
+        try:
+            rows_with_ins = [r for r in br_final if isinstance(r, dict) and "roof_area_insulated_m2" in r]
+            if rows_with_ins:
+                area_daemmung_m2 = sum(float(r.get("roof_area_insulated_m2") or 0.0) for r in rows_with_ins)
+        except Exception:
+            area_daemmung_m2 = None
 
     items, subtotal_before_services, _tin, total_cost = _recompute_roof_items_costs(
         items=items,
         area_without_overhang=area_without_overhang,
         area_with_overhang=area_with_overhang,
         tinichigerie_percent=tinichigerie_percent,
+        area_daemmung_m2=area_daemmung_m2,
     )
 
     result = {

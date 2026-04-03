@@ -22,6 +22,8 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.utils import simpleSplit
+from reportlab.pdfgen.canvas import Canvas
 
 from config.settings import OUTPUT_ROOT, RUNNER_ROOT, JOBS_ROOT, RUNS_ROOT, load_plan_infos, PlansListError, PlanInfo
 from config.frontend_loader import load_frontend_data_for_run
@@ -29,6 +31,31 @@ from pdf_generator.utils import resolve_editor_blueprint_for_pdf
 from pdf_generator.offer_scope import get_offer_inclusions, normalize_nivel_oferta
 from area.config import STANDARD_DOOR_HEIGHT_M, STANDARD_WINDOW_HEIGHT_M
 from area.calculator import _infer_window_height_from_width
+
+
+def _lista_etaje_from_frontend(fd: dict[str, Any]) -> list[Any]:
+    sc = fd.get("structuraCladirii")
+    if isinstance(sc, dict):
+        le = sc.get("listaEtaje")
+        if isinstance(le, list):
+            return le
+    drafts = fd.get("drafts")
+    if isinstance(drafts, dict):
+        dsc = drafts.get("structuraCladirii")
+        if isinstance(dsc, dict):
+            le = dsc.get("listaEtaje")
+            if isinstance(le, list):
+                return le
+    le = fd.get("listaEtaje")
+    return le if isinstance(le, list) else []
+
+
+def _gebaudestruktur_last_floor_is_mansard(lista_etaje: list[Any]) -> bool:
+    """mansarda_ohne / mansarda_mit (Gebäudestruktur) → ultimul etaj e Dachgeschoss, nu Obergeschoss."""
+    if not lista_etaje:
+        return False
+    last = lista_etaje[-1]
+    return isinstance(last, str) and last.startswith("mansarda")
 
 
 def _load_floor_plan_order_and_labels_from_manifest(
@@ -372,15 +399,22 @@ def _roof_rect_table_rows(rec: dict[str, Any]) -> list[list[str]]:
     rows.append(["Dachtyp", roof_type_label.get(raw_rt, raw_rt or "—"), "—"])
     rows.append(
         [
-            "Dachfläche gesamt (mit Überstand)",
+            "Dachfläche (mit Überstand)",
             f"{float(rec.get('roof_area_with_overhang_m2')):.2f}" if rec.get("roof_area_with_overhang_m2") is not None else "—",
             "m²",
         ]
     )
     rows.append(
         [
-            "Dachfläche gedämmt (ohne Überstand)",
+            "Dachfläche (ohne Überstand)",
             f"{float(rec.get('roof_area_without_overhang_m2')):.2f}" if rec.get("roof_area_without_overhang_m2") is not None else "—",
+            "m²",
+        ]
+    )
+    rows.append(
+        [
+            "Dachfläche gedämmt",
+            f"{float(rec.get('roof_area_insulated_m2')):.2f}" if rec.get("roof_area_insulated_m2") is not None else "—",
             "m²",
         ]
     )
@@ -418,6 +452,36 @@ def _style_data_table(t: Table) -> None:
             ]
         )
     )
+
+
+_ROOF_MEASUREMENTS_FOOTER_DE = (
+    "Hinweis: Die angegebenen Maße basieren auf den von Ihnen ausgewählten Optionen im "
+    "Formular und im Bearbeitungsfenster sowie auf den von Ihnen gezeichneten Linien bei der "
+    "Erkennung der Räume, der Öffnungen und der Dachflächen."
+)
+
+
+def _roof_measurements_footer_canvas(canv: Canvas, doc: SimpleDocTemplate) -> None:
+    """Kleiner Disclaimer unten auf jeder Seite (ReportLab-Callback)."""
+    canv.saveState()
+    try:
+        page_w, _page_h = A4
+        margin_x = 15 * mm
+        max_w = page_w - 2 * margin_x
+        font_name = "Helvetica"
+        font_size = 7
+        lines = simpleSplit(_ROOF_MEASUREMENTS_FOOTER_DE, font_name, font_size, max_w)
+        canv.setFont(font_name, font_size)
+        canv.setFillColor(colors.HexColor("#5c5c5c"))
+        # ReportLab: y grows upward — first split line must get the highest y so reading order is top→bottom.
+        line_h = 3.4 * mm
+        y_bottom = 8 * mm
+        y = y_bottom + (len(lines) - 1) * line_h
+        for line in lines:
+            canv.drawString(margin_x, y, line)
+            y -= line_h
+    finally:
+        canv.restoreState()
 
 
 def _measurements_section_title_stockwerk(sw: str) -> str:
@@ -527,6 +591,11 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     continue
         plan_id_to_stockwerk[p.plan_id] = f"Stockwerk {i + 1}"
 
+    # Ultimul plan în ordinea PDF = etajul cel mai de sus. La mansardă (nu pod), DE: Dachgeschoss.
+    if _gebaudestruktur_last_floor_is_mansard(_lista_etaje_from_frontend(fd_dict)) and plans_pdf_sequence:
+        top_pid = plans_pdf_sequence[-1].plan_id
+        plan_id_to_stockwerk[top_pid] = "Dachgeschoss"
+
     roof_floor_idx_to_plan, plan_id_to_roof_floor_idx = _roof_floor_mapping_for_pdf(run_id, out_root)
 
     def plan_id_for_roof_floor_idx(floor_idx: int) -> str | None:
@@ -586,7 +655,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         rightMargin=15 * mm,
         leftMargin=15 * mm,
         topMargin=15 * mm,
-        bottomMargin=15 * mm,
+        bottomMargin=22 * mm,
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -762,6 +831,10 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                 sw = f"Stockwerk {i + 1}"
                 _append_building_measurements_table(story, fd, sw, heading_style, inc=pdf_inclusions)
 
-    doc.build(story)
+    doc.build(
+        story,
+        onFirstPage=_roof_measurements_footer_canvas,
+        onLaterPages=_roof_measurements_footer_canvas,
+    )
     print(f"✅ [PDF ROOF] Generat: {output_path}")
     return output_path

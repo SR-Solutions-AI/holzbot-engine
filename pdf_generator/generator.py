@@ -2387,7 +2387,14 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
             overview_items.append(f"<b>{enforcer.get('Dachfläche')}:</b> <b>{total_roof_area:.1f} m²</b>")
 
         if roof_area_without_overhang is not None and float(roof_area_without_overhang) > 0:
-            overview_items.append(f"<b>Dachfläche (Dämmzone, ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
+            overview_items.append(f"<b>Dachfläche (ohne Überstand):</b> <b>{float(roof_area_without_overhang):.1f} m²</b>")
+        try:
+            rm_ins = (roof_pricing or {}).get("roof_measurements") or {}
+            roof_area_insulated = rm_ins.get("roof_area_insulated_m2")
+            if roof_area_insulated is not None and float(roof_area_insulated) >= 0:
+                overview_items.append(f"<b>Dachfläche gedämmt:</b> <b>{float(roof_area_insulated):.1f} m²</b>")
+        except Exception:
+            pass
     
     overview_items.extend(
         build_selected_form_overview_items(
@@ -3832,7 +3839,10 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     has_basement_form = bool(frontend_data.get("basement", False)) or (
         tip_fundatie_beci_calc and "Keller" in str(tip_fundatie_beci_calc) and "Kein Keller" not in str(tip_fundatie_beci_calc)
     )
-    basement_livable = bool(frontend_data.get("basementUse", False)) or ("mit einfachem Ausbau" in str(tip_fundatie_beci_calc))
+    _tfbc = str(tip_fundatie_beci_calc)
+    basement_livable = bool(frontend_data.get("basementUse", False)) or (
+        "mit einfachem Ausbau" in _tfbc or "Keller (mit Ausbau)" in _tfbc
+    )
 
     if not has_basement_form:
         story.append(Paragraph(
@@ -3873,6 +3883,9 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         "Ușor (camion 40t)": "Easy (40t truck)", "Mediu": "Medium", "Dificil": "Difficult",
         "Plan": "Flat", "Pantă ușoară": "Gentle slope", "Pantă mare": "Steep slope",
         "Kein Keller (nur Bodenplatte)": "No basement (only floor slab)",
+        "Keller (ohne Ausbau)": "Basement (without finish)",
+        "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": "Basement (unheated / utility, without finish)",
+        "Keller (mit Ausbau)": "Basement (with finish)",
         "Keller (unbeheizt / Nutzkeller)": "Basement (unheated / utility)",
         "Keller (mit einfachem Ausbau)": "Basement (with simple finish)",
         "Standard (2,50 m)": "Standard (2.50 m)", "Komfort (2,70 m)": "Comfort (2.70 m)", "Hoch (2,85+ m)": "High (2.85+ m)",
