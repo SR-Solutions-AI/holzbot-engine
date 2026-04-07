@@ -83,6 +83,29 @@ def notify_ui_batch(stage_tag: str, image_paths: list):
     sys.stdout.flush()
 
 
+OFFER_NUMBER_WAIT_TIMEOUT_SEC = 180.0
+
+
+def wait_for_offer_number_in_job(job_root: Path) -> None:
+    """API assigns offer_no and patches jobs/<job_id>/frontend_data.json (tenant counter updated there)."""
+    job_file = job_root / "frontend_data.json"
+    notify_ui("offer_number_request")
+    deadline = time.time() + OFFER_NUMBER_WAIT_TIMEOUT_SEC
+    while time.time() < deadline:
+        if job_file.exists():
+            try:
+                data = json.loads(job_file.read_text(encoding="utf-8"))
+                ono = data.get("offer_no")
+                if isinstance(ono, str) and ono.strip():
+                    print(f"✅ [OfferNo] ready: {ono.strip()}", flush=True)
+                    return
+            except Exception:
+                pass
+        time.sleep(0.25)
+    print(">>> ERROR: Timeout waiting for offer_no (API handshake)", flush=True)
+    sys.exit(1)
+
+
 DETECTIONS_REVIEW_FLAG = "detections_review_approved.flag"
 DETECTIONS_REVIEW_WAIT_TIMEOUT_SEC = 3600
 DETECTIONS_REVIEW_POLL_INTERVAL_SEC = 1.5
@@ -756,6 +779,9 @@ def run_segmentation_and_classification_for_document(
                 notify_ui("offer_generation")
             set_progress(_PROGRESS_WEIGHTS["offer_end"])
             pipeline_timer.add_step("Offer Generation", t.end_time - t.start_time)
+
+            wait_for_offer_number_in_job(job_root)
+            frontend_data = load_frontend_data_for_run(run_id, job_root)
 
             with Timer("STEP 18-19: PDF GENERATION") as t:
                 pdf_path = None
