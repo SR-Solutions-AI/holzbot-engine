@@ -2906,6 +2906,12 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             offer_no = str(frontend_data["offer_no"]).strip()
         else:
             offer_no = f"{offer_prefix}-{datetime.now().strftime('%Y')}-{random.randint(1000,9999)}"
+        # PDF-Metadaten für Browser-Tab; leerer Author → oft „(anonymous)“.
+        _pdf_author = (
+            str(COMPANY.get("name") or "").strip()
+            or str(COMPANY.get("legal") or "").strip()
+            or "Holzbot"
+        )
         doc = SimpleDocTemplate(
             str(output_path), 
             pagesize=A4, 
@@ -2914,7 +2920,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             topMargin=42*mm, 
             bottomMargin=22*mm, 
             title=f"Angebot {offer_no}", 
-            author=COMPANY["name"]
+            author=_pdf_author,
         )
         
         styles = _styles()

@@ -649,6 +649,24 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     floors_by_plan = _load_floor_data_from_pricing(out_root)
     roof_windows_by_plan = _load_roof_windows_by_plan(out_root, run_id)
 
+    # Tab-Titel im Browser: PDF-/Title-Metadaten (sonst „(anonymous)“ bei ReportLab).
+    def _meta_offer_no(fd: dict[str, Any]) -> str:
+        raw = str(fd.get("offer_no") or "").strip()
+        if raw:
+            return raw
+        return (run_id[:8] if len(run_id) >= 8 else run_id) or "—"
+
+    def _meta_author(fd: dict[str, Any]) -> str:
+        pc = fd.get("pdf_company")
+        if isinstance(pc, dict):
+            n = str(pc.get("name") or "").strip()
+            if n:
+                return n
+        return "Holzbot"
+
+    _m_title = f"Mengenermittlung {_meta_offer_no(fd_dict)}"
+    _m_author = _meta_author(fd_dict)
+
     doc = SimpleDocTemplate(
         str(output_path),
         pagesize=A4,
@@ -656,6 +674,8 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         leftMargin=15 * mm,
         topMargin=15 * mm,
         bottomMargin=22 * mm,
+        title=_m_title,
+        author=_m_author,
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
