@@ -24,6 +24,51 @@ def _parse_height_from_label(label: str | None) -> float | None:
         return None
 
 
+def _pick_ferestre_field(
+    frontend_data: dict | None,
+    ferestre_usi: dict,
+    *,
+    field: str,
+    tag: str | None,
+    default: str,
+) -> str:
+    """Prefer live ferestreUsi from offer_steps; then _valuesByTag snapshot if present."""
+    v = ferestre_usi.get(field)
+    if v is not None and str(v).strip() != "":
+        return str(v).strip()
+    if frontend_data and tag:
+        snap = frontend_data.get("_valuesByTag")
+        if isinstance(snap, dict):
+            tv = snap.get(tag)
+            if tv is not None and str(tv).strip() != "":
+                return str(tv).strip()
+    return default
+
+
+def _resolve_window_quality(frontend_data: dict | None, ferestre_usi: dict) -> str:
+    """
+    Fensterart for €/m² must match PDF „Projektübersicht“ (windowQuality, else tamplarie if glazing-like).
+    """
+    wq = _pick_ferestre_field(
+        frontend_data,
+        ferestre_usi,
+        field="windowQuality",
+        tag="window_quality",
+        default="",
+    )
+    if wq:
+        return wq
+    if frontend_data:
+        mat = frontend_data.get("materialeFinisaj") or {}
+        t = mat.get("tamplarie")
+        if t is not None and str(t).strip():
+            s = str(t).strip()
+            sl = s.lower()
+            if "verglast" in sl or "fach" in sl or "passiv" in sl:
+                return s
+    return "3-fach verglast"
+
+
 def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data: dict | None = None) -> dict:
     """
     Ferestre: cost = suprafață (m²) × preț €/m² (Fensterart din formular).
@@ -36,21 +81,50 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
     ferestre_usi = frontend_data.get("ferestreUsi", {}) if frontend_data else {}
     door_int_prices = coeffs.get("door_interior_prices", {}) or {}
     door_ext_prices = coeffs.get("door_exterior_prices", {}) or {}
-    door_material_int = (ferestre_usi.get("doorMaterialInterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
-    door_material_ext = (ferestre_usi.get("doorMaterialExterior", "Standard") or "Standard").strip() if frontend_data else "Standard"
+    door_material_int = _pick_ferestre_field(
+        frontend_data,
+        ferestre_usi,
+        field="doorMaterialInterior",
+        tag="door_material_interior",
+        default="Standard",
+    )
+    door_material_ext = _pick_ferestre_field(
+        frontend_data,
+        ferestre_usi,
+        field="doorMaterialExterior",
+        tag="door_material_exterior",
+        default="Standard",
+    )
     door_price_int = float(door_int_prices.get(door_material_int, 0))
     door_price_ext = float(door_ext_prices.get(door_material_ext, 0))
 
     windows_prices = coeffs.get("windows_price_per_m2", {})
-    window_quality = (ferestre_usi.get("windowQuality", "3-fach verglast") if frontend_data else "3-fach verglast")
+    window_quality = _resolve_window_quality(frontend_data, ferestre_usi)
     window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
     sliding_prices = coeffs.get("sliding_door_prices_per_m2", {}) or {}
-    sliding_type = (ferestre_usi.get("slidingDoorType", "Standard") if frontend_data else "Standard")
+    sliding_type = _pick_ferestre_field(
+        frontend_data,
+        ferestre_usi,
+        field="slidingDoorType",
+        tag="sliding_door_type",
+        default="Standard",
+    )
     sliding_price_per_m2 = float(sliding_prices.get(sliding_type, sliding_prices.get("Standard", 0)))
 
     garage_prices = coeffs.get("garage_door_prices", {}) or {}
-    garage_type = (ferestre_usi.get("garageDoorType", "Sektionaltor Standard") if frontend_data else "Sektionaltor Standard")
-    wants_garage_door = bool(ferestre_usi.get("garagentorGewuenscht")) if frontend_data else False
+    garage_type = _pick_ferestre_field(
+        frontend_data,
+        ferestre_usi,
+        field="garageDoorType",
+        tag="garage_door_type",
+        default="Sektionaltor Standard",
+    )
+    wg = ferestre_usi.get("garagentorGewuenscht")
+    if wg is None and frontend_data:
+        snap = frontend_data.get("_valuesByTag")
+        if isinstance(snap, dict) and "garage_door_desired" in snap:
+            wg = snap.get("garage_door_desired")
+    wants_garage_door = bool(wg) if frontend_data else False
     garage_price_piece = float(
         garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", 0)),
     )

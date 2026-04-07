@@ -31,6 +31,8 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
     ("ferestreUsi", "windowQuality"): "window_quality",
     ("ferestreUsi", "doorMaterialInterior"): "door_material_interior",
     ("ferestreUsi", "doorMaterialExterior"): "door_material_exterior",
+    ("ferestreUsi", "slidingDoorType"): "sliding_door_type",
+    ("ferestreUsi", "garageDoorType"): "garage_door_type",
     ("ferestreUsi", "garagentorGewuenscht"): "garage_door_desired",
     ("ferestreUsi", "treppeTyp"): "stairs_type",
     ("performantaEnergetica", "nivelEnergetic"): "energy_level",
@@ -49,25 +51,12 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
 }
 
 
-def build_values_by_tag(
+def _collect_tag_values_from_steps(
     frontend_data: dict[str, Any],
-    steps_schema: list[dict] | None = None,
+    steps_schema: list[dict] | None,
 ) -> dict[str, Any]:
-    """
-    Construiește un dicționar { tag: value } din datele formularului.
-
-    - Dacă frontend_data conține "_valuesByTag", îl returnează (frontend/API l-a construit din schema).
-    - Altfel, dacă steps_schema e dat, parcurge steps[].fields[].tag și step key/field name pentru value.
-    - Altfel, folosește BUILTIN_FIELD_TAG_MAP pe frontend_data (per step key → dict de fields).
-
-    Returns:
-        Dict tag → value (ex: {"system_type": "Blockbau", "site_access": "Mittel", ...}).
-    """
-    if isinstance(frontend_data.get("_valuesByTag"), dict):
-        return dict(frontend_data["_valuesByTag"])
-
+    """Values read from live step blobs (ferestreUsi, sistemConstructiv, …)."""
     out: dict[str, Any] = {}
-
     if steps_schema:
         for step in steps_schema:
             step_key = step.get("key")
@@ -82,12 +71,37 @@ def build_values_by_tag(
                 if not tag or not name:
                     continue
                 if name in step_data:
-                    out[tag] = step_data[name]
+                    val = step_data[name]
+                    if val is not None and val != "":
+                        out[tag] = val
         return out
 
-    # Fallback: built-in map
     for (step_key, field_name), tag in BUILTIN_FIELD_TAG_MAP.items():
         step_data = frontend_data.get(step_key)
         if isinstance(step_data, dict) and field_name in step_data:
-            out[tag] = step_data[field_name]
+            val = step_data[field_name]
+            if val is not None and val != "":
+                out[tag] = val
     return out
+
+
+def build_values_by_tag(
+    frontend_data: dict[str, Any],
+    steps_schema: list[dict] | None = None,
+) -> dict[str, Any]:
+    """
+    Construiește un dicționar { tag: value } din datele formularului.
+
+    - Valorile din pașii curenți (ferestreUsi.windowQuality etc.) au **prioritate** față de
+      `_valuesByTag`, astfel încât un snapshot vechi din job JSON nu poate suprascrie
+      modificările salvate în offer_steps (PDF vede pașii; pricing trebuie la fel).
+    - `_valuesByTag` completează doar tag-urile lipsă din pași.
+
+    Returns:
+        Dict tag → value (ex: {"system_type": "Blockbau", "site_access": "Mittel", ...}).
+    """
+    from_steps = _collect_tag_values_from_steps(frontend_data, steps_schema)
+    snap = frontend_data.get("_valuesByTag")
+    if isinstance(snap, dict) and snap:
+        return {**snap, **from_steps}
+    return from_steps
