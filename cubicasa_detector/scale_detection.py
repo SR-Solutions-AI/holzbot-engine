@@ -31,7 +31,11 @@ Rules:
 - DO NOT translate. If you translate the text, the answer is WRONG.
 - DO NOT interpret. DO NOT guess meaning. Treat this like OCR — only copy visible text.
 - If multiple labels or unclear → return "Raum". If no room name readable → "Raum".
-- For area_m2: use the number only when a surface in m² is clearly indicated for this room (e.g. "F= X m²"); otherwise null. Ignore NNF, Nutzfläche, totals.
+- For area_m2: use the number only when a surface in m² is clearly indicated for THIS room space (e.g. "F= X m²" for that zone); otherwise null.
+
+CRITICAL — NNF / totals are NOT a room:
+- Never use as room_name (and never use their m² as area_m2) any line about: NNF, Nettonutzfläche, Nutzfläche, Gesamtnutzfläche, Bruttowohnfläche, Wohnfläche/Hausfläche as a single dwelling total, "ca. … m²" for the whole unit/floor, or other legal/marketing floor-area stamps. That is a different metric than a room label.
+- If the only readable text in the crop is such a stamp → room_name "Raum", area_m2 null.
 
 Return ONLY this JSON, nothing else:
 {"room_name": "<exact text from plan>", "area_m2": number or null}
@@ -88,7 +92,8 @@ def is_invalid_room_label(room_name: str) -> bool:
 
 # System instruction pentru apeluri single-crop (opțional, folosit la call_gemini_room_single).
 GEMINI_SYSTEM_INSTRUCTION_ROOMS = (
-    "You are STRICT OCR. Copy room labels exactly as written. Do NOT translate. If you translate, the answer is WRONG."
+    "You are STRICT OCR. Copy room labels exactly as written. Do NOT translate. "
+    "Never treat NNF, Nettonutzfläche, Nutzfläche, or dwelling/floor totals as a room name — use \"Raum\" and null area."
 )
 
 # roof_only_offer: scală din suma valorilor m² tipărite vizibile în crop (poligon acoperiș din editor).
@@ -99,13 +104,17 @@ GEMINI_SYSTEM_INSTRUCTION_ROOF_VISIBLE_M2 = (
 GEMINI_PROMPT_ROOF_VISIBLE_M2 = """
 You receive one crop of a floor or roof plan. In the top-left corner there may be technical labels "area_px:NNN" and "room_no:N" — these are for our software only; do not treat them as plan areas.
 
-Task: Find every surface area printed in square metres (m²) that is visible in this image — for example stamps like "F = 12,5 m²", tables with m² columns, callouts with "m²", totals such as NNF/Nutzfläche when given in m², etc.
+Task: Sum ONLY printed m² values that belong to individual spaces on this drawing (e.g. "F = 12,5 m²" next to a room/zone, table rows pairing a room/zone name with m²).
+
+EXCLUDE completely from the sum (do not add these numbers):
+- NNF, Nettonutzfläche, Nutzfläche, Gesamtnutzfläche, Bruttowohnfläche, or any single total m² for the whole dwelling, floor, or building.
+- Legal/marketing footnotes like "NNF ca. … m²" — that is not the same as room areas on the plan.
 
 Rules:
-- Add together ALL numeric m² values you can clearly read. If the same number appears as separate room/zone labels, add each occurrence (e.g. two labels "20 m²" → include both in the sum).
-- Use only values explicitly shown as areas in m² (or unambiguous area context on the plan). Do not infer m² from rulers, scale bars, or image pixels alone.
+- Add together per-room / per-zone m² you can clearly read. If two separate zones each show "20 m²", include both.
+- Use only values explicitly shown as areas in m² on the plan. Do not infer m² from rulers, scale bars, or pixels alone.
 - Ignore the area_px / room_no overlays.
-- If you cannot read any m² number, return null for total_visible_m2_sum.
+- If only NNF/totals are visible and no per-space m², return null for total_visible_m2_sum.
 
 Return ONLY JSON (no markdown):
 {"total_visible_m2_sum": <number or null>}
@@ -117,7 +126,7 @@ You are an architect or specialist in reading floor plans. You receive {n} image
 
 CRITICAL — Do not translate: The plans are often in German (or another language). For room_name and room_type you MUST return the exact characters written on the plan. Example: if you see "Technikraum" write "Technikraum", not "Technical room". If you see "Speis" write "Speis", not "Dining". If you see "WC" write "WC", not "Bathroom". Same language, same spelling. You are transcribing, not translating.
 
-Your task is to extract, for each crop, the room label that appears on the plan. Transcribe it exactly as written. If in one crop you see several room names or overlapping labels and you cannot assign a single clear room name, use "Raum" (or "Mehrere Räume" if the plan is in German and the crop clearly shows multiple rooms). If no room name is readable, use "Raum". For area_m2, use the number only when a surface in m² is explicitly given for that room (e.g. "F= X m²"); otherwise null. Ignore plan totals like NNF or Nutzfläche. Black areas are not part of the room.
+Your task is to extract, for each crop, the room label that appears on the plan. Transcribe it exactly as written. If in one crop you see several room names or overlapping labels and you cannot assign a single clear room name, use "Raum" (or "Mehrere Räume" if the plan is in German and the crop clearly shows multiple rooms). If no room name is readable, use "Raum". For area_m2, use the number only when a surface in m² is explicitly given for that room (e.g. "F= X m²"); otherwise null. Never use NNF, Nettonutzfläche, Nutzfläche, or dwelling/floor totals as room_name or area_m2. Black areas are not part of the room.
 
 For each of the {n} images, return: room_number (from "room_no:N"), area_px (from "area_px:NNNNN"), room_name (exact text from the plan, same language as the plan), room_type (same as room_name), area_m2 (number or null).
 
@@ -134,11 +143,17 @@ def is_informational_total_result(result: dict) -> bool:
     """
     if not result or not isinstance(result, dict):
         return True
-    room_name = (result.get("room_name") or "").strip().upper()
+    raw_name = (result.get("room_name") or "").strip()
+    room_name = raw_name.upper()
+    # NNF ca cuvânt (evităm false positive rare pe substringe în alte cuvinte)
+    if re.search(r"\bNNF\b", raw_name, flags=re.IGNORECASE):
+        return True
     area_m2 = result.get("area_m2")
     total_keywords = (
-        "NNF", "NUTZFLÄCHE", "NUTZFLAECHE", "GESAMT", "HAUSFLÄCHE", "HAUSFLAECHE",
-        "NET FLOOR", "TOTAL AREA", "SUPRAFAȚĂ UTILIZABILĂ", "SUPRAFATA UTILIZABILA",
+        "NUTZFLÄCHE", "NUTZFLAECHE", "NETTONUTZ", "NETTONUTZFLÄCHE", "NETTONUTZFLAECHE",
+        "GESAMTNUTZ", "GESAMTWOHN", "BRUTTOWOHN", "BRUTTOWOHNFLÄCHE", "BRUTTOWOHNFLAECHE",
+        "GESAMT", "HAUSFLÄCHE", "HAUSFLAECHE", "WOHNFLÄCHE", "WOHNFLAECHE",
+        "NET FLOOR", "TOTAL AREA", "USABLE AREA", "SUPRAFAȚĂ UTILIZABILĂ", "SUPRAFATA UTILIZABILA",
         "ERDGESCHOSS 1:100", "1:100"
     )
     if any(kw in room_name for kw in total_keywords):
@@ -154,14 +169,30 @@ def is_informational_total_result(result: dict) -> bool:
     return False
 
 
+def normalize_gemini_room_label_result(result: dict | None) -> dict | None:
+    """Dacă Gemini a extras NNF/totaluri ca etichetă cameră, forțează Raum și area_m2 null."""
+    if not result or not isinstance(result, dict):
+        return result
+    room_name = str(result.get("room_name", "")).strip()
+    area_m2 = result.get("area_m2")
+    if is_informational_total_result({"room_name": room_name, "area_m2": area_m2}):
+        out = dict(result)
+        out["room_name"] = "Raum"
+        out["area_m2"] = None
+        return out
+    return result
+
+
 GEMINI_PROMPT_TOTAL_SUM = """
-Analizează această imagine de plan de casă și identifică suma totală a suprafețelor tuturor camerelor (în metri pătrați, m²).
+Analizează această imagine de plan de casă și identifică suma totală a suprafețelor camerilor/zonelor desenate pe plan (m²).
+
+Nu folosi valori din stampile NNF / Nettonutzfläche / Nutzfläche / total locuință sau etaj — acelea nu sunt suma camerelor de pe desen.
 
 Returnează JSON cu formatul:
 {
   "total_sum_m2": 120.5
 }
-Dacă nu găsești suma totală, returnează null.
+Dacă nu poți deduce suma din suprafețe per cameră pe plan, returnează null.
 """
 
 # Prompt pentru detectarea zonelor: garaj, terasă, balcon, intrare acoperită (coordonate în procente)
@@ -754,7 +785,9 @@ def call_gemini_room_single(image_path: str | Path, api_key: str, max_retries: i
                 continue
             data = json.loads(text[start:end])
             if isinstance(data, dict) and "room_name" in data:
-                return {"room_name": str(data.get("room_name", "")).strip() or "Raum", "area_m2": data.get("area_m2")}
+                return normalize_gemini_room_label_result(
+                    {"room_name": str(data.get("room_name", "")).strip() or "Raum", "area_m2": data.get("area_m2")}
+                )
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
         except Exception as e:
@@ -989,6 +1022,7 @@ def call_gemini_rooms_per_crop(image_paths: list, api_key: str) -> list[dict] | 
         if res is None:
             out.append({"room_name": "Raum", "room_type": "Raum", "area_m2": None})
             continue
+        res = normalize_gemini_room_label_result(res)
         rn = (res.get("room_name") or "").strip() or "Raum"
         # Validare semantică: doar label-uri care arată ca cuvinte reale; altfel "Raum"
         if not is_valid_room_label(rn) or is_hallucinated_room_label(rn):
@@ -1593,6 +1627,8 @@ def detect_scale_from_room_labels(image_path, indoor_mask, walls_mask, steps_dir
                 print(f"      ⏳ Segment {room_idx} ({area_px} px)...")
                 
                 res = call_gemini(crop_path, GEMINI_PROMPT_CROP, api_key)
+                if res:
+                    res = normalize_gemini_room_label_result(res)
                 if res and is_informational_total_result(res):
                     res = None
                 if res and 'area_m2' in res and res['area_m2'] is not None:

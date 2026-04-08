@@ -22,6 +22,7 @@ from .scale_detection import (
     call_gemini_roof_visible_m2_single,
     call_gemini_openings_with_context,
     is_informational_total_result,
+    normalize_gemini_room_label_result,
 )
 from .ocr_room_filling import (
     run_ocr_on_zones,
@@ -496,6 +497,8 @@ def calculate_scale_per_room(
         # Trimitem la Gemini pentru a extrage numele și suprafața
         if room_crop_path.exists():
             gemini_result = call_gemini(str(room_crop_path), GEMINI_PROMPT_CROP, gemini_api_key)
+            if gemini_result:
+                gemini_result = normalize_gemini_room_label_result(gemini_result)
             
             if gemini_result:
                 room_name = gemini_result.get('room_name', 'Unknown')
@@ -2536,6 +2539,8 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
                         }
                 else:
                     result = call_gemini(crop_path, GEMINI_PROMPT_CROP, gemini_api_key)
+                    if result:
+                        result = normalize_gemini_room_label_result(result)
                     if result and is_informational_total_result(result):
                         result = None
                     if result and result.get('area_m2') is not None:
