@@ -15,7 +15,7 @@ import requests
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .config import GEMINI_MODEL
 
@@ -90,6 +90,26 @@ def is_invalid_room_label(room_name: str) -> bool:
 GEMINI_SYSTEM_INSTRUCTION_ROOMS = (
     "You are STRICT OCR. Copy room labels exactly as written. Do NOT translate. If you translate, the answer is WRONG."
 )
+
+# roof_only_offer: scală din suma valorilor m² tipărite vizibile în crop (poligon acoperiș din editor).
+GEMINI_SYSTEM_INSTRUCTION_ROOF_VISIBLE_M2 = (
+    "You read architectural floor plans. Sum only printed m² values you see; do not guess areas from geometry or pixel size."
+)
+
+GEMINI_PROMPT_ROOF_VISIBLE_M2 = """
+You receive one crop of a floor or roof plan. In the top-left corner there may be technical labels "area_px:NNN" and "room_no:N" — these are for our software only; do not treat them as plan areas.
+
+Task: Find every surface area printed in square metres (m²) that is visible in this image — for example stamps like "F = 12,5 m²", tables with m² columns, callouts with "m²", totals such as NNF/Nutzfläche when given in m², etc.
+
+Rules:
+- Add together ALL numeric m² values you can clearly read. If the same number appears as separate room/zone labels, add each occurrence (e.g. two labels "20 m²" → include both in the sum).
+- Use only values explicitly shown as areas in m² (or unambiguous area context on the plan). Do not infer m² from rulers, scale bars, or image pixels alone.
+- Ignore the area_px / room_no overlays.
+- If you cannot read any m² number, return null for total_visible_m2_sum.
+
+Return ONLY JSON (no markdown):
+{"total_visible_m2_sum": <number or null>}
+"""
 
 # Batch (deprecated pentru rooms — preferați call_gemini_rooms_per_crop): prompt lung, instabil cu N imagini.
 GEMINI_PROMPT_ROOMS_BATCH = """
@@ -741,6 +761,218 @@ def call_gemini_room_single(image_path: str | Path, api_key: str, max_retries: i
             if attempt >= max_retries:
                 print(f"⚠️  Gemini room single error: {e}")
     return None
+
+
+def _write_gemini_roof_visible_m2_audit(
+    save_path: str | Path,
+    *,
+    image_path: Path,
+    outcome: str,
+    attempt: int,
+    http_status: int | None = None,
+    http_body_snippet: str | None = None,
+    gemini_response_json: dict[str, Any] | None = None,
+    model_raw_text: str | None = None,
+    parsed_object: dict[str, Any] | None = None,
+    total_visible_m2_sum_raw: Any = None,
+    accepted_value: float | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Salvează răspunsul Gemini (text + JSON API) pentru debug/audit roof_only."""
+    p = Path(save_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = {
+        "image_path": str(image_path.resolve()),
+        "outcome": outcome,
+        "attempt_last": attempt,
+        "http_status": http_status,
+        "http_body_snippet": http_body_snippet,
+        "gemini_response_json": gemini_response_json,
+        "model_raw_text": model_raw_text,
+        "parsed_object": parsed_object,
+        "total_visible_m2_sum_raw": total_visible_m2_sum_raw,
+        "accepted_total_visible_m2_sum": accepted_value,
+        "error_message": error_message,
+    }
+    p.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def call_gemini_roof_visible_m2_single(
+    image_path: str | Path,
+    api_key: str,
+    max_retries: int = 2,
+    response_save_path: str | Path | None = None,
+) -> dict | None:
+    """
+    Un crop (roof_only) → suma valorilor m² vizibile tipărite în imagine.
+    Returnează {"total_visible_m2_sum": float} sau None.
+    Dacă response_save_path e setat, scrie un JSON cu textul modelului și corpul răspunsului API.
+    """
+    image_path = Path(image_path)
+    audit_path = Path(response_save_path) if response_save_path else None
+    if not image_path.exists() or not api_key:
+        if audit_path:
+            _write_gemini_roof_visible_m2_audit(
+                audit_path,
+                image_path=image_path,
+                outcome="skipped_missing_image_or_key",
+                attempt=-1,
+                error_message="missing file or api key",
+            )
+        return None
+    try:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+    except OSError as e:
+        if audit_path:
+            _write_gemini_roof_visible_m2_audit(
+                audit_path,
+                image_path=image_path,
+                outcome="read_image_failed",
+                attempt=-1,
+                error_message=str(e),
+            )
+        return None
+    ext = image_path.suffix.lower()
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    mime_type = mime_map.get(ext, "image/png")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    gen_config = {"temperature": 0.0, "maxOutputTokens": 512, "responseMimeType": "application/json"}
+    system_instruction = {"parts": [{"text": GEMINI_SYSTEM_INSTRUCTION_ROOF_VISIBLE_M2}]}
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": image_data}},
+                {"text": GEMINI_PROMPT_ROOF_VISIBLE_M2 + "\n\nReturn ONLY valid JSON. No markdown."},
+            ]
+        }],
+        "generationConfig": gen_config,
+        "system_instruction": system_instruction,
+    }
+    headers = {"Content-Type": "application/json"}
+
+    last_attempt = 0
+    last_http_status: int | None = None
+    last_http_body: str | None = None
+    last_gemini_json: dict[str, Any] | None = None
+    last_model_text: str | None = None
+    last_parsed: dict[str, Any] | None = None
+    last_raw_sum: Any = None
+    last_err: str | None = None
+
+    for attempt in range(max_retries + 1):
+        last_attempt = attempt
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+            last_http_status = response.status_code
+            if response.status_code != 200:
+                last_http_body = (response.text or "")[:8000]
+                last_err = f"HTTP {response.status_code}"
+                continue
+            result = response.json()
+            last_gemini_json = result
+            if "candidates" not in result or not result["candidates"]:
+                last_err = "no candidates"
+                continue
+            text = (result["candidates"][0]["content"]["parts"][0].get("text") or "").strip()
+            last_model_text = text
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start == -1 or end <= start:
+                last_err = "no JSON object in model text"
+                continue
+            try:
+                data = json.loads(text[start:end])
+            except json.JSONDecodeError as e:
+                last_err = f"json decode: {e}"
+                continue
+            if not isinstance(data, dict):
+                last_err = "parsed JSON is not an object"
+                continue
+            last_parsed = data
+            raw = data.get("total_visible_m2_sum")
+            last_raw_sum = raw
+            if raw is None:
+                if audit_path:
+                    _write_gemini_roof_visible_m2_audit(
+                        audit_path,
+                        image_path=image_path,
+                        outcome="model_returned_null",
+                        attempt=attempt,
+                        http_status=last_http_status,
+                        gemini_response_json=last_gemini_json,
+                        model_raw_text=last_model_text,
+                        parsed_object=last_parsed,
+                        total_visible_m2_sum_raw=raw,
+                        accepted_value=None,
+                    )
+                return {"total_visible_m2_sum": None}
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                last_err = f"total_visible_m2_sum not numeric: {raw!r}"
+                continue
+            if v <= 0 or v > 500_000 or not math.isfinite(v):
+                last_err = f"total_visible_m2_sum out of range: {v}"
+                continue
+            if audit_path:
+                _write_gemini_roof_visible_m2_audit(
+                    audit_path,
+                    image_path=image_path,
+                    outcome="accepted",
+                    attempt=attempt,
+                    http_status=last_http_status,
+                    gemini_response_json=last_gemini_json,
+                    model_raw_text=last_model_text,
+                    parsed_object=last_parsed,
+                    total_visible_m2_sum_raw=raw,
+                    accepted_value=v,
+                )
+            return {"total_visible_m2_sum": v}
+        except (KeyError, TypeError) as e:
+            last_err = str(e)
+        except Exception as e:
+            last_err = str(e)
+            if attempt >= max_retries:
+                print(f"⚠️  Gemini roof visible m² error: {e}")
+
+    if audit_path:
+        _write_gemini_roof_visible_m2_audit(
+            audit_path,
+            image_path=image_path,
+            outcome="failed_after_retries",
+            attempt=last_attempt,
+            http_status=last_http_status,
+            http_body_snippet=last_http_body,
+            gemini_response_json=last_gemini_json,
+            model_raw_text=last_model_text,
+            parsed_object=last_parsed,
+            total_visible_m2_sum_raw=last_raw_sum,
+            accepted_value=None,
+            error_message=last_err,
+        )
+    return None
+
+
+def call_gemini_roof_visible_m2_per_crop(image_paths: list, api_key: str) -> list[dict] | None:
+    """
+    Aceeași ordine ca image_paths. Fiecare element: room_name/room_type Dach, area_m2 = sumă sau None.
+    """
+    if not image_paths or not api_key:
+        return None
+    out: list[dict] = []
+    for path in image_paths:
+        p = Path(path)
+        audit_file = p.parent / f"{p.stem}_gemini_roof_visible_m2_response.json"
+        res = call_gemini_roof_visible_m2_single(path, api_key, response_save_path=audit_file)
+        if res is None:
+            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": None})
+            continue
+        t = res.get("total_visible_m2_sum")
+        if t is None:
+            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": None})
+        else:
+            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": float(t)})
+    return out
 
 
 def call_gemini_rooms_per_crop(image_paths: list, api_key: str) -> list[dict] | None:

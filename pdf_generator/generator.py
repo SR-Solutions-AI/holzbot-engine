@@ -2716,6 +2716,15 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         offer_title = branding.get("offer_title") if isinstance(branding, dict) else None
         if tenant_slug and str(tenant_slug).lower() == "betonbau":
             offer_title = "Angebot für Ihr Massivhaus"
+        # Titlu intro: job / preview (frontend_data + pdf_texts) bate branding-ul din DB
+        offer_title_effective = offer_title
+        if isinstance(frontend_data, dict):
+            ot = frontend_data.get("offer_title")
+            if isinstance(ot, str) and ot.strip():
+                offer_title_effective = ot.strip()
+        _pot = pdf_text_overrides.get("offer_title") if isinstance(pdf_text_overrides, dict) else None
+        if isinstance(_pot, str) and _pot.strip():
+            offer_title_effective = _pot.strip()
         
         # Apply company overrides (header/footer content)
         if isinstance(company_overrides, dict) and company_overrides:
@@ -2868,6 +2877,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         roof_pricing_total_eur: float | None = None  # Preț acoperiș din workflow nou (roof_metrics + formular)
         roof_skylight_count = 0
         roof_skylight_total_cost = 0.0
+        roof_pricing: dict = {}
         if roof_pricing_path and roof_pricing_path.exists() and inclusions.get("roof", False):
             try:
                 with open(roof_pricing_path, encoding="utf-8") as f:
@@ -2928,12 +2938,20 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         
         _header_block(story, styles, offer_no, client_data_untranslated, enforcer, assets=assets, tenant_slug=tenant_slug)
         if roof_only:
-            _roof_only_intro(story, styles, client_data_untranslated, enforcer)
+            # Același intro configurabil ca la Vollangebot (Angebotsanpassung / preview)
+            _intro(
+                story,
+                styles,
+                client_data_untranslated,
+                enforcer,
+                offer_title_effective,
+                str(pdf_text_overrides.get("intro_content") or ""),
+            )
             _roof_only_summary(story, styles, frontend_data, enforcer)
             # Roof-only offer: show chosen price positions (aggregated total), without measurements.
             if roof_pricing_path and roof_pricing_path.exists():
                 try:
-                    rp = roof_pricing or {}
+                    rp = roof_pricing if isinstance(roof_pricing, dict) else {}
                     rp_items = rp.get("detailed_items") or rp.get("items") or []
                     rp_items = [it for it in rp_items if float(it.get("cost", 0) or 0) > 0]
                     if rp_items:
@@ -2964,7 +2982,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 styles,
                 client_data_untranslated,
                 enforcer,
-                offer_title,
+                offer_title_effective,
                 str(pdf_text_overrides.get("intro_content") or ""),
             )
             # Secțiunea 2: Prezentare generală proiect (doar informații comune)
@@ -3022,7 +3040,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             if inclusions.get("openings") and roof_skylight_count > 0:
                 total_windows_global += roof_skylight_count
         
-        # Planuri (side by side) și ferestre/uși — omise pentru ofertă doar Dachstuhl
+        # Planuri (side by side) și ferestre/uși; planurile apar și la ofertă Dachstuhl-only
         if plans_data:
             # Dach / Dämmung & Dachdeckung – preț acoperiș din roof_pricing.json sau fallback la plans_data
             roof_total_price = roof_pricing_total_eur if roof_pricing_total_eur is not None and roof_pricing_total_eur > 0 else 0.0
@@ -3108,78 +3126,77 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 fenster_content.append(Spacer(1, 2 * mm))
                 story.append(KeepTogether(fenster_content))
         
-            if not roof_only:
-                plan_images = []
-                plan_labels = []
-                plan_info_texts = []
-                
-                for entry in plans_data:
-                    plan = entry["info"]
-                    pricing = entry["pricing"]
-                    plan_labels.append("")
-                    info_text = []
-                    plan_info_texts.append("<br/>".join(info_text) if info_text else "")
-                    plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
-                    if plan_img_path and plan_img_path.exists():
-                        try:
-                            im = PILImage.open(plan_img_path).convert("L")
-                            im = ImageEnhance.Brightness(im).enhance(0.9)
-                            im = ImageOps.autocontrast(im)
-                            width, height = im.size
-                            aspect = width / height
-                            target_width = (A4[0]-36*mm-10*mm) / 2
-                            if aspect < 1: 
-                                target_width = target_width * 0.9
-                            img_byte_arr = io.BytesIO()
-                            im.save(img_byte_arr, format='PNG')
-                            img_byte_arr.seek(0)
-                            rl_img = Image(img_byte_arr)
-                            rl_img._restrictSize(target_width, 100*mm)
-                            plan_images.append(rl_img)
-                        except: 
-                            plan_images.append(None)
-                    else:
+            plan_images = []
+            plan_labels = []
+            plan_info_texts = []
+
+            for entry in plans_data:
+                plan = entry["info"]
+                pricing = entry["pricing"]
+                plan_labels.append("")
+                info_text = []
+                plan_info_texts.append("<br/>".join(info_text) if info_text else "")
+                plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+                if plan_img_path and plan_img_path.exists():
+                    try:
+                        im = PILImage.open(plan_img_path).convert("L")
+                        im = ImageEnhance.Brightness(im).enhance(0.9)
+                        im = ImageOps.autocontrast(im)
+                        width, height = im.size
+                        aspect = width / height
+                        target_width = (A4[0]-36*mm-10*mm) / 2
+                        if aspect < 1:
+                            target_width = target_width * 0.9
+                        img_byte_arr = io.BytesIO()
+                        im.save(img_byte_arr, format='PNG')
+                        img_byte_arr.seek(0)
+                        rl_img = Image(img_byte_arr)
+                        rl_img._restrictSize(target_width, 100*mm)
+                        plan_images.append(rl_img)
+                    except Exception:
                         plan_images.append(None)
-                
-                num_plans = len(plans_data)
-                for i in range(0, num_plans, 2):
-                    row_images = []
-                    row_labels = []
-                    row_infos = []
-                    
-                    if i < num_plans:
-                        row_labels.append(plan_labels[i])
-                        row_infos.append(plan_info_texts[i])
-                        row_images.append(plan_images[i] if plan_images[i] else "")
-                    
-                    if i + 1 < num_plans:
-                        row_labels.append(plan_labels[i + 1])
-                        row_infos.append(plan_info_texts[i + 1])
-                        row_images.append(plan_images[i + 1] if plan_images[i + 1] else "")
-                    else:
-                        row_labels.append("")
-                        row_infos.append("")
-                        row_images.append("")
-                    
-                    col_width = (A4[0]-36*mm-10*mm) / 2
-                    
-                    img_row = [
-                        row_images[0] if row_images[0] else P("", "Body"),
-                        row_images[1] if row_images[1] else P("", "Body")
-                    ]
-                    
-                    table_data = [img_row]
-                    tbl = Table(table_data, colWidths=[col_width, col_width])
-                    tbl.setStyle(TableStyle([
-                        ("VALIGN", (0,0), (-1,-1), "TOP"),
-                        ("ALIGN", (0,0), (-1,-1), "CENTER"),
-                        ("LEFTPADDING", (0,0), (-1,-1), 0),
-                        ("RIGHTPADDING", (0,0), (-1,-1), 5*mm),
-                    ]))
-                    
-                    story.append(tbl)
-                    if i + 2 < num_plans:
-                        story.append(Spacer(1, 6*mm))
+                else:
+                    plan_images.append(None)
+
+            num_plans = len(plans_data)
+            for i in range(0, num_plans, 2):
+                row_images = []
+                row_labels = []
+                row_infos = []
+
+                if i < num_plans:
+                    row_labels.append(plan_labels[i])
+                    row_infos.append(plan_info_texts[i])
+                    row_images.append(plan_images[i] if plan_images[i] else "")
+
+                if i + 1 < num_plans:
+                    row_labels.append(plan_labels[i + 1])
+                    row_infos.append(plan_info_texts[i + 1])
+                    row_images.append(plan_images[i + 1] if plan_images[i + 1] else "")
+                else:
+                    row_labels.append("")
+                    row_infos.append("")
+                    row_images.append("")
+
+                col_width = (A4[0]-36*mm-10*mm) / 2
+
+                img_row = [
+                    row_images[0] if row_images[0] else P("", "Body"),
+                    row_images[1] if row_images[1] else P("", "Body")
+                ]
+
+                table_data = [img_row]
+                tbl = Table(table_data, colWidths=[col_width, col_width])
+                tbl.setStyle(TableStyle([
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 0),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 5*mm),
+                ]))
+
+                story.append(tbl)
+                if i + 2 < num_plans:
+                    story.append(Spacer(1, 6*mm))
         
         # Nu mai afișăm tabele detaliate pentru openings și utilities - sunt în structura simplificată
         
@@ -3238,10 +3255,8 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         story.append(tbl)
         story.append(Spacer(1, 5*mm))
         
-        if roof_only:
-            _legal_disclaimer_roof_only(story, styles, enforcer)
-        else:
-            _legal_disclaimer(story, styles, enforcer, pdf_text_overrides)
+        # Rechtlicher Block: aceleași texte configurabile (Angebotsanpassung) ca la Vollangebot
+        _legal_disclaimer(story, styles, enforcer, pdf_text_overrides)
         
         doc.build(
             story, 
@@ -3578,30 +3593,28 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
             story.append(Paragraph(f"Plan: {floor_label} ({plan.plan_id})", styles["H2"]))
             story.append(Spacer(1, 2*mm))
             
-            # ADMIN: Adaugă imaginea planului (nicht bei reiner Dachstuhl-Schätzung)
-            if not roof_only:
-                plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
-                if plan_img_path and plan_img_path.exists():
-                    try:
-                        im = PILImage.open(plan_img_path).convert("L")
-                        im = ImageEnhance.Brightness(im).enhance(0.9)
-                        im = ImageOps.autocontrast(im)
-                        width, height = im.size
-                        aspect = width / height
-                        target_width = A4[0]-36*mm
-                        if aspect < 1: 
-                            target_width = (A4[0]-36*mm) * 0.65
-                        img_byte_arr = io.BytesIO()
-                        im.save(img_byte_arr, format='PNG')
-                        img_byte_arr.seek(0)
-                        rl_img = Image(img_byte_arr)
-                        rl_img._restrictSize(target_width, 75*mm)
-                        rl_img.hAlign = 'CENTER'
-                        story.append(Spacer(1, 2*mm))
-                        story.append(rl_img)
-                        story.append(Spacer(1, 3*mm))
-                    except Exception as e:
-                        print(f"⚠️ [PDF ADMIN] Nu pot încărca imaginea planului: {e}")
+            plan_img_path = resolve_plan_image_for_pdf(plan.plan_image, plan.plan_id, output_root, job_root)
+            if plan_img_path and plan_img_path.exists():
+                try:
+                    im = PILImage.open(plan_img_path).convert("L")
+                    im = ImageEnhance.Brightness(im).enhance(0.9)
+                    im = ImageOps.autocontrast(im)
+                    width, height = im.size
+                    aspect = width / height
+                    target_width = A4[0]-36*mm
+                    if aspect < 1:
+                        target_width = (A4[0]-36*mm) * 0.65
+                    img_byte_arr = io.BytesIO()
+                    im.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    rl_img = Image(img_byte_arr)
+                    rl_img._restrictSize(target_width, 75*mm)
+                    rl_img.hAlign = 'CENTER'
+                    story.append(Spacer(1, 2*mm))
+                    story.append(rl_img)
+                    story.append(Spacer(1, 3*mm))
+                except Exception as e:
+                    print(f"⚠️ [PDF ADMIN] Nu pot încărca imaginea planului: {e}")
             
             bd = pricing.get("breakdown", {})
             

@@ -99,6 +99,17 @@ def run_walls_pipeline_after_manual_editor(plan: PlanInfo, roof_only_offer: bool
     if not gemini_key:
         print("      ⚠️ [manual] GEMINI_API_KEY lipsește", flush=True)
         return False
+    use_roof_visible_m2_scale = roof_only_offer
+    response_path = raster_dir / "response.json"
+    if response_path.exists():
+        try:
+            resp = json.loads(response_path.read_text(encoding="utf-8"))
+            data = resp.get("data", resp) if isinstance(resp, dict) else {}
+            rooms = data.get("rooms") if isinstance(data, dict) else None
+            if isinstance(rooms, list) and len(rooms) >= 1:
+                use_roof_visible_m2_scale = False
+        except Exception:
+            pass
     try:
         generate_walls_from_room_coordinates(
             original_img,
@@ -109,6 +120,7 @@ def run_walls_pipeline_after_manual_editor(plan: PlanInfo, roof_only_offer: bool
             initial_walls_mask_1px=initial,
             progress_callback=None,
             notify_scale_walls_3d_ui=not roof_only_offer,
+            roof_only_offer=use_roof_visible_m2_scale,
         )
         return True
     except Exception as e:
@@ -121,8 +133,10 @@ def run_walls_pipeline_after_manual_editor(plan: PlanInfo, roof_only_offer: bool
 
 def seed_roof_only_rooms_from_roof_polygons(run_id: str, plans: list["PlanInfo"]) -> dict[str, int]:
     """
-    roof_only_offer: construiește 09_interior.png direct din poligoanele editorului de acoperiș
+    roof_only_offer (legacy): construiește 09_interior.png din poligoanele editorului de acoperiș
     și injectează aceleași poligoane în raster/response.json (rooms), per plan.
+    Dacă response.json are deja camere (din Grundriss / detections_edited), planul e sărit –
+    același flux ca la casă completă, cu Räume gedämmt/ungedämmt.
     Returnează numărul de poligoane aplicate pentru fiecare plan_id.
     """
     from config.settings import OUTPUT_ROOT
@@ -181,6 +195,20 @@ def seed_roof_only_rooms_from_roof_polygons(run_id: str, plans: list["PlanInfo"]
         stage = Path(plan.stage_work_dir)
         cubicasa = stage / "cubicasa_steps"
         raster_dir = cubicasa / "raster"
+        response_path = raster_dir / "response.json"
+        skip_seed = False
+        if response_path.exists():
+            try:
+                current = json.loads(response_path.read_text(encoding="utf-8"))
+                data = current.get("data", current) if isinstance(current, dict) else {}
+                rooms_existing = data.get("rooms") if isinstance(data, dict) else None
+                if isinstance(rooms_existing, list) and len(rooms_existing) >= 1:
+                    skip_seed = True
+            except Exception:
+                pass
+        if skip_seed:
+            continue
+
         output_dir = cubicasa / "raster_processing" / "walls_from_coords"
         output_dir.mkdir(parents=True, exist_ok=True)
         orig_path = cubicasa / "00_original.png"

@@ -18,6 +18,8 @@ from .scale_detection import (
     GEMINI_PROMPT_CROP,
     GEMINI_DOORS_BATCH_CHUNK_SIZE,
     call_gemini_rooms_per_crop,
+    call_gemini_roof_visible_m2_per_crop,
+    call_gemini_roof_visible_m2_single,
     call_gemini_openings_with_context,
     is_informational_total_result,
 )
@@ -740,6 +742,7 @@ def generate_walls_from_room_coordinates(
     initial_walls_mask_1px: np.ndarray = None,
     progress_callback: Optional[Callable[[], None]] = None,
     notify_scale_walls_3d_ui: bool = True,
+    roof_only_offer: bool = False,
 ) -> Dict[str, Any]:
     """
     Generează pereții pentru camere folosind coordonatele din overlay_on_original.png,
@@ -755,6 +758,7 @@ def generate_walls_from_room_coordinates(
         steps_dir: Directorul pentru steps
         gemini_api_key: Cheia API pentru Gemini (opțional)
         initial_walls_mask_1px: Mască pereți 1px deja aliniată la original (skip construire segmente)
+        roof_only_offer: Dacă True, Gemini sumează valorile m² tipărite vizibile în fiecare crop (poligon acoperiș).
 
     Returns:
         Dict cu rezultatele: walls_mask, room_scales, indoor_mask, outdoor_mask, walls_int, walls_ext
@@ -2507,20 +2511,44 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
         result_data = None
         if gemini_api_key:
             try:
-                result = call_gemini(crop_path, GEMINI_PROMPT_CROP, gemini_api_key)
-                if result and is_informational_total_result(result):
-                    result = None
-                if result and result.get('area_m2') is not None:
-                    area_m2 = float(result['area_m2'])
-                    if area_m2 > 0:
+                if roof_only_offer:
+                    batch_path = output_dir / f"room_{i}_batch.png"
+                    p_use = str(batch_path) if batch_path.is_file() else crop_path
+                    p_use_path = Path(p_use)
+                    roof_audit = p_use_path.parent / f"{p_use_path.stem}_gemini_roof_visible_m2_response.json"
+                    roof_r = call_gemini_roof_visible_m2_single(
+                        p_use, gemini_api_key, response_save_path=roof_audit
+                    )
+                    area_m2 = None
+                    if roof_r and roof_r.get("total_visible_m2_sum") is not None:
+                        try:
+                            area_m2 = float(roof_r["total_visible_m2_sum"])
+                        except (TypeError, ValueError):
+                            area_m2 = None
+                    if area_m2 is not None and area_m2 > 0:
                         result_data = {
                             'idx': i,
                             'area_m2': float(area_m2),
                             'area_px': int(room_area_px),
-                            'room_name': result.get('room_name', f'Room_{i}'),
+                            'room_name': 'Dach',
                             'room_crop': room_crop,
                             'room_mask': room_mask_crop
                         }
+                else:
+                    result = call_gemini(crop_path, GEMINI_PROMPT_CROP, gemini_api_key)
+                    if result and is_informational_total_result(result):
+                        result = None
+                    if result and result.get('area_m2') is not None:
+                        area_m2 = float(result['area_m2'])
+                        if area_m2 > 0:
+                            result_data = {
+                                'idx': i,
+                                'area_m2': float(area_m2),
+                                'area_px': int(room_area_px),
+                                'room_name': result.get('room_name', f'Room_{i}'),
+                                'room_crop': room_crop,
+                                'room_mask': room_mask_crop
+                            }
             except Exception as e:
                 _log(f"         Camera {i}: Eroare Gemini: {e}")
         if result_data:
@@ -2788,7 +2816,15 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
         _tick()
         batch_results = None
         if gemini_api_key and paths_for_batch and len(paths_for_batch) == len(valid_entries):
-            batch_results = call_gemini_rooms_per_crop([str(p) for p in paths_for_batch], gemini_api_key)
+            if roof_only_offer:
+                print(
+                    "      🏠 [roof_only_offer] Gemini: sumă m² tipărite vizibile în fiecare crop (poligon acoperiș).",
+                    flush=True,
+                )
+                _log("      🏠 roof_only_offer: Gemini sumă m² tipărite vizibile per crop (poligon acoperiș).")
+                batch_results = call_gemini_roof_visible_m2_per_crop([str(p) for p in paths_for_batch], gemini_api_key)
+            else:
+                batch_results = call_gemini_rooms_per_crop([str(p) for p in paths_for_batch], gemini_api_key)
         _tick()
         if batch_results is None or len(batch_results) != len(paths_for_batch):
             batch_results = None
@@ -2804,7 +2840,10 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
                         area_m2 = float(r['area_m2'])
                     except (TypeError, ValueError):
                         area_m2 = 0.0
-                if area_m2 is not None and area_m2 > 0 and not is_informational_total_result(dict(room_name=room_name, area_m2=area_m2)):
+                use_area = area_m2 is not None and area_m2 > 0
+                if use_area and not roof_only_offer:
+                    use_area = not is_informational_total_result(dict(room_name=room_name, area_m2=area_m2))
+                if use_area:
                     area_px_stored = int(room_area_px)
                     cv2.imwrite(str(output_dir / f"room_{i}_crop.png"), room_crop)
                     cv2.imwrite(str(output_dir / f"room_{i}_mask.png"), room_mask_crop)
@@ -2978,6 +3017,7 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
             'weighted_average_m_px': float(m_px) if m_px is not None and m_px > 0 else None,
             'room_scales': room_scales if room_scales else {},
             'estimated_scale': estimated_scale,
+            'gemini_scale_mode': ('roof_visible_m2_sum' if roof_only_offer else 'room_crop'),
         }
         with open(output_dir / "room_scales.json", 'w', encoding='utf-8') as f:
             json.dump(scale_data, f, indent=2, ensure_ascii=False)
