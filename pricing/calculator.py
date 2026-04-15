@@ -845,6 +845,80 @@ def calculate_pricing_for_plan(
             else:
                 cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
 
+    # Aufstockung Phase 1 (Rückbau / Treppenöffnung / Statik): global pro Angebot, nur einmal auf Erdgeschoss addieren.
+    cost_aufstockung_phase1 = {"total_cost": 0.0, "detailed_items": []}
+    phase1_data = frontend_input.get("aufstockungPhase1", {}) if isinstance(frontend_input, dict) else {}
+    if is_ground_floor and isinstance(phase1_data, dict):
+        raw_params = pricing_coeffs.get("_raw_params", {}) or {}
+        items_phase1 = []
+        demolition_items = phase1_data.get("demolitionSelections", []) or []
+        for idx, sel in enumerate(demolition_items):
+            if not isinstance(sel, dict):
+                continue
+            area_m2 = float(sel.get("area_m2") or 0.0)
+            price_key = str(sel.get("price_key") or "").strip()
+            if area_m2 <= 0 or not price_key:
+                continue
+            unit_price = float(raw_params.get(price_key, 0.0) or 0.0)
+            cost = area_m2 * unit_price
+            items_phase1.append({
+                "category": "aufstockung_demolition",
+                "name": f"Dachrückbau #{idx + 1}",
+                "area_m2": round(area_m2, 2),
+                "unit_price": round(unit_price, 2),
+                "total_cost": round(cost, 2),
+            })
+
+        stair_items = phase1_data.get("stairOpenings", []) or []
+        for idx, sel in enumerate(stair_items):
+            if not isinstance(sel, dict):
+                continue
+            qty = float(sel.get("quantity") or 1.0)
+            price_key = str(sel.get("price_key") or "aufstockung_stair_opening_piece").strip()
+            if qty <= 0:
+                continue
+            unit_price = float(raw_params.get(price_key, raw_params.get("aufstockung_stair_opening_piece", 0.0)) or 0.0)
+            cost = qty * unit_price
+            items_phase1.append({
+                "category": "aufstockung_stair_opening",
+                "name": f"Treppenöffnung #{idx + 1}",
+                "quantity": round(qty, 2),
+                "unit_price": round(unit_price, 2),
+                "total_cost": round(cost, 2),
+            })
+
+        statik = phase1_data.get("statikChoice", {}) or {}
+        if isinstance(statik, dict):
+            mode = str(statik.get("mode") or "none").strip().lower()
+            if mode == "stahlbetonverbunddecke":
+                unit_price = float(raw_params.get("aufstockung_statik_stahlbetonverbunddecke_m2", 0.0) or 0.0)
+                target_area = float(phase1_data.get("newFloorsAreaM2") or floor_area or 0.0)
+                cost = target_area * unit_price
+                items_phase1.append({
+                    "category": "aufstockung_statik",
+                    "name": "Statik: Stahlbetonverbunddecke",
+                    "area_m2": round(target_area, 2),
+                    "unit_price": round(unit_price, 2),
+                    "total_cost": round(cost, 2),
+                })
+            elif mode == "sonderkonstruktion":
+                custom_price = float(statik.get("customPiecePrice") or 0.0)
+                if custom_price > 0:
+                    items_phase1.append({
+                        "category": "aufstockung_statik",
+                        "name": "Statik: Sonderkonstruktion",
+                        "quantity": 1,
+                        "unit_price": round(custom_price, 2),
+                        "total_cost": round(custom_price, 2),
+                    })
+
+        if items_phase1:
+            cost_aufstockung_phase1 = {
+                "total_cost": round(sum(float(it.get("total_cost") or 0.0) for it in items_phase1), 2),
+                "detailed_items": items_phase1,
+            }
+            total_plan_cost += cost_aufstockung_phase1["total_cost"]
+
     # Breakdown: componente excluse prin nivel ofertă apar cu cost 0; structura e afișată cu factorii acces × teren aplicați
     def _zero_if_excluded(cost_dict: dict, include: bool) -> dict:
         if include:
@@ -881,5 +955,6 @@ def calculate_pricing_for_plan(
             "fireplace": _zero_if_excluded(cost_fireplace, include_fireplace),
             "basement": cost_basement,
             "wintergaerten_balkone": _zero_if_excluded(cost_wintergaerten_balkone, include_finishes),
+            "aufstockung_phase1": cost_aufstockung_phase1,
         }
     }

@@ -10,6 +10,7 @@ post_editor: from apply_detections_edited through scale/count/roof/pricing/PDF.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +46,52 @@ from orchestrator import (
     notify_ui,
     wait_for_offer_number_in_job,
 )
+
+
+def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path) -> dict:
+    """Merge editor phase1 selections (demolition/stairs/statik) into frontend_data for pricing."""
+    if not isinstance(frontend_data, dict):
+        return frontend_data
+    out = dict(frontend_data)
+    phase1 = dict(out.get("aufstockungPhase1") or {})
+
+    extras_path = job_root / "detections_review_extras.json"
+    if extras_path.exists():
+        try:
+            extras = json.loads(extras_path.read_text(encoding="utf-8"))
+            statik = extras.get("statikChoice")
+            if isinstance(statik, dict):
+                phase1["statikChoice"] = statik
+        except Exception:
+            pass
+
+    demolition = []
+    stairs = []
+    for p in job_root.glob("scale/*/cubicasa_steps/raster/detections_edited.json"):
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for d in payload.get("roofDemolitions", []) or []:
+            if isinstance(d, dict):
+                demolition.append({
+                    "area_m2": float(d.get("area_m2") or d.get("area") or 0.0),
+                    "price_key": str(d.get("price_key") or "aufstockung_demolition_roof_basic_m2"),
+                })
+        for s in payload.get("stairOpenings", []) or []:
+            if isinstance(s, dict):
+                stairs.append({
+                    "quantity": float(s.get("quantity") or 1.0),
+                    "price_key": str(s.get("price_key") or "aufstockung_stair_opening_piece"),
+                })
+
+    if demolition:
+        phase1["demolitionSelections"] = demolition
+    if stairs:
+        phase1["stairOpenings"] = stairs
+    if phase1:
+        out["aufstockungPhase1"] = phase1
+    return out
 
 
 def _pdf_block(run_id: str, job_root: Path, frontend_data: dict, set_progress) -> tuple:
@@ -119,6 +166,7 @@ def run_variables(engine_run_id: str, job_id: str) -> int:
     set_progress(_PROGRESS_WEIGHTS["pricing_end"] - 2)
 
     frontend_data = load_frontend_data_for_run(engine_run_id, job_root)
+    frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
 
     with Timer("RESUME: Pricing") as t:
         pricing_results = run_pricing_for_run(engine_run_id, frontend_data_override=frontend_data)
@@ -158,6 +206,7 @@ def run_variables(engine_run_id: str, job_id: str) -> int:
 
     wait_for_offer_number_in_job(job_root)
     frontend_data = load_frontend_data_for_run(engine_run_id, job_root)
+    frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
 
     with Timer("RESUME: PDF") as t:
         pdf_path, *_rest = _pdf_block(engine_run_id, job_root, frontend_data, set_progress)
@@ -182,6 +231,7 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
 
     run_id = engine_run_id
     frontend_data = load_frontend_data_for_run(run_id, job_root)
+    frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
 
     plans = load_plan_infos(run_id, "scale")
@@ -271,6 +321,7 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
     set_progress(_PROGRESS_WEIGHTS["count_roof_end"])
 
     frontend_data = load_frontend_data_for_run(run_id, job_root)
+    frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
 
     set_progress(_PROGRESS_WEIGHTS["pricing_end"] - 2)
     with Timer("RESUME: Pricing") as t:

@@ -2460,6 +2460,7 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
     utilities_total = 0.0
     fireplace_total = 0.0
     stairs_total = 0.0
+    aufstockung_phase1_total = 0.0
     
     for entry in plans_data:
         pricing = entry["pricing"]
@@ -2478,6 +2479,7 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
             floors_total += bd.get("floors_ceilings", {}).get("total_cost", 0.0)
             # Stairs sunt incluse în floors_ceilings dacă este inclus
             stairs_total += bd.get("stairs", {}).get("total_cost", 0.0)
+            aufstockung_phase1_total += bd.get("aufstockung_phase1", {}).get("total_cost", 0.0)
         if inclusions.get("roof", False):
             roof_total += bd.get("roof", {}).get("total_cost", 0.0)
         if inclusions.get("openings", False):
@@ -2497,7 +2499,7 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
     structure_total += roof_total + floors_total
     
     # Calculează totalul final (fără tabel, doar pentru verificare)
-    total_cost = foundation_total + structure_total + openings_total + finishes_total + utilities_total + fireplace_total + stairs_total
+    total_cost = foundation_total + structure_total + openings_total + finishes_total + utilities_total + fireplace_total + stairs_total + aufstockung_phase1_total
     
     story.append(Spacer(1, 3*mm))
 
@@ -2817,6 +2819,10 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 for category_key, category_data in breakdown.items():
                     # Stairs este inclus dacă floors_ceilings este inclus
                     if category_key == "stairs" and inclusions.get("floors_ceilings", False):
+                        filtered_breakdown[category_key] = category_data
+                        filtered_total += category_data.get("total_cost", 0.0)
+                        continue
+                    if category_key == "aufstockung_phase1" and inclusions.get("floors_ceilings", False):
                         filtered_breakdown[category_key] = category_data
                         filtered_total += category_data.get("total_cost", 0.0)
                         continue
@@ -3460,6 +3466,10 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                         filtered_breakdown[category_key] = category_data
                         filtered_total += category_data.get("total_cost", 0.0)
                         continue
+                    if category_key == "aufstockung_phase1" and inclusions.get("floors_ceilings", False):
+                        filtered_breakdown[category_key] = category_data
+                        filtered_total += category_data.get("total_cost", 0.0)
+                        continue
                     
                     # Fireplace este inclus dacă utilities este inclus (fireplace face parte din utilities)
                     if category_key == "fireplace" and inclusions.get("utilities", False):
@@ -3783,6 +3793,10 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
             for category_key, category_data in breakdown.items():
                 # Stairs este inclus dacă floors_ceilings este inclus
                 if category_key == "stairs" and inclusions.get("floors_ceilings", False):
+                    filtered_breakdown[category_key] = category_data
+                    filtered_total += category_data.get("total_cost", 0.0)
+                    continue
+                if category_key == "aufstockung_phase1" and inclusions.get("floors_ceilings", False):
                     filtered_breakdown[category_key] = category_data
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue

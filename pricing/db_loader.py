@@ -251,6 +251,15 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Sonder": data_map.get("stairs_type_sonder_piece_price", data_map.get("price_per_stair_unit", 0)),
             },
         },
+        "aufstockung_phase1": {
+            "demolition_price_keys": [
+                "aufstockung_demolition_roof_basic_m2",
+                "aufstockung_demolition_roof_complex_m2",
+                "aufstockung_demolition_roof_special_m2",
+            ],
+            "stair_opening_price_key": "aufstockung_stair_opening_piece",
+            "statik_stahlbetonverbunddecke_key": "aufstockung_statik_stahlbetonverbunddecke_m2",
+        },
         "utilities": {
             "electricity": {
                 "coefficient_electricity_per_m2": data_map.get("electricity_base_price", 60.0),
