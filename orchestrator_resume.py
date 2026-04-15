@@ -42,56 +42,11 @@ from orchestrator import (
     Timer,
     _PROGRESS_WEIGHTS,
     _check_raster_complete,
+    _enrich_frontend_with_aufstockung_phase1,
     _make_progress_sender,
     notify_ui,
     wait_for_offer_number_in_job,
 )
-
-
-def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path) -> dict:
-    """Merge editor phase1 selections (demolition/stairs/statik) into frontend_data for pricing."""
-    if not isinstance(frontend_data, dict):
-        return frontend_data
-    out = dict(frontend_data)
-    phase1 = dict(out.get("aufstockungPhase1") or {})
-
-    extras_path = job_root / "detections_review_extras.json"
-    if extras_path.exists():
-        try:
-            extras = json.loads(extras_path.read_text(encoding="utf-8"))
-            statik = extras.get("statikChoice")
-            if isinstance(statik, dict):
-                phase1["statikChoice"] = statik
-        except Exception:
-            pass
-
-    demolition = []
-    stairs = []
-    for p in job_root.glob("scale/*/cubicasa_steps/raster/detections_edited.json"):
-        try:
-            payload = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        for d in payload.get("roofDemolitions", []) or []:
-            if isinstance(d, dict):
-                demolition.append({
-                    "area_m2": float(d.get("area_m2") or d.get("area") or 0.0),
-                    "price_key": str(d.get("price_key") or "aufstockung_demolition_roof_basic_m2"),
-                })
-        for s in payload.get("stairOpenings", []) or []:
-            if isinstance(s, dict):
-                stairs.append({
-                    "quantity": float(s.get("quantity") or 1.0),
-                    "price_key": str(s.get("price_key") or "aufstockung_stair_opening_piece"),
-                })
-
-    if demolition:
-        phase1["demolitionSelections"] = demolition
-    if stairs:
-        phase1["stairOpenings"] = stairs
-    if phase1:
-        out["aufstockungPhase1"] = phase1
-    return out
 
 
 def _pdf_block(run_id: str, job_root: Path, frontend_data: dict, set_progress) -> tuple:
@@ -233,6 +188,8 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
     frontend_data = load_frontend_data_for_run(run_id, job_root)
     frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
+    wizard_package = str(frontend_data.get("wizard_package") or "").strip().lower()
+    is_aufstockung_offer = wizard_package == "aufstockung"
 
     plans = load_plan_infos(run_id, "scale")
     if not plans:
@@ -286,11 +243,18 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
     pt.add_step("Manual blueprint + walls", t.end_time - t.start_time)
 
     if not raster_ok:
-        print(
-            "\n⛔ [resume] Raster incomplete — cannot continue to scale/pricing.\n",
-            flush=True,
-        )
-        return 2
+        if is_aufstockung_offer:
+            print(
+                "\n⚠️ [resume] Aufstockung: raster completeness check bypassed; continuing pipeline.",
+                flush=True,
+            )
+            raster_ok = True
+        else:
+            print(
+                "\n⛔ [resume] Raster incomplete — cannot continue to scale/pricing.\n",
+                flush=True,
+            )
+            return 2
 
     set_progress(_PROGRESS_WEIGHTS["raster_end"])
     with Timer("RESUME: Scale") as t:

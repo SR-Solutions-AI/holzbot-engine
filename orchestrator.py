@@ -280,6 +280,134 @@ def _check_raster_complete(plans: List[PlanInfo], job_root: Path | None = None) 
     return (len(failed) == 0, failed)
 
 
+def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path) -> dict:
+    """Build canonical Aufstockung phase1 payload from per-plan editor artifacts."""
+    if not isinstance(frontend_data, dict):
+        return frontend_data
+    out = dict(frontend_data)
+    wizard_package = str(out.get("wizard_package") or "").strip().lower()
+    if wizard_package != "aufstockung":
+        return out
+
+    extras = {}
+    extras_path = job_root / "detections_review_extras.json"
+    if extras_path.exists():
+        try:
+            extras = json.loads(extras_path.read_text(encoding="utf-8"))
+        except Exception:
+            extras = {}
+
+    floor_kinds_raw = (
+        out.get("aufstockungFloorKinds")
+        or out.get("floorKinds")
+        or (extras.get("floorKinds") if isinstance(extras, dict) else None)
+        or (out.get("structuraCladirii") or {}).get("aufstockungFloorKinds")
+        or []
+    )
+    floor_kinds = [
+        "new" if str(k).strip().lower() == "new" else "existing"
+        for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
+    ]
+
+    phase1 = dict(out.get("aufstockungPhase1") or {})
+    existing_floors = []
+    new_floors = []
+    demolition_flat = []
+    stairs_flat = []
+    fallback_global_statik = extras.get("statikChoice") if isinstance(extras, dict) and isinstance(extras.get("statikChoice"), dict) else None
+
+    # Run artifacts live under output/<run_id>/..., not under jobs/<run_id>/scale.
+    run_id = str(job_root.name)
+    scale_root = OUTPUT_ROOT / run_id / "scale"
+    manifest_path = job_root / "detections_review_manifest.json"
+    plan_roots = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raster_dirs = manifest.get("rasterDirs") if isinstance(manifest, dict) else []
+            if isinstance(raster_dirs, list):
+                for rd in raster_dirs:
+                    rp = Path(str(rd))
+                    # raster dir => .../scale/<plan>/cubicasa_steps/raster
+                    if rp.name == "raster":
+                        plan_roots.append(rp.parent.parent)
+        except Exception:
+            plan_roots = []
+    if not plan_roots and scale_root.exists():
+        plan_roots = [p for p in sorted(scale_root.iterdir()) if p.is_dir()]
+
+    for idx, plan_root in enumerate(plan_roots):
+        edited_path = plan_root / "cubicasa_steps" / "raster" / "detections_edited.json"
+        payload = {}
+        if edited_path.exists():
+            try:
+                payload = json.loads(edited_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+        floor_kind = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
+        roof_demolitions = payload.get("roofDemolitions") if isinstance(payload.get("roofDemolitions"), list) else []
+        stair_openings = payload.get("stairOpenings") if isinstance(payload.get("stairOpenings"), list) else []
+        custom_demolition_price = (
+            float(payload.get("customDemolitionPrice"))
+            if isinstance(payload.get("customDemolitionPrice"), (int, float))
+            else None
+        )
+        statik_raw = payload.get("statikChoice") if isinstance(payload.get("statikChoice"), dict) else fallback_global_statik
+        statik_mode = str((statik_raw or {}).get("mode") or "none").strip().lower()
+        statik_choice = {"mode": statik_mode if statik_mode in ("stahlbetonverbunddecke", "sonderkonstruktion") else "none"}
+        if statik_choice["mode"] == "sonderkonstruktion":
+            custom_piece = (statik_raw or {}).get("customPiecePrice")
+            if isinstance(custom_piece, (int, float)):
+                statik_choice["customPiecePrice"] = float(custom_piece)
+
+        floor_entry = {
+            "plan_index": idx,
+            "floorKind": floor_kind,
+            "demolitionSelections": [],
+            "stairOpenings": [],
+            "customDemolitionPrice": custom_demolition_price,
+            "statikChoice": statik_choice,
+        }
+        for d in roof_demolitions:
+            if not isinstance(d, dict):
+                continue
+            area_m2 = float(d.get("area_m2") or d.get("area") or 0.0)
+            if area_m2 <= 0:
+                continue
+            demolition_item = {
+                "area_m2": area_m2,
+                "price_key": str(d.get("price_key") or "aufstockung_roof_demolition_m2"),
+            }
+            floor_entry["demolitionSelections"].append(demolition_item)
+            if floor_kind != "new":
+                demolition_flat.append({**demolition_item, "plan_index": idx})
+        for s in stair_openings:
+            if not isinstance(s, dict):
+                continue
+            qty = float(s.get("quantity") or 1.0)
+            if qty <= 0:
+                continue
+            stair_item = {
+                "quantity": qty,
+                "price_key": str(s.get("price_key") or "aufstockung_stair_opening_piece"),
+            }
+            floor_entry["stairOpenings"].append(stair_item)
+            if floor_kind != "new":
+                stairs_flat.append({**stair_item, "plan_index": idx})
+
+        if floor_kind == "new":
+            new_floors.append(floor_entry)
+        else:
+            existing_floors.append(floor_entry)
+
+    phase1["existingFloors"] = existing_floors
+    phase1["newFloors"] = new_floors
+    phase1["demolitionSelections"] = demolition_flat
+    phase1["stairOpenings"] = stairs_flat
+    out["aufstockungPhase1"] = phase1
+    return out
+
+
 # =========================================================
 # TIMER UTILITIES
 # =========================================================
@@ -495,6 +623,8 @@ def run_segmentation_and_classification_for_document(
     frontend_data = load_frontend_data_for_run(job_root.name, job_root)
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
     measurements_only_offer = bool(frontend_data.get("measurements_only_offer"))
+    wizard_package = str(frontend_data.get("wizard_package") or "").strip().lower()
+    is_aufstockung_offer = wizard_package == "aufstockung"
     our_floors = len(house_plans)
     floors_number = frontend_data.get("floorsNumber")
     basement = frontend_data.get("basement", False)
@@ -710,9 +840,20 @@ def run_segmentation_and_classification_for_document(
         pipeline_timer.add_step("Manual blueprint + walls", t.end_time - t.start_time)
         
         if not raster_ok:
-            print(f"\n⛔ [Pipeline] Camerele nu sunt calculate pentru toate planurile.", flush=True)
-            print(f"   Se sar pașii: Scale, Count Objects, Roof, Pricing, Offer, PDF.", flush=True)
-            print(f"   Asigură-te că RasterScan finalizează (room_scales.json + rooms.png) pentru fiecare etaj în ordine, apoi rulează din nou.\n", flush=True)
+            if is_aufstockung_offer:
+                print(
+                    "\n⚠️ [Pipeline] Aufstockung: raster completeness check bypassed (missing room_scales/rooms on some plans).",
+                    flush=True,
+                )
+                print(
+                    "   Continuăm pipeline-ul conform workflow-ului Aufstockung (Scale/Count/Roof/Pricing/Offer/PDF).",
+                    flush=True,
+                )
+                raster_ok = True
+            else:
+                print(f"\n⛔ [Pipeline] Camerele nu sunt calculate pentru toate planurile.", flush=True)
+                print(f"   Se sar pașii: Scale, Count Objects, Roof, Pricing, Offer, PDF.", flush=True)
+                print(f"   Asigură-te că RasterScan finalizează (room_scales.json + rooms.png) pentru fiecare etaj în ordine, apoi rulează din nou.\n", flush=True)
         
         if raster_ok:
             set_progress(_PROGRESS_WEIGHTS["raster_end"])
@@ -742,6 +883,7 @@ def run_segmentation_and_classification_for_document(
             set_progress(_PROGRESS_WEIGHTS["count_roof_end"])
 
             frontend_data = load_frontend_data_for_run(run_id, job_root)
+            frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
 
             set_progress(_PROGRESS_WEIGHTS["pricing_end"] - 2)
             with Timer("STEP 14-15: Pricing") as t:
@@ -782,6 +924,7 @@ def run_segmentation_and_classification_for_document(
 
             wait_for_offer_number_in_job(job_root)
             frontend_data = load_frontend_data_for_run(run_id, job_root)
+            frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
 
             with Timer("STEP 18-19: PDF GENERATION") as t:
                 pdf_path = None

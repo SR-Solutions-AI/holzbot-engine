@@ -845,13 +845,37 @@ def calculate_pricing_for_plan(
             else:
                 cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
 
-    # Aufstockung Phase 1 (Rückbau / Treppenöffnung / Statik): global pro Angebot, nur einmal auf Erdgeschoss addieren.
+    # Aufstockung Phase 1 (Bestand): per-floor Rückbau / Treppenöffnung / Statik.
     cost_aufstockung_phase1 = {"total_cost": 0.0, "detailed_items": []}
     phase1_data = frontend_input.get("aufstockungPhase1", {}) if isinstance(frontend_input, dict) else {}
-    if is_ground_floor and isinstance(phase1_data, dict):
+    wizard_package = str(frontend_input.get("wizard_package") or "").strip().lower() if isinstance(frontend_input, dict) else ""
+    aufstockung_floor_kinds = frontend_input.get("aufstockungFloorKinds") if isinstance(frontend_input.get("aufstockungFloorKinds"), list) else []
+    phase_floor = None
+    def _as_int(v, default=-1):
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    if isinstance(phase1_data, dict):
+        for entry in (phase1_data.get("existingFloors") or []):
+            if isinstance(entry, dict) and _as_int(entry.get("plan_index", -1)) == _as_int(plan_index):
+                phase_floor = entry
+                break
+        if phase_floor is None:
+            for entry in (phase1_data.get("newFloors") or []):
+                if isinstance(entry, dict) and _as_int(entry.get("plan_index", -1)) == _as_int(plan_index):
+                    phase_floor = entry
+                    break
+    floor_kind = str((phase_floor or {}).get("floorKind") or (aufstockung_floor_kinds[plan_index] if plan_index < len(aufstockung_floor_kinds) else "")).strip().lower()
+    is_existing_aufstockung_floor = wizard_package == "aufstockung" and floor_kind != "new"
+
+    if is_existing_aufstockung_floor and isinstance(phase_floor, dict):
         raw_params = pricing_coeffs.get("_raw_params", {}) or {}
         items_phase1 = []
-        demolition_items = phase1_data.get("demolitionSelections", []) or []
+        demolition_items = phase_floor.get("demolitionSelections", []) or []
+        custom_demolition_price = phase_floor.get("customDemolitionPrice")
+        custom_demolition_unit = float(custom_demolition_price) if isinstance(custom_demolition_price, (int, float)) else None
         for idx, sel in enumerate(demolition_items):
             if not isinstance(sel, dict):
                 continue
@@ -859,17 +883,17 @@ def calculate_pricing_for_plan(
             price_key = str(sel.get("price_key") or "").strip()
             if area_m2 <= 0 or not price_key:
                 continue
-            unit_price = float(raw_params.get(price_key, 0.0) or 0.0)
+            unit_price = custom_demolition_unit if custom_demolition_unit is not None else float(raw_params.get(price_key, 0.0) or 0.0)
             cost = area_m2 * unit_price
             items_phase1.append({
                 "category": "aufstockung_demolition",
-                "name": f"Dachrückbau #{idx + 1}",
+                "name": f"Aufstandsfläche / Abreißung #{idx + 1}",
                 "area_m2": round(area_m2, 2),
                 "unit_price": round(unit_price, 2),
                 "total_cost": round(cost, 2),
             })
 
-        stair_items = phase1_data.get("stairOpenings", []) or []
+        stair_items = phase_floor.get("stairOpenings", []) or []
         for idx, sel in enumerate(stair_items):
             if not isinstance(sel, dict):
                 continue
@@ -887,12 +911,13 @@ def calculate_pricing_for_plan(
                 "total_cost": round(cost, 2),
             })
 
-        statik = phase1_data.get("statikChoice", {}) or {}
+        statik = phase_floor.get("statikChoice", {}) or {}
         if isinstance(statik, dict):
             mode = str(statik.get("mode") or "none").strip().lower()
             if mode == "stahlbetonverbunddecke":
                 unit_price = float(raw_params.get("aufstockung_statik_stahlbetonverbunddecke_m2", 0.0) or 0.0)
-                target_area = float(phase1_data.get("newFloorsAreaM2") or floor_area or 0.0)
+                area_candidates = [float((x or {}).get("area_m2") or 0.0) for x in demolition_items if isinstance(x, dict)]
+                target_area = float(sum(area_candidates) or floor_area or 0.0)
                 cost = target_area * unit_price
                 items_phase1.append({
                     "category": "aufstockung_statik",
@@ -918,6 +943,23 @@ def calculate_pricing_for_plan(
                 "detailed_items": items_phase1,
             }
             total_plan_cost += cost_aufstockung_phase1["total_cost"]
+
+    if is_existing_aufstockung_floor:
+        # Existing-floor Aufstockung pricing: keep only roof + phase1 editor-driven items.
+        cost_foundation = {"total_cost": 0.0, "detailed_items": []}
+        cost_walls = {"total_cost": 0.0, "detailed_items": []}
+        cost_floors_ceilings = {"total_cost": 0.0, "detailed_items": []}
+        cost_openings = {"total_cost": 0.0, "detailed_items": []}
+        cost_finishes = {"total_cost": 0.0, "detailed_items": []}
+        cost_utilities = {"total_cost": 0.0, "detailed_items": []}
+        cost_stairs = {"total_cost": 0.0, "detailed_items": []}
+        cost_fireplace = {"total_cost": 0.0, "detailed_items": []}
+        cost_basement = {"total_cost": 0.0, "detailed_items": []}
+        cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
+        total_plan_cost = round(
+            float(cost_roof.get("total_cost") or 0.0) + float(cost_aufstockung_phase1.get("total_cost") or 0.0),
+            2,
+        )
 
     # Breakdown: componente excluse prin nivel ofertă apar cu cost 0; structura e afișată cu factorii acces × teren aplicați
     def _zero_if_excluded(cost_dict: dict, include: bool) -> dict:

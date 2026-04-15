@@ -4726,6 +4726,34 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                         styles["Body"]
                     ))
             story.append(Spacer(1, 4*mm))
+
+        # 9.2. AUFSTOCKUNG BESTAND (editor selections with applied prices)
+        phase1 = breakdown.get("aufstockung_phase1", {})
+        if phase1 and phase1.get("total_cost", 0) > 0:
+            story.append(Paragraph("9.2. Aufstockung Bestand (Editor-Auswahl)", styles["H2"]))
+            phase_items = phase1.get("detailed_items", []) or []
+            for item in phase_items:
+                name = item.get("name", "Position")
+                total_cost = float(item.get("total_cost") or item.get("cost") or 0.0)
+                if "area_m2" in item:
+                    qty = float(item.get("area_m2") or 0.0)
+                    unit_price = float(item.get("unit_price") or 0.0)
+                    story.append(Paragraph(
+                        f"<b>Calculation:</b> {name}: {qty:.2f} m² × {unit_price:.2f} {calc_cur_label}/m² = <b>{total_cost:.2f} {calc_cur_label}</b>",
+                        styles["Body"],
+                    ))
+                else:
+                    qty = float(item.get("quantity") or 1.0)
+                    unit_price = float(item.get("unit_price") or 0.0)
+                    story.append(Paragraph(
+                        f"<b>Calculation:</b> {name}: {qty:.2f} × {unit_price:.2f} {calc_cur_label} = <b>{total_cost:.2f} {calc_cur_label}</b>",
+                        styles["Body"],
+                    ))
+            story.append(Paragraph(
+                f"<b>Summe Bestand (dieses Geschoss):</b> {float(phase1.get('total_cost') or 0.0):.2f} {calc_cur_label}",
+                styles["Body"],
+            ))
+            story.append(Spacer(1, 4*mm))
         
         # 9.5. BASEMENT CALCULATION FOR THIS PLAN (if exists)
         basement = breakdown.get("basement", {})

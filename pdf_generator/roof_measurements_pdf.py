@@ -535,6 +535,37 @@ def _append_building_measurements_table(
     story.append(Spacer(1, 8 * mm))
 
 
+def _append_aufstockung_bestand_indicator_table(
+    story: list[Any],
+    sw: str,
+    heading_style: ParagraphStyle,
+    floor_phase1: dict[str, Any],
+) -> None:
+    """Measurements-only indicator block for Aufstockung existing-floor editor selections (no EUR)."""
+    if not isinstance(floor_phase1, dict):
+        return
+    demo = floor_phase1.get("demolitionSelections") if isinstance(floor_phase1.get("demolitionSelections"), list) else []
+    stairs = floor_phase1.get("stairOpenings") if isinstance(floor_phase1.get("stairOpenings"), list) else []
+    statik = floor_phase1.get("statikChoice") if isinstance(floor_phase1.get("statikChoice"), dict) else {}
+    statik_mode = str(statik.get("mode") or "none").strip().lower()
+    total_demo_area = sum(float((d or {}).get("area_m2") or 0.0) for d in demo if isinstance(d, dict))
+    has_custom_demo_price = isinstance(floor_phase1.get("customDemolitionPrice"), (int, float))
+
+    story.append(Paragraph(f"<b>{sw} – Aufstockung Bestand-Auswahl</b>", heading_style))
+    rows = [
+        ["Indikator", "Wert", "Einheit"],
+        ["Aufstandsflächen (Polygone)", str(len(demo)), "Stk."],
+        ["Aufstandsfläche gesamt", f"{total_demo_area:.2f}", "m²"],
+        ["Treppenöffnungen", str(len(stairs)), "Stk."],
+        ["Statik / Verstärkung", statik_mode if statik_mode != "none" else "keine Auswahl", "—"],
+        ["Abbruch-Eigenpreis gesetzt", "Ja" if has_custom_demo_price else "Nein", "—"],
+    ]
+    t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
+    _style_data_table(t)
+    story.append(t)
+    story.append(Spacer(1, 8 * mm))
+
+
 def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None) -> Path | None:
     """
     PDF: Stockwerk 1…n = aceeași ordine ca în plans_list și în editor (detections_review);
@@ -556,6 +587,73 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
     frontend_data = load_frontend_data_for_run(run_id, job_root)
     roof_only = bool(frontend_data.get("roof_only_offer")) if isinstance(frontend_data, dict) else False
     fd_dict = frontend_data if isinstance(frontend_data, dict) else {}
+    aufstockung_phase1 = (fd_dict.get("aufstockungPhase1") or {}) if isinstance(fd_dict, dict) else {}
+    # Fallback: measurements PDF runs standalone and may not receive enriched phase1 in frontend_data.
+    if not (isinstance(aufstockung_phase1, dict) and isinstance(aufstockung_phase1.get("existingFloors"), list)) and job_root:
+        try:
+            extras = {}
+            extras_path = job_root / "detections_review_extras.json"
+            if extras_path.exists():
+                extras = json.loads(extras_path.read_text(encoding="utf-8"))
+            floor_kinds_raw = (
+                (fd_dict.get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
+                or (fd_dict.get("floorKinds") if isinstance(fd_dict, dict) else None)
+                or ((fd_dict.get("structuraCladirii") or {}).get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
+                or (extras.get("floorKinds") if isinstance(extras, dict) else None)
+                or []
+            )
+            floor_kinds = [
+                "new" if str(k).strip().lower() == "new" else "existing"
+                for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
+            ]
+            fallback_global_statik = extras.get("statikChoice") if isinstance(extras, dict) and isinstance(extras.get("statikChoice"), dict) else {}
+            manifest_path = job_root / "detections_review_manifest.json"
+            plan_roots: list[Path] = []
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raster_dirs = manifest.get("rasterDirs") if isinstance(manifest, dict) else []
+                if isinstance(raster_dirs, list):
+                    for rd in raster_dirs:
+                        rp = Path(str(rd))
+                        if rp.name == "raster":
+                            plan_roots.append(rp.parent.parent)
+            existing_floors = []
+            for idx, plan_root in enumerate(plan_roots):
+                edited_path = plan_root / "cubicasa_steps" / "raster" / "detections_edited.json"
+                payload = {}
+                if edited_path.exists():
+                    try:
+                        payload = json.loads(edited_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        payload = {}
+                floor_kind = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
+                if floor_kind == "new":
+                    continue
+                statik = payload.get("statikChoice") if isinstance(payload.get("statikChoice"), dict) else fallback_global_statik
+                existing_floors.append({
+                    "plan_index": idx,
+                    "demolitionSelections": payload.get("roofDemolitions") if isinstance(payload.get("roofDemolitions"), list) else [],
+                    "stairOpenings": payload.get("stairOpenings") if isinstance(payload.get("stairOpenings"), list) else [],
+                    "customDemolitionPrice": payload.get("customDemolitionPrice"),
+                    "statikChoice": statik if isinstance(statik, dict) else {},
+                })
+            aufstockung_phase1 = {"existingFloors": existing_floors}
+        except Exception:
+            aufstockung_phase1 = {}
+    existing_phase_entries = (
+        aufstockung_phase1.get("existingFloors")
+        if isinstance(aufstockung_phase1, dict) and isinstance(aufstockung_phase1.get("existingFloors"), list)
+        else []
+    )
+    phase1_by_plan_index: dict[int, dict[str, Any]] = {}
+    for entry in existing_phase_entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("plan_index"))
+        except Exception:
+            continue
+        phase1_by_plan_index[idx] = entry
     nivel_oferta = normalize_nivel_oferta(fd_dict)
     pdf_inclusions = get_offer_inclusions(nivel_oferta, fd_dict)
 
@@ -789,6 +887,10 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     roof_windows_area_m2=rw_area,
                     inc=pdf_inclusions,
                 )
+            raw_plan_index = floor_perm[si] if isinstance(floor_perm, list) and si < len(floor_perm) else si
+            phase1_entry = phase1_by_plan_index.get(raw_plan_index)
+            if phase1_entry:
+                _append_aufstockung_bestand_indicator_table(story, sw, heading_style, phase1_entry)
 
     else:
         # Kein plans_list: nur Dachtabellen nach roof_floor_idx
