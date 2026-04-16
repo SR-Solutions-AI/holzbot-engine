@@ -40,6 +40,116 @@ from .offer_scope import (
     baukosten_position_label_de as _baukosten_position_label_de,
 )
 from .project_overview_fields import build_selected_form_overview_items
+from .roof_measurements_pdf import _load_floor_plan_order_and_labels_from_manifest
+
+
+def _load_aufstockung_floor_kinds(run_id: str, frontend_data: dict, job_root: Path | None) -> list[str]:
+    """Best-effort floor kinds in raw plan index order."""
+    extras: dict = {}
+    if job_root:
+        extras_path = Path(job_root) / "detections_review_extras.json"
+        if extras_path.exists():
+            try:
+                extras = json.loads(extras_path.read_text(encoding="utf-8"))
+            except Exception:
+                extras = {}
+    kinds_raw = (
+        (extras.get("floorKinds") if isinstance(extras, dict) else None)
+        or (frontend_data.get("floorKinds") if isinstance(frontend_data, dict) else None)
+        or (frontend_data.get("aufstockungFloorKinds") if isinstance(frontend_data, dict) else None)
+        or ((frontend_data.get("structuraCladirii") or {}).get("aufstockungFloorKinds") if isinstance(frontend_data, dict) else None)
+        or []
+    )
+    if not isinstance(kinds_raw, list):
+        return []
+    return ["new" if str(k).strip().lower() == "new" else "existing" for k in kinds_raw]
+
+
+def _load_detections_review_floor_labels_list(run_id: str, job_root: Path | None) -> list[str]:
+    paths: list[Path] = []
+    if job_root:
+        paths.append(Path(job_root) / "detections_review_floor_labels.json")
+    paths.append(JOBS_ROOT / run_id / "detections_review_floor_labels.json")
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+    return []
+
+
+def _expand_floor_label_for_form_omit(de_label: str) -> set[str]:
+    """Map job/manifest floor labels to keys used in Projektübersicht (finishes / Wandaufbau / Boden)."""
+    s = (de_label or "").strip()
+    out: set[str] = set()
+    if not s:
+        return out
+    out.add(s)
+    low = s.lower()
+    if low == "keller":
+        out.add("Keller")
+    if low == "erdgeschoss":
+        out.add("Erdgeschoss")
+    m = re.match(r"^(\d+)\.\s*Obergeschoss(?:\s*/\s*Dachgeschoss)?$", s, re.I)
+    if m:
+        n = int(m.group(1))
+        out.add(f"Obergeschoss {n}")
+    if "dachgeschoss" in low:
+        out.add("Dachgeschoss")
+    if "mansard" in low:
+        out.add("Mansardă")
+        out.add("Dachgeschoss")
+    return out
+
+
+def _overview_floor_key_matches_omit(key: str, omit: frozenset[str]) -> bool:
+    if not key or not omit:
+        return False
+    k = key.strip()
+    if k in omit:
+        return True
+    m = re.match(r"^Obergeschoss\s+(\d+)$", k, re.I)
+    if m:
+        if f"{m.group(1)}. Obergeschoss" in omit:
+            return True
+    if k == "Mansardă":
+        return bool(omit & {"Mansardă", "Dachgeschoss"})
+    if k == "Dachgeschoss":
+        return bool(omit & {"Dachgeschoss", "Mansardă"})
+    return False
+
+
+def _aufstockung_form_overview_omit_floor_labels(
+    run_id: str,
+    frontend_data: dict | None,
+    job_root: Path | None,
+) -> frozenset[str]:
+    """
+    For Aufstockung offers: do not show form-based per-floor finishes / wall / floor buildups
+    for floors marked existing (Bestand) in floorKinds, aligned with detections_review floor labels.
+    """
+    if str((frontend_data or {}).get("wizard_package") or "").strip().lower() != "aufstockung":
+        return frozenset()
+    kinds = _load_aufstockung_floor_kinds(run_id, frontend_data or {}, job_root)
+    if not kinds:
+        return frozenset()
+    labels = _load_detections_review_floor_labels_list(run_id, job_root)
+    if not labels:
+        _order, man_labels = _load_floor_plan_order_and_labels_from_manifest(run_id, job_root)
+        if isinstance(man_labels, list) and man_labels:
+            labels = [str(x).strip() for x in man_labels if str(x).strip()]
+    combined: set[str] = set()
+    for i, kind in enumerate(kinds):
+        if str(kind).strip().lower() != "existing":
+            continue
+        lab = labels[i] if i < len(labels) else ""
+        combined |= _expand_floor_label_for_form_omit(lab)
+    return frozenset(combined)
+
 
 # ---------- 1. DICTIONAR STATIC EXTINS (CONSTANTE) ----------
 STATIC_TRANSLATIONS = {
@@ -406,6 +516,7 @@ STATIC_TRANSLATIONS = {
     "Nivel energetic": "Energiestandard",
     "Gesamtnutzfläche": "Hausfläche",
     "Hausfläche": "Hausfläche",
+    "Bruttogeschossfläche": "Bruttogeschossfläche",
     "Allgemeine Projektinformationen": "Allgemeine Projektinformationen",
 }
 
@@ -2149,7 +2260,15 @@ def _scope_clarification(story, styles, enforcer: GermanEnforcer):
     story.append(Paragraph("• " + enforcer.get("Vermeidung von Zeitverlust bei Projekten, die finanziell nicht machbar sind"), styles["Body"]))
     story.append(Spacer(1, 3*mm))
 
-def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforcer, plans_data: list = None):
+def _project_overview(
+    story,
+    styles,
+    frontend_data: dict,
+    enforcer: GermanEnforcer,
+    plans_data: list = None,
+    *,
+    job_root: Path | None = None,
+):
     """Prezentare generală proiect - DOAR informații comune (nu per etaj)"""
     story.append(Paragraph(enforcer.get("Projektübersicht"), styles["H2"]))
     story.append(Spacer(1, 2*mm))
@@ -2256,6 +2375,17 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
     
     # Finisaje per etaj: prioritate date din formular (alese de user), apoi fallback din plans_data (calcul)
     finishes_per_floor = _finishes_per_floor_from_form(materiale_finisaj) if inclusions_ov.get("finishes") else {}
+    aufstockung_omit = _aufstockung_form_overview_omit_floor_labels(
+        str(frontend_data.get("run_id") or "").strip(),
+        frontend_data,
+        job_root,
+    )
+    if aufstockung_omit and finishes_per_floor:
+        finishes_per_floor = {
+            k: v
+            for k, v in finishes_per_floor.items()
+            if not _overview_floor_key_matches_omit(k, aufstockung_omit)
+        }
     if plans_data and inclusions_ov.get("finishes"):
         import re
         for entry in plans_data:
@@ -2301,7 +2431,13 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
                         finishes_per_floor[floor_label]["interior_inner"] = material
                     elif "exterior" in category and finishes_per_floor[floor_label]["exterior"] is None:
                         finishes_per_floor[floor_label]["exterior"] = material
-    
+    if aufstockung_omit and finishes_per_floor:
+        finishes_per_floor = {
+            k: v
+            for k, v in finishes_per_floor.items()
+            if not _overview_floor_key_matches_omit(k, aufstockung_omit)
+        }
+
     # Traduce valorile
     tip_sistem_de = enforcer.get(tip_sistem) if tip_sistem else "Holzrahmenbau"
     acces_santier_de = enforcer.get(acces_santier) if acces_santier and acces_santier != "—" else "—"
@@ -2348,7 +2484,11 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
             print(f"🔍 [PDF] Plan {idx}: area={area} m² (total acum: {total_house_area} m²)")
     
     if total_house_area > 0:
-        overview_items.append(f"<b>{enforcer.get('Hausfläche')}:</b> ca. <b>{total_house_area:.0f} m²</b>")
+        _wp_pkg = str((frontend_data or {}).get("wizard_package") or "").strip().lower()
+        _house_area_label = (
+            enforcer.get("Bruttogeschossfläche") if _wp_pkg == "aufstockung" else enforcer.get("Hausfläche")
+        )
+        overview_items.append(f"<b>{_house_area_label}:</b> ca. <b>{total_house_area:.0f} m²</b>")
         print(f"✅ [PDF] Suprafața brută totală a casei afișată: {total_house_area:.0f} m²")
     else:
         print(f"⚠️ [PDF] total_house_area is 0 - nu se afișează suprafața casei")
@@ -2412,6 +2552,7 @@ def _project_overview(story, styles, frontend_data: dict, enforcer: GermanEnforc
             nivel_energetic_de=nivel_energetic_de,
             nivel_finisare_de=nivel_finisare_de,
             tip_semineu=tip_semineu,
+            aufstockung_omit_floor_labels=aufstockung_omit,
         )
     )
     
@@ -2803,8 +2944,9 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         plans_data = []
         global_openings = []
         global_utilities = []
+        aufstockung_floor_kinds = _load_aufstockung_floor_kinds(run_id, frontend_data, job_root)
         
-        for p_data in enriched_plans:
+        for raw_idx, p_data in enumerate(enriched_plans):
             plan = p_data["plan"]
             pricing_path = plan.stage_work_dir / "pricing_raw.json"
             
@@ -2869,7 +3011,12 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                             filtered_breakdown.get("roof", {})["total_cost"] -= cost
                             filtered_total += cost
         
-                plans_data.append({"info": plan, "type": p_data["floor_type"], "pricing": p_json})
+                floor_kind = (
+                    aufstockung_floor_kinds[raw_idx]
+                    if 0 <= raw_idx < len(aufstockung_floor_kinds)
+                    else "new"
+                )
+                plans_data.append({"info": plan, "type": p_data["floor_type"], "pricing": p_json, "floor_kind": floor_kind})
         
         # ✅ Înlocuiește roof breakdown cu roof_pricing.json dacă există (pentru top floor, când roof e inclus)
         # Căutăm roof_pricing în toate locațiile posibile (OUTPUT_ROOT, JOBS_ROOT/output, RUNNER_ROOT/output)
@@ -2943,6 +3090,13 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         story = []
         
         _header_block(story, styles, offer_no, client_data_untranslated, enforcer, assets=assets, tenant_slug=tenant_slug)
+        is_aufstockung_offer = str(frontend_data.get("wizard_package") or "").strip().lower() == "aufstockung"
+        display_plans_data = [
+            e for e in plans_data
+            if not (is_aufstockung_offer and str(e.get("floor_kind") or "new").strip().lower() != "new")
+        ]
+        if not display_plans_data:
+            display_plans_data = plans_data
         if roof_only:
             # Același intro configurabil ca la Vollangebot (Angebotsanpassung / preview)
             _intro(
@@ -2993,11 +3147,18 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             )
             # Secțiunea 2: Prezentare generală proiect (doar informații comune)
             frontend_data_with_run_id = {**frontend_data, "run_id": run_id}
-            _project_overview(story, styles, frontend_data_with_run_id, enforcer, plans_data)
+            _project_overview(
+                story,
+                styles,
+                frontend_data_with_run_id,
+                enforcer,
+                display_plans_data,
+                job_root=job_root,
+            )
         
         # Structură de cost simplificată (eliminată complet conform cerințelor)
         # _simplified_cost_structure(story, styles, plans_data, inclusions, enforcer)
-        
+
         # Calculează ferestre și uși la total pentru afișare la planuri.
         # Dachfenster (din roof editor) se includ explicit la "Fenster".
         total_windows_global = 0
@@ -3007,8 +3168,8 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         total_windows_area_global = 0.0
         total_doors_area_global = 0.0
         
-        if plans_data and not roof_only:
-            for entry in plans_data:
+        if display_plans_data and not roof_only:
+            for entry in display_plans_data:
                 pricing = entry.get("pricing", {})
                 breakdown = pricing.get("breakdown", {})
                 openings_bd = breakdown.get("openings", {})
@@ -3061,6 +3222,65 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                     Spacer(1, 2*mm),
                 ]
                 story.append(KeepTogether(dach_content))
+
+            # Aufstockung: show editor selections for existing floors explicitly,
+            # even when they are excluded from standard room/structure blocks.
+            if (
+                str(frontend_data.get("wizard_package") or "").strip().lower() == "aufstockung"
+                and not roof_only
+            ):
+                phase1_rows = []
+                phase1_total = 0.0
+                for entry in plans_data:
+                    if str(entry.get("floor_kind") or "new").strip().lower() == "new":
+                        continue
+                    breakdown = (entry.get("pricing") or {}).get("breakdown", {}) or {}
+                    phase1 = breakdown.get("aufstockung_phase1", {}) or {}
+                    for item in (phase1.get("detailed_items", []) or []):
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name") or "Position")
+                        unit_price = float(item.get("unit_price") or 0.0)
+                        total_cost = float(item.get("total_cost") or item.get("cost") or 0.0)
+                        cat = str(item.get("category") or "")
+                        if cat == "aufstockung_stair_opening":
+                            qty = float(item.get("quantity") or 1.0)
+                            oa = item.get("opening_area_m2")
+                            ow, ol = item.get("opening_width_m"), item.get("opening_length_m")
+                            extra = ""
+                            if ow is not None and ol is not None and float(ow) > 0 and float(ol) > 0:
+                                le = max(float(ow), float(ol))
+                                br = min(float(ow), float(ol))
+                                extra = f" (Öffnung ca. {le:.2f} × {br:.2f} m"
+                                if oa is not None and float(oa) > 0:
+                                    extra += f", {float(oa):.2f} m²"
+                                extra += ")"
+                            elif oa is not None and float(oa) > 0:
+                                extra = f" (Öffnung ca. {float(oa):.2f} m²)"
+                            phase1_rows.append(
+                                f"{name}{extra}: {qty:.0f} Stk. × {unit_price:.2f} EUR = {total_cost:.2f} EUR"
+                            )
+                            phase1_total += total_cost
+                            continue
+                        qty = float(item.get("area_m2") or item.get("quantity") or 0.0)
+                        unit_suffix = (
+                            "m²"
+                            if ("area_m2" in item and item.get("area_m2") is not None)
+                            or cat == "aufstockung_demolition"
+                            or cat == "aufstockung_statik"
+                            else "Stk."
+                        )
+                        phase1_rows.append(
+                            f"{name}: {qty:.2f} {unit_suffix} × {unit_price:.2f} EUR = {total_cost:.2f} EUR"
+                        )
+                        phase1_total += total_cost
+                if phase1_rows:
+                    phase1_content = [Paragraph("<b>Aufstockung Bestand (Editor-Auswahl)</b>", styles["H3"])]
+                    for line in phase1_rows:
+                        phase1_content.append(Paragraph(f"• {line}", styles["Body"]))
+                    phase1_content.append(Paragraph(f"Summe Bestand: {_money(phase1_total)}", styles["Body"]))
+                    phase1_content.append(Spacer(1, 2 * mm))
+                    story.append(KeepTogether(phase1_content))
         
             if not roof_only:
                 story.append(Spacer(1, 4*mm))
@@ -3075,7 +3295,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                     
                     windows_total_price = 0.0
                     doors_total_price = 0.0
-                    for entry in plans_data:
+                    for entry in display_plans_data:
                         pricing = entry.get("pricing", {})
                         breakdown = pricing.get("breakdown", {})
                         openings_bd = breakdown.get("openings", {})
@@ -3136,7 +3356,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
             plan_labels = []
             plan_info_texts = []
 
-            for entry in plans_data:
+            for entry in display_plans_data:
                 plan = entry["info"]
                 pricing = entry["pricing"]
                 plan_labels.append("")
@@ -3164,7 +3384,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                 else:
                     plan_images.append(None)
 
-            num_plans = len(plans_data)
+            num_plans = len(display_plans_data)
             for i in range(0, num_plans, 2):
                 row_images = []
                 row_labels = []
@@ -4729,13 +4949,30 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
 
         # 9.2. AUFSTOCKUNG BESTAND (editor selections with applied prices)
         phase1 = breakdown.get("aufstockung_phase1", {})
-        if phase1 and phase1.get("total_cost", 0) > 0:
+        phase_items = phase1.get("detailed_items", []) if isinstance(phase1, dict) else []
+        if phase_items:
             story.append(Paragraph("9.2. Aufstockung Bestand (Editor-Auswahl)", styles["H2"]))
-            phase_items = phase1.get("detailed_items", []) or []
             for item in phase_items:
                 name = item.get("name", "Position")
                 total_cost = float(item.get("total_cost") or item.get("cost") or 0.0)
-                if "area_m2" in item:
+                cat = str(item.get("category") or "")
+                if cat == "aufstockung_stair_opening":
+                    qty = float(item.get("quantity") or 1.0)
+                    unit_price = float(item.get("unit_price") or 0.0)
+                    oa = item.get("opening_area_m2")
+                    ow, ol = item.get("opening_width_m"), item.get("opening_length_m")
+                    dim_txt = ""
+                    if ow is not None and ol is not None and float(ow) > 0 and float(ol) > 0:
+                        le = max(float(ow), float(ol))
+                        br = min(float(ow), float(ol))
+                        dim_txt = f" Öffnung ca. {le:.2f} × {br:.2f} m"
+                    if oa is not None and float(oa) > 0:
+                        dim_txt += (", " if dim_txt else " ") + f"{float(oa):.2f} m² Fläche"
+                    story.append(Paragraph(
+                        f"<b>Calculation:</b> {name}:{dim_txt} — {qty:.0f} Stk. × {unit_price:.2f} {calc_cur_label}/Stk. = <b>{total_cost:.2f} {calc_cur_label}</b>",
+                        styles["Body"],
+                    ))
+                elif "area_m2" in item:
                     qty = float(item.get("area_m2") or 0.0)
                     unit_price = float(item.get("unit_price") or 0.0)
                     story.append(Paragraph(

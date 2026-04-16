@@ -313,6 +313,75 @@ def _load_mpp_by_floor_from_scale(out_root: Path, run_id: str | None = None) -> 
     return out
 
 
+def _apply_aufstockung_new_floor_mpp_override(
+    out_root: Path,
+    run_id: str,
+    frontend_data: dict | None,
+    mpp_by_floor: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Aufstockung rule: use m/px from a NEW floor for all roof surfaces.
+    """
+    base = dict(mpp_by_floor or {})
+    if str((frontend_data or {}).get("wizard_package") or "").strip().lower() != "aufstockung":
+        return base
+
+    floor_kinds_raw = (
+        (frontend_data or {}).get("aufstockungFloorKinds")
+        or (frontend_data or {}).get("floorKinds")
+        or ((frontend_data or {}).get("structuraCladirii") or {}).get("aufstockungFloorKinds")
+        or []
+    )
+    floor_kinds = [
+        "new" if str(k).strip().lower() == "new" else "existing"
+        for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
+    ]
+
+    # Logical plan index -> plan_id from scale/plan_* order.
+    scale_root = out_root / "scale"
+    plan_dirs = sorted([p for p in scale_root.iterdir() if p.is_dir() and p.name.startswith("plan_")], key=lambda p: p.name) if scale_root.exists() else []
+    kind_by_plan_id: dict[str, str] = {}
+    for idx, pd in enumerate(plan_dirs):
+        kind_by_plan_id[pd.name] = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
+
+    floor_idx_to_plan_id = _floor_idx_to_plan_id_map_from_run(out_root, run_id)
+    new_floor_mpp: float | None = None
+    for floor_idx, plan_id in sorted(floor_idx_to_plan_id.items(), key=lambda t: t[0]):
+        if kind_by_plan_id.get(plan_id) != "new":
+            continue
+        try:
+            candidate = float(base.get(str(floor_idx)) or 0.0)
+        except Exception:
+            candidate = 0.0
+        if candidate > 0:
+            new_floor_mpp = candidate
+            break
+
+    # Fallback: pick first valid mpp if mapping is incomplete.
+    if not new_floor_mpp:
+        for idx, kind in enumerate(floor_kinds):
+            if kind != "new":
+                continue
+            plan_id = plan_dirs[idx].name if idx < len(plan_dirs) else None
+            if not plan_id:
+                continue
+            mapped_floor_idx = next((fi for fi, pid in floor_idx_to_plan_id.items() if pid == plan_id), None)
+            if mapped_floor_idx is None:
+                continue
+            try:
+                candidate = float(base.get(str(mapped_floor_idx)) or 0.0)
+            except Exception:
+                candidate = 0.0
+            if candidate > 0:
+                new_floor_mpp = candidate
+                break
+
+    if not new_floor_mpp or new_floor_mpp <= 0:
+        return base
+
+    return {str(k): float(new_floor_mpp) for k in base.keys()}
+
+
 def _window_area_from_dims(win: dict[str, Any], mpp: float) -> float:
     w = win.get("width_m")
     h = win.get("height_m")
@@ -1218,6 +1287,12 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
                 f"🔸 [ROOF PRICING] roof_only_offer: folosesc m/px din Scale(09_interior) pentru suprafețe roof: {mpp_by_floor_for_rectangles}",
                 flush=True,
             )
+    mpp_by_floor_for_rectangles = _apply_aufstockung_new_floor_mpp_override(
+        out_root=out_root,
+        run_id=run_id,
+        frontend_data=frontend_data,
+        mpp_by_floor=mpp_by_floor_for_rectangles,
+    )
 
     by_rect = _extract_rectangle_measurements_from_3d(
         out_root=out_root,

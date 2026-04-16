@@ -12,6 +12,7 @@ import base64
 import os
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 from pathlib import Path
@@ -989,23 +990,41 @@ def call_gemini_roof_visible_m2_single(
 def call_gemini_roof_visible_m2_per_crop(image_paths: list, api_key: str) -> list[dict] | None:
     """
     Aceeași ordine ca image_paths. Fiecare element: room_name/room_type Dach, area_m2 = sumă sau None.
+    Apeluri Gemini în paralel (cap la 8 workeri) pentru a reduce durata totală.
     """
     if not image_paths or not api_key:
         return None
-    out: list[dict] = []
-    for path in image_paths:
-        p = Path(path)
+    n = len(image_paths)
+    max_workers = max(1, min(8, n))
+
+    def _one(idx: int, path_str: str) -> tuple[int, dict]:
+        p = Path(path_str)
         audit_file = p.parent / f"{p.stem}_gemini_roof_visible_m2_response.json"
-        res = call_gemini_roof_visible_m2_single(path, api_key, response_save_path=audit_file)
+        try:
+            res = call_gemini_roof_visible_m2_single(p, api_key, response_save_path=audit_file)
+        except Exception:
+            res = None
         if res is None:
-            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": None})
-            continue
+            return idx, {"room_name": "Dach", "room_type": "Dach", "area_m2": None}
         t = res.get("total_visible_m2_sum")
         if t is None:
-            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": None})
-        else:
-            out.append({"room_name": "Dach", "room_type": "Dach", "area_m2": float(t)})
-    return out
+            return idx, {"room_name": "Dach", "room_type": "Dach", "area_m2": None}
+        try:
+            return idx, {"room_name": "Dach", "room_type": "Dach", "area_m2": float(t)}
+        except (TypeError, ValueError):
+            return idx, {"room_name": "Dach", "room_type": "Dach", "area_m2": None}
+
+    if n == 1:
+        _, row = _one(0, str(image_paths[0]))
+        return [row]
+
+    out: list[dict | None] = [None] * n
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, i, str(image_paths[i])): i for i in range(n)}
+        for fut in as_completed(futures):
+            idx, row = fut.result()
+            out[idx] = row
+    return [r if r is not None else {"room_name": "Dach", "room_type": "Dach", "area_m2": None} for r in out]
 
 
 def call_gemini_rooms_per_crop(image_paths: list, api_key: str) -> list[dict] | None:
@@ -1013,22 +1032,37 @@ def call_gemini_rooms_per_crop(image_paths: list, api_key: str) -> list[dict] | 
     Un apel Gemini per crop (recomandat față de batch). Acuratețe mai bună, fără amestec între imagini.
     Returnează list[dict] în ordinea imaginilor: room_name, room_type (=room_name), area_m2.
     Aplică filtru anti-halucinații: etichete tipice traduse (Living Room, Kitchen etc.) → "Raum".
+    Apeluri în paralel (cap la 8 workeri).
     """
     if not image_paths or not api_key:
         return None
-    out = []
-    for i, path in enumerate(image_paths):
-        res = call_gemini_room_single(path, api_key)
+    n = len(image_paths)
+    max_workers = max(1, min(8, n))
+
+    def _one(idx: int, path_str: str) -> tuple[int, dict]:
+        try:
+            res = call_gemini_room_single(path_str, api_key)
+        except Exception:
+            res = None
         if res is None:
-            out.append({"room_name": "Raum", "room_type": "Raum", "area_m2": None})
-            continue
+            return idx, {"room_name": "Raum", "room_type": "Raum", "area_m2": None}
         res = normalize_gemini_room_label_result(res)
         rn = (res.get("room_name") or "").strip() or "Raum"
-        # Validare semantică: doar label-uri care arată ca cuvinte reale; altfel "Raum"
         if not is_valid_room_label(rn) or is_hallucinated_room_label(rn):
             rn = "Raum"
-        out.append({"room_name": rn, "room_type": rn, "area_m2": res.get("area_m2")})
-    return out
+        return idx, {"room_name": rn, "room_type": rn, "area_m2": res.get("area_m2")}
+
+    if n == 1:
+        _, row = _one(0, str(image_paths[0]))
+        return [row]
+
+    out: list[dict | None] = [None] * n
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, i, str(image_paths[i])): i for i in range(n)}
+        for fut in as_completed(futures):
+            idx, row = fut.result()
+            out[idx] = row
+    return [r if r is not None else {"room_name": "Raum", "room_type": "Raum", "area_m2": None} for r in out]
 
 
 def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 2):

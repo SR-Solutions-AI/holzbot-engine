@@ -6,6 +6,22 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def _overview_floor_label_matches_omit(key: str, omit: frozenset[str]) -> bool:
+    if not key or not omit:
+        return False
+    k = key.strip()
+    if k in omit:
+        return True
+    m = re.match(r"^Obergeschoss\s+(\d+)$", k, re.I)
+    if m and f"{m.group(1)}. Obergeschoss" in omit:
+        return True
+    if k == "Mansardă":
+        return bool(omit & {"Mansardă", "Dachgeschoss"})
+    if k == "Dachgeschoss":
+        return bool(omit & {"Dachgeschoss", "Mansardă"})
+    return False
+
+
 def _strip_label_for_option(label: str) -> str:
     if not label or not isinstance(label, str):
         return ""
@@ -103,6 +119,7 @@ def build_selected_form_overview_items(
     nivel_energetic_de: str = "—",
     nivel_finisare_de: str = "—",
     tip_semineu: str = "",
+    aufstockung_omit_floor_labels: frozenset[str] | None = None,
 ) -> list[str]:
     overview_items: list[str] = []
     pdf_display = frontend_data.get("pdf_display") or {}
@@ -145,8 +162,12 @@ def build_selected_form_overview_items(
                 rendered = _resolve_display_value(rendered, field_tag)
         overview_items.append(f"<b>{label}:</b> <b>{rendered}</b>")
 
+    omit = aufstockung_omit_floor_labels or frozenset()
+
     def _append_floor_values(prefix: str, mapping: list[tuple[str, str, str | None]], values: dict, *, translate: bool = True):
         for key, label, field_tag in mapping:
+            if omit and _overview_floor_label_matches_omit(label, omit):
+                continue
             value = values.get(key)
             if value is None or str(value).strip() == "":
                 continue
@@ -161,6 +182,8 @@ def build_selected_form_overview_items(
     if inclusions_ov.get("finishes") and finishes_per_floor:
         floor_order = ["Keller", "Erdgeschoss"] + [f"Obergeschoss {i}" for i in range(1, 10)] + ["Mansardă", "Dachgeschoss"]
         for floor_label in floor_order:
+            if omit and _overview_floor_label_matches_omit(floor_label, omit):
+                continue
             if floor_label not in finishes_per_floor:
                 continue
             floor_finishes = finishes_per_floor[floor_label]

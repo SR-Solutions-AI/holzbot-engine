@@ -59,6 +59,31 @@ def _compute_interior_mask_area_m2(scale_dir: Path) -> tuple[float | None, int |
     area_m2 = float(area_px) * float(mpp) * float(mpp)
     return area_m2, area_px, mpp
 
+
+def _sum_room_scales_area_m2(room_scales_data: dict) -> float:
+    """
+    Sumă robustă a ariilor pe toate camerele din room_scales.json.
+    Unele rulări pot avea `total_area_m2` incomplet; preferăm suma explicită pe camere.
+    """
+    if not isinstance(room_scales_data, dict):
+        return 0.0
+    rooms = room_scales_data.get("room_scales")
+    if not isinstance(rooms, dict) or not rooms:
+        rooms = room_scales_data.get("rooms")
+    if not isinstance(rooms, dict):
+        return 0.0
+    total = 0.0
+    for room in rooms.values():
+        if not isinstance(room, dict):
+            continue
+        try:
+            area_m2 = float(room.get("area_m2") or 0.0)
+        except Exception:
+            area_m2 = 0.0
+        if area_m2 > 0:
+            total += area_m2
+    return float(total)
+
 def _count_floors_with_stairs(run_id: str, plans: List[PlanInfo]) -> int:
     """Count distinct floors containing at least one 'stairs' opening from raster measurements."""
     run_dir = get_run_dir(run_id)
@@ -243,6 +268,10 @@ def _run_for_single_plan(
             total_area_m2 = room_scales_data.get('total_area_m2', 0.0)
             total_area_px = room_scales_data.get('total_area_px', 0)
             area_source = "room_scales.total_area_m2"
+            summed_rooms_area_m2 = _sum_room_scales_area_m2(room_scales_data)
+            if summed_rooms_area_m2 > 0:
+                total_area_m2 = float(summed_rooms_area_m2)
+                area_source = "room_scales.sum(room_scales[*].area_m2)"
 
             # Prefer full interior mask area (09_interior orange pixels * mpp^2),
             # because room OCR can leave many rooms with 0 m².

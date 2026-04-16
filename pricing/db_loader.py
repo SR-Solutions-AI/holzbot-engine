@@ -29,6 +29,21 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
 
     data_map = {row["key"]: float(row["value"]) for row in params_res.data}
 
+    # Aufstockung Phase 1: chei noi pot lipsi din `pricing_parameters` pentru tenanți vechi (niciodată
+    # „Speichern” pe cardul Preisdatenbank după adăugarea variabilelor în schema JSON). Aliniat la
+    # `holzbau-form-steps.json` → preisdatenbank.sections (fieldTag aufstockung_phase1).
+    _aufstockung_raw_defaults: dict[str, float] = {
+        "aufstockung_demolition_roof_basic_m2": 85.0,
+        "aufstockung_demolition_roof_complex_m2": 120.0,
+        "aufstockung_demolition_roof_special_m2": 160.0,
+        "aufstockung_stair_opening_piece": 2800.0,
+        "aufstockung_stair_opening_m2": 320.0,
+        "aufstockung_statik_stahlbetonverbunddecke_m2": 145.0,
+    }
+    for _k, _v in _aufstockung_raw_defaults.items():
+        if _k not in data_map:
+            data_map[_k] = _v
+
     # Baustellenzufahrt (accesSantier): toate cele 3 opțiuni din form influențează prețul
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
     _heat_base = float(data_map.get("heating_base_price", 70.0))

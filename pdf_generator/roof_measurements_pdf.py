@@ -33,6 +33,143 @@ from area.config import STANDARD_DOOR_HEIGHT_M, STANDARD_WINDOW_HEIGHT_M
 from area.calculator import _infer_window_height_from_width
 
 
+def _polygon_area_px2_from_points(points: object) -> float:
+    """Shoelace area in editor pixel space (same as orchestrator)."""
+    if not isinstance(points, list) or len(points) < 3:
+        return 0.0
+    pts: list[tuple[float, float]] = []
+    for p in points:
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            try:
+                pts.append((float(p[0]), float(p[1])))
+            except (TypeError, ValueError):
+                continue
+    if len(pts) < 3:
+        return 0.0
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += (x1 * y2) - (x2 * y1)
+    return abs(s) * 0.5
+
+
+def _bbox_area_px2(bbox: object) -> float:
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return 0.0
+    try:
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _stair_opening_edge_lengths_m_from_bbox_and_area(bbox: object, area_m2: float) -> tuple[float | None, float | None]:
+    """Kürzere und längere Kantenlänge (m) aus Pixel-BBox und Fläche (m²)."""
+    if area_m2 <= 0 or not isinstance(bbox, list) or len(bbox) != 4:
+        return None, None
+    try:
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        w_px = max(0.0, x2 - x1)
+        h_px = max(0.0, y2 - y1)
+        apx = w_px * h_px
+        if apx <= 0:
+            return None, None
+        mpp = (float(area_m2) / apx) ** 0.5
+        w_m = w_px * mpp
+        h_m = h_px * mpp
+        return (min(w_m, h_m), max(w_m, h_m))
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _scale_mpp_for_plan_dir(plan_dir: Path) -> float | None:
+    sr = plan_dir / "scale_result.json"
+    if sr.exists():
+        try:
+            data = json.loads(sr.read_text(encoding="utf-8"))
+            mpp = data.get("meters_per_pixel")
+            if isinstance(mpp, (int, float)) and float(mpp) > 0:
+                return float(mpp)
+        except Exception:
+            pass
+    rs = plan_dir / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+    if rs.exists():
+        try:
+            data = json.loads(rs.read_text(encoding="utf-8"))
+            mpp = data.get("m_px") or data.get("weighted_average_m_px")
+            if isinstance(mpp, (int, float)) and float(mpp) > 0:
+                return float(mpp)
+        except Exception:
+            pass
+    return None
+
+
+def _manifest_ordered_scale_plan_dirs(job_root: Path | None, out_root: Path) -> list[Path]:
+    """Same plan order as editor/orchestrator (manifest rasterDirs), not sorted plan_01/plan_02 names."""
+    roots: list[Path] = []
+    if job_root:
+        mp = job_root / "detections_review_manifest.json"
+        if mp.exists():
+            try:
+                manifest = json.loads(mp.read_text(encoding="utf-8"))
+                raster_dirs = manifest.get("rasterDirs") if isinstance(manifest, dict) else []
+                if isinstance(raster_dirs, list):
+                    for rd in raster_dirs:
+                        rp = Path(str(rd))
+                        if rp.name == "raster":
+                            roots.append(rp.parent.parent)
+            except Exception:
+                roots = []
+    if not roots:
+        scale_root = out_root / "scale"
+        if scale_root.is_dir():
+            roots = sorted(
+                [p for p in scale_root.iterdir() if p.is_dir() and p.name.startswith("plan_")],
+                key=lambda p: p.name,
+            )
+    return roots
+
+
+def _aufstockung_new_floor_mpp(out_root: Path, floor_kinds: list[str], job_root: Path | None = None) -> float | None:
+    """m/px from first plan classified as `new` (Aufstockung rule, same as pricing)."""
+    plan_dirs = _manifest_ordered_scale_plan_dirs(job_root, out_root)
+    if not plan_dirs:
+        return None
+    for idx, pd in enumerate(plan_dirs):
+        kind = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
+        if kind != "new":
+            continue
+        mpp = _scale_mpp_for_plan_dir(pd)
+        if mpp and mpp > 0:
+            return mpp
+    return None
+
+
+def _load_aufstockung_floor_kinds(run_id: str, fd_dict: dict[str, Any], job_root: Path | None) -> list[str]:
+    """Best-effort floor kinds for Aufstockung in raw plan index order."""
+    kinds_raw: Any = []
+    extras: dict[str, Any] = {}
+    if job_root:
+        extras_path = job_root / "detections_review_extras.json"
+        if extras_path.exists():
+            try:
+                extras = json.loads(extras_path.read_text(encoding="utf-8"))
+            except Exception:
+                extras = {}
+    kinds_raw = (
+        (extras.get("floorKinds") if isinstance(extras, dict) else None)
+        or (fd_dict.get("floorKinds") if isinstance(fd_dict, dict) else None)
+        or (fd_dict.get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
+        or ((fd_dict.get("structuraCladirii") or {}).get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
+        or []
+    )
+    if not isinstance(kinds_raw, list):
+        return []
+    return ["new" if str(k).strip().lower() == "new" else "existing" for k in kinds_raw]
+
+
 def _lista_etaje_from_frontend(fd: dict[str, Any]) -> list[Any]:
     sc = fd.get("structuraCladirii")
     if isinstance(sc, dict):
@@ -540,6 +677,10 @@ def _append_aufstockung_bestand_indicator_table(
     sw: str,
     heading_style: ParagraphStyle,
     floor_phase1: dict[str, Any],
+    *,
+    out_root: Path | None = None,
+    floor_kinds_for_mpp: list[str] | None = None,
+    job_root: Path | None = None,
 ) -> None:
     """Measurements-only indicator block for Aufstockung existing-floor editor selections (no EUR)."""
     if not isinstance(floor_phase1, dict):
@@ -548,7 +689,29 @@ def _append_aufstockung_bestand_indicator_table(
     stairs = floor_phase1.get("stairOpenings") if isinstance(floor_phase1.get("stairOpenings"), list) else []
     statik = floor_phase1.get("statikChoice") if isinstance(floor_phase1.get("statikChoice"), dict) else {}
     statik_mode = str(statik.get("mode") or "none").strip().lower()
-    total_demo_area = sum(float((d or {}).get("area_m2") or 0.0) for d in demo if isinstance(d, dict))
+    new_mpp: float | None = None
+    if out_root is not None and floor_kinds_for_mpp:
+        new_mpp = _aufstockung_new_floor_mpp(out_root, floor_kinds_for_mpp, job_root)
+
+    def _demo_area_m2(d: dict) -> float:
+        a = float(d.get("area_m2") or d.get("area") or 0.0)
+        if a <= 0 and new_mpp and new_mpp > 0:
+            apx = _polygon_area_px2_from_points(d.get("points"))
+            if apx > 0:
+                a = float(apx) * (float(new_mpp) ** 2)
+        return a
+
+    total_demo_area = sum(_demo_area_m2(d) for d in demo if isinstance(d, dict))
+    total_stair_area = 0.0
+    for s in stairs:
+        if not isinstance(s, dict):
+            continue
+        a = float(s.get("area_m2") or 0.0)
+        if a <= 0 and new_mpp and new_mpp > 0:
+            apx = _bbox_area_px2(s.get("bbox"))
+            if apx > 0:
+                a = float(apx) * (float(new_mpp) ** 2)
+        total_stair_area += a
     has_custom_demo_price = isinstance(floor_phase1.get("customDemolitionPrice"), (int, float))
 
     story.append(Paragraph(f"<b>{sw} – Aufstockung Bestand-Auswahl</b>", heading_style))
@@ -556,10 +719,48 @@ def _append_aufstockung_bestand_indicator_table(
         ["Indikator", "Wert", "Einheit"],
         ["Aufstandsflächen (Polygone)", str(len(demo)), "Stk."],
         ["Aufstandsfläche gesamt", f"{total_demo_area:.2f}", "m²"],
-        ["Treppenöffnungen", str(len(stairs)), "Stk."],
-        ["Statik / Verstärkung", statik_mode if statik_mode != "none" else "keine Auswahl", "—"],
-        ["Abbruch-Eigenpreis gesetzt", "Ja" if has_custom_demo_price else "Nein", "—"],
+        ["Treppenöffnungen (Rechtecke)", str(len(stairs)), "Stk."],
+        ["Fläche Treppenöffnungen gesamt", f"{total_stair_area:.2f}", "m²"],
     ]
+    for si, s in enumerate(stairs):
+        if not isinstance(s, dict):
+            continue
+        a = float(s.get("area_m2") or 0.0)
+        if a <= 0 and new_mpp and new_mpp > 0:
+            apx = _bbox_area_px2(s.get("bbox"))
+            if apx > 0:
+                a = float(apx) * (float(new_mpp) ** 2)
+        ow, ol = s.get("opening_width_m"), s.get("opening_length_m")
+        wf = float(ow) if isinstance(ow, (int, float)) else None
+        lf = float(ol) if isinstance(ol, (int, float)) else None
+        if (wf is None or lf is None or wf <= 0 or lf <= 0) and a > 0:
+            wf, lf = _stair_opening_edge_lengths_m_from_bbox_and_area(s.get("bbox"), a)
+        if (wf is None or lf is None or wf <= 0 or lf <= 0) and new_mpp and new_mpp > 0:
+            bbox = s.get("bbox")
+            if isinstance(bbox, list) and len(bbox) == 4:
+                try:
+                    x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+                    w_px = max(0.0, x2 - x1)
+                    h_px = max(0.0, y2 - y1)
+                    if w_px > 0 and h_px > 0:
+                        mpp = float(new_mpp)
+                        wf = min(w_px, h_px) * mpp
+                        lf = max(w_px, h_px) * mpp
+                except (TypeError, ValueError):
+                    pass
+        dim_str = "—"
+        dim_unit = "—"
+        if wf is not None and lf is not None and wf > 0 and lf > 0:
+            dim_str = f"{max(wf, lf):.2f} × {min(wf, lf):.2f}"
+            dim_unit = "m"
+        rows.append([f"Treppenöffnung #{si + 1} Öffnungsmaße (L×B)", dim_str, dim_unit])
+        rows.append([f"Treppenöffnung #{si + 1} Fläche", f"{a:.2f}" if a > 0 else "—", "m²"])
+    rows.extend(
+        [
+            ["Statik / Verstärkung", statik_mode if statik_mode != "none" else "keine Auswahl", "—"],
+            ["Abbruch-Eigenpreis gesetzt", "Ja" if has_custom_demo_price else "Nein", "—"],
+        ]
+    )
     t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
     _style_data_table(t)
     story.append(t)
@@ -595,11 +796,12 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             extras_path = job_root / "detections_review_extras.json"
             if extras_path.exists():
                 extras = json.loads(extras_path.read_text(encoding="utf-8"))
+            # Prefer reviewed editor extras first; structuraCladirii often contains stale defaults.
             floor_kinds_raw = (
-                (fd_dict.get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
+                (extras.get("floorKinds") if isinstance(extras, dict) else None)
                 or (fd_dict.get("floorKinds") if isinstance(fd_dict, dict) else None)
+                or (fd_dict.get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
                 or ((fd_dict.get("structuraCladirii") or {}).get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
-                or (extras.get("floorKinds") if isinstance(extras, dict) else None)
                 or []
             )
             floor_kinds = [
@@ -654,6 +856,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
         except Exception:
             continue
         phase1_by_plan_index[idx] = entry
+    aufstockung_floor_kinds = _load_aufstockung_floor_kinds(run_id, fd_dict, job_root)
     nivel_oferta = normalize_nivel_oferta(fd_dict)
     pdf_inclusions = get_offer_inclusions(nivel_oferta, fd_dict)
 
@@ -877,7 +1080,18 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             rw = roof_windows_by_plan.get(plan.plan_id, {})
             rw_count = int(rw.get("count", 0) or 0)
             rw_area = float(rw.get("area_m2", 0.0) or 0.0)
-            if not roof_only and plan.plan_id in floors_by_plan:
+            raw_plan_index = floor_perm[si] if isinstance(floor_perm, list) and si < len(floor_perm) else si
+            is_existing_aufstockung_floor = (
+                str(fd_dict.get("wizard_package") or "").strip().lower() == "aufstockung"
+                and (
+                    raw_plan_index in phase1_by_plan_index
+                    or (
+                        0 <= raw_plan_index < len(aufstockung_floor_kinds)
+                        and aufstockung_floor_kinds[raw_plan_index] != "new"
+                    )
+                )
+            )
+            if not roof_only and plan.plan_id in floors_by_plan and not is_existing_aufstockung_floor:
                 _append_building_measurements_table(
                     story,
                     floors_by_plan[plan.plan_id],
@@ -887,10 +1101,17 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     roof_windows_area_m2=rw_area,
                     inc=pdf_inclusions,
                 )
-            raw_plan_index = floor_perm[si] if isinstance(floor_perm, list) and si < len(floor_perm) else si
             phase1_entry = phase1_by_plan_index.get(raw_plan_index)
             if phase1_entry:
-                _append_aufstockung_bestand_indicator_table(story, sw, heading_style, phase1_entry)
+                _append_aufstockung_bestand_indicator_table(
+                    story,
+                    sw,
+                    heading_style,
+                    phase1_entry,
+                    out_root=out_root,
+                    floor_kinds_for_mpp=aufstockung_floor_kinds,
+                    job_root=job_root,
+                )
 
     else:
         # Kein plans_list: nur Dachtabellen nach roof_floor_idx

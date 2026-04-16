@@ -264,6 +264,12 @@ def _check_raster_complete(plans: List[PlanInfo], job_root: Path | None = None) 
             continue
         try:
             data = json.loads(room_scales_path.read_text(encoding="utf-8"))
+            skip_ps = str(data.get("pipeline_skipped") or "").strip()
+            if skip_ps == "no_editor_room_selections":
+                if not rooms_png_path.exists():
+                    failed.append(plan.plan_id)
+                continue
+
             m2 = float(data.get("total_area_m2") or 0)
             px = int(data.get("total_area_px") or 0)
             rooms_data = data.get("room_scales") or data.get("rooms") or {}
@@ -297,10 +303,11 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         except Exception:
             extras = {}
 
+    # Prefer editor extras (detections_review) over structuraCladirii — wizard JSON is often stale vs. review UI.
     floor_kinds_raw = (
-        out.get("aufstockungFloorKinds")
+        (extras.get("floorKinds") if isinstance(extras, dict) else None)
+        or out.get("aufstockungFloorKinds")
         or out.get("floorKinds")
-        or (extras.get("floorKinds") if isinstance(extras, dict) else None)
         or (out.get("structuraCladirii") or {}).get("aufstockungFloorKinds")
         or []
     )
@@ -308,6 +315,76 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         "new" if str(k).strip().lower() == "new" else "existing"
         for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
     ]
+
+    def _polygon_area_px2(points: object) -> float:
+        if not isinstance(points, list) or len(points) < 3:
+            return 0.0
+        pts: list[tuple[float, float]] = []
+        for p in points:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                try:
+                    pts.append((float(p[0]), float(p[1])))
+                except Exception:
+                    continue
+        if len(pts) < 3:
+            return 0.0
+        s = 0.0
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            s += (x1 * y2) - (x2 * y1)
+        return abs(s) * 0.5
+
+    def _load_mpp_for_plan(plan_root: Path) -> float | None:
+        scale_result_path = plan_root / "scale_result.json"
+        if scale_result_path.exists():
+            try:
+                scale_data = json.loads(scale_result_path.read_text(encoding="utf-8"))
+                mpp_raw = scale_data.get("meters_per_pixel")
+                if isinstance(mpp_raw, (int, float)) and float(mpp_raw) > 0:
+                    return float(mpp_raw)
+            except Exception:
+                pass
+        room_scales_path = plan_root / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "room_scales.json"
+        if room_scales_path.exists():
+            try:
+                room_scales = json.loads(room_scales_path.read_text(encoding="utf-8"))
+                mpp_raw = room_scales.get("m_px") or room_scales.get("weighted_average_m_px")
+                if isinstance(mpp_raw, (int, float)) and float(mpp_raw) > 0:
+                    return float(mpp_raw)
+            except Exception:
+                pass
+        return None
+
+    def _infer_mpp_from_doors(p: dict) -> float | None:
+        doors = p.get("doors")
+        if not isinstance(doors, list):
+            return None
+        for d in doors:
+            if not isinstance(d, dict):
+                continue
+            h_raw = d.get("height_m")
+            if not isinstance(h_raw, (int, float)) or float(h_raw) <= 0:
+                continue
+            h = float(h_raw)
+            bbox = d.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) < 4:
+                continue
+            try:
+                y1, y2 = float(bbox[1]), float(bbox[3])
+            except Exception:
+                continue
+            px_h = abs(y2 - y1)
+            if px_h > 1.0:
+                return h / px_h
+        return None
+
+    def _first_valid_mpp_from_list(mpps: list[float | None]) -> float | None:
+        for m in mpps:
+            if m is not None and m > 0:
+                return float(m)
+        return None
 
     phase1 = dict(out.get("aufstockungPhase1") or {})
     existing_floors = []
@@ -336,6 +413,18 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
     if not plan_roots and scale_root.exists():
         plan_roots = [p for p in sorted(scale_root.iterdir()) if p.is_dir()]
 
+    mpp_disk: list[float | None] = [_load_mpp_for_plan(pr) for pr in plan_roots]
+
+    def _mpp_for_plan_idx(plan_idx: int, payload: dict) -> float | None:
+        if 0 <= plan_idx < len(mpp_disk):
+            own = mpp_disk[plan_idx]
+            if own is not None and own > 0:
+                return float(own)
+        inferred = _infer_mpp_from_doors(payload)
+        if inferred is not None and inferred > 0:
+            return float(inferred)
+        return _first_valid_mpp_from_list(mpp_disk)
+
     for idx, plan_root in enumerate(plan_roots):
         edited_path = plan_root / "cubicasa_steps" / "raster" / "detections_edited.json"
         payload = {}
@@ -360,6 +449,8 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
             if isinstance(custom_piece, (int, float)):
                 statik_choice["customPiecePrice"] = float(custom_piece)
 
+        plan_mpp = _mpp_for_plan_idx(idx, payload)
+
         floor_entry = {
             "plan_index": idx,
             "floorKind": floor_kind,
@@ -372,6 +463,10 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
             if not isinstance(d, dict):
                 continue
             area_m2 = float(d.get("area_m2") or d.get("area") or 0.0)
+            if area_m2 <= 0 and plan_mpp and plan_mpp > 0:
+                area_px2 = _polygon_area_px2(d.get("points"))
+                if area_px2 > 0:
+                    area_m2 = float(area_px2) * (float(plan_mpp) ** 2)
             if area_m2 <= 0:
                 continue
             demolition_item = {
@@ -384,13 +479,44 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         for s in stair_openings:
             if not isinstance(s, dict):
                 continue
-            qty = float(s.get("quantity") or 1.0)
-            if qty <= 0:
+            bbox = s.get("bbox")
+            stair_area_m2 = float(s.get("area_m2") or 0.0)
+            if stair_area_m2 <= 0 and plan_mpp and plan_mpp > 0:
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    try:
+                        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+                        w = max(0.0, x2 - x1)
+                        h = max(0.0, y2 - y1)
+                        apx = w * h
+                        if apx > 0:
+                            stair_area_m2 = float(apx) * (float(plan_mpp) ** 2)
+                    except Exception:
+                        pass
+            pk = str(s.get("price_key") or "").strip()
+            if not pk or pk == "aufstockung_stair_opening_m2":
+                pk = "aufstockung_stair_opening_piece"
+            if stair_area_m2 <= 0:
                 continue
-            stair_item = {
-                "quantity": qty,
-                "price_key": str(s.get("price_key") or "aufstockung_stair_opening_piece"),
+            w_m = h_m = None
+            if isinstance(bbox, list) and len(bbox) == 4 and plan_mpp and plan_mpp > 0:
+                try:
+                    x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+                    w_px = max(0.0, x2 - x1)
+                    h_px = max(0.0, y2 - y1)
+                    if w_px > 0 and h_px > 0:
+                        w_m = w_px * float(plan_mpp)
+                        h_m = h_px * float(plan_mpp)
+                except Exception:
+                    w_m = h_m = None
+            stair_item: dict = {
+                "area_m2": stair_area_m2,
+                "price_key": pk,
             }
+            if isinstance(bbox, list) and len(bbox) == 4:
+                stair_item["bbox"] = bbox
+            if w_m is not None and h_m is not None and w_m > 0 and h_m > 0:
+                stair_item["opening_width_m"] = round(min(w_m, h_m), 3)
+                stair_item["opening_length_m"] = round(max(w_m, h_m), 3)
             floor_entry["stairOpenings"].append(stair_item)
             if floor_kind != "new":
                 stairs_flat.append({**stair_item, "plan_index": idx})

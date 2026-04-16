@@ -11,6 +11,26 @@ from .modules.roof import calculate_roof_details
 from .modules.utilities import calculate_utilities_details, calculate_fireplace_details
 from .modules.stairs import calculate_stairs_details
 
+
+def _stair_opening_dims_m_from_bbox_and_area(bbox: object, area_m2: float) -> tuple[float | None, float | None]:
+    """Kürzere × längere Seite (m) aus Pixel-BBox und realer Öffnungsfläche (m²)."""
+    if area_m2 <= 0 or not isinstance(bbox, list) or len(bbox) != 4:
+        return None, None
+    try:
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        w_px = max(0.0, x2 - x1)
+        h_px = max(0.0, y2 - y1)
+        apx = w_px * h_px
+        if apx <= 0:
+            return None, None
+        mpp = (float(area_m2) / apx) ** 0.5
+        w_m = w_px * mpp
+        h_m = h_px * mpp
+        return (min(w_m, h_m), max(w_m, h_m))
+    except (TypeError, ValueError):
+        return None, None
+
+
 def calculate_pricing_for_plan(
     area_data: dict,
     openings_data: list,
@@ -868,6 +888,11 @@ def calculate_pricing_for_plan(
                     phase_floor = entry
                     break
     floor_kind = str((phase_floor or {}).get("floorKind") or (aufstockung_floor_kinds[plan_index] if plan_index < len(aufstockung_floor_kinds) else "")).strip().lower()
+    # Aufstockung: dacă există orice tip de Keller în structura clădirii, beciul este mereu tratat ca Bestand.
+    tip_fundatie_beci_for_kind = str((frontend_input.get("structuraCladirii", {}) or {}).get("tipFundatieBeci") or "")
+    has_keller_in_structure = "Keller" in tip_fundatie_beci_for_kind and "Kein Keller" not in tip_fundatie_beci_for_kind
+    if wizard_package == "aufstockung" and is_basement_plan and has_keller_in_structure:
+        floor_kind = "bestand"
     is_existing_aufstockung_floor = wizard_package == "aufstockung" and floor_kind != "new"
 
     if is_existing_aufstockung_floor and isinstance(phase_floor, dict):
@@ -875,7 +900,13 @@ def calculate_pricing_for_plan(
         items_phase1 = []
         demolition_items = phase_floor.get("demolitionSelections", []) or []
         custom_demolition_price = phase_floor.get("customDemolitionPrice")
-        custom_demolition_unit = float(custom_demolition_price) if isinstance(custom_demolition_price, (int, float)) else None
+        custom_demolition_total = (
+            float(custom_demolition_price)
+            if isinstance(custom_demolition_price, (int, float)) and float(custom_demolition_price) >= 0
+            else None
+        )
+        # Rows with positive area + price_key from editor (Preisdatenbank keys).
+        demo_rows: list[tuple[int, float, str]] = []
         for idx, sel in enumerate(demolition_items):
             if not isinstance(sel, dict):
                 continue
@@ -883,32 +914,58 @@ def calculate_pricing_for_plan(
             price_key = str(sel.get("price_key") or "").strip()
             if area_m2 <= 0 or not price_key:
                 continue
-            unit_price = custom_demolition_unit if custom_demolition_unit is not None else float(raw_params.get(price_key, 0.0) or 0.0)
-            cost = area_m2 * unit_price
-            items_phase1.append({
-                "category": "aufstockung_demolition",
-                "name": f"Aufstandsfläche / Abreißung #{idx + 1}",
-                "area_m2": round(area_m2, 2),
-                "unit_price": round(unit_price, 2),
-                "total_cost": round(cost, 2),
-            })
+            demo_rows.append((idx, area_m2, price_key))
+
+        # Abbruch-Eigenpreis: editor value is a lump-sum EUR for all Aufstandsflächen on this floor (split by area).
+        if custom_demolition_total is not None and demo_rows:
+            sum_area = sum(a for _, a, _ in demo_rows)
+            for idx, area_m2, _price_key in demo_rows:
+                alloc = custom_demolition_total * (area_m2 / sum_area) if sum_area > 0 else 0.0
+                eff_unit = (alloc / area_m2) if area_m2 > 0 else 0.0
+                items_phase1.append({
+                    "category": "aufstockung_demolition",
+                    "name": f"Aufstandsfläche / Abreißung #{idx + 1}",
+                    "area_m2": round(area_m2, 2),
+                    "unit_price": round(eff_unit, 4),
+                    "total_cost": round(alloc, 2),
+                })
+        else:
+            for idx, area_m2, price_key in demo_rows:
+                unit_price = float(raw_params.get(price_key, 0.0) or 0.0)
+                cost = area_m2 * unit_price
+                items_phase1.append({
+                    "category": "aufstockung_demolition",
+                    "name": f"Aufstandsfläche / Abreißung #{idx + 1}",
+                    "area_m2": round(area_m2, 2),
+                    "unit_price": round(unit_price, 2),
+                    "total_cost": round(cost, 2),
+                })
 
         stair_items = phase_floor.get("stairOpenings", []) or []
+        piece_key = "aufstockung_stair_opening_piece"
+        unit_piece = float(raw_params.get(piece_key, raw_params.get("aufstockung_stair_opening_piece", 0.0)) or 0.0)
         for idx, sel in enumerate(stair_items):
             if not isinstance(sel, dict):
                 continue
-            qty = float(sel.get("quantity") or 1.0)
-            price_key = str(sel.get("price_key") or "aufstockung_stair_opening_piece").strip()
-            if qty <= 0:
+            area_m2_stair = float(sel.get("area_m2") or 0.0)
+            if area_m2_stair <= 0:
                 continue
-            unit_price = float(raw_params.get(price_key, raw_params.get("aufstockung_stair_opening_piece", 0.0)) or 0.0)
-            cost = qty * unit_price
+            ow = sel.get("opening_width_m")
+            ol = sel.get("opening_length_m")
+            w_m = float(ow) if isinstance(ow, (int, float)) else None
+            l_m = float(ol) if isinstance(ol, (int, float)) else None
+            if w_m is None or l_m is None or w_m <= 0 or l_m <= 0:
+                w_m, l_m = _stair_opening_dims_m_from_bbox_and_area(sel.get("bbox"), area_m2_stair)
+            cost = unit_piece
             items_phase1.append({
                 "category": "aufstockung_stair_opening",
                 "name": f"Treppenöffnung #{idx + 1}",
-                "quantity": round(qty, 2),
-                "unit_price": round(unit_price, 2),
+                "quantity": 1.0,
+                "unit_price": round(unit_piece, 2),
                 "total_cost": round(cost, 2),
+                "opening_area_m2": round(area_m2_stair, 2),
+                "opening_width_m": round(float(w_m), 3) if w_m is not None and w_m > 0 else None,
+                "opening_length_m": round(float(l_m), 3) if l_m is not None and l_m > 0 else None,
             })
 
         statik = phase_floor.get("statikChoice", {}) or {}
