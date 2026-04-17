@@ -618,31 +618,174 @@ def _room_color_bgr(i: int) -> Tuple[int, int, int]:
     return (int(b * 255), int(g * 255), int(r * 255))
 
 
+# Alpha pentru fill (folosit și la export PNG RGBA pentru admin / stacking în browser)
+_FILL_ALPHA_ROOMS = 0.35
+# addWeighted în _draw_response_overlay; alpha fill la export RGBA demolitions/stairs
+_FILL_ALPHA = 0.35
+
+
 def _draw_room_polygons_only(
     base_img: np.ndarray,
     polygons_request: Sequence[np.ndarray],
     out_path: Path,
 ) -> bool:
-    """Desenează doar poligoanele de camere (culori distincte, fill transparent), fără pereți/uși."""
-    overlay = base_img.copy()
+    """
+    Export RGBA: doar poligoanele de camere, fundal complet transparent — pot fi stivuite peste base în UI.
+    """
+    h, w = base_img.shape[:2]
+    bgra = np.zeros((h, w, 4), dtype=np.uint8)
+    a_fill = int(round(255 * _FILL_ALPHA_ROOMS))
     for i, pts_np in enumerate(polygons_request):
         if pts_np is None or len(pts_np) < 3:
             continue
         color = _room_color_bgr(i)
-        fill_layer = overlay.copy()
-        cv2.fillPoly(fill_layer, [pts_np], color)
-        overlay = cv2.addWeighted(fill_layer, _FILL_ALPHA, overlay, 1.0 - _FILL_ALPHA, 0).astype(np.uint8)
-        cv2.polylines(overlay, [pts_np], True, color, 2)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts_np], 255)
+        m = mask > 0
+        bgra[m, 0] = color[0]
+        bgra[m, 1] = color[1]
+        bgra[m, 2] = color[2]
+        bgra[m, 3] = np.maximum(bgra[m, 3], np.uint8(a_fill))
+        cv2.polylines(bgra, [pts_np], True, (color[0], color[1], color[2], 255), 2)
         if len(pts_np) > 0:
             M = cv2.moments(pts_np)
             if M["m00"] and M["m00"] > 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
-                cv2.putText(overlay, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    return cv2.imwrite(str(out_path), overlay)
+                cv2.putText(bgra, f"R{i}", (cx - 15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (color[0], color[1], color[2], 255), 1)
+    return cv2.imwrite(str(out_path), bgra)
 
 
-def save_detections_review_image(raster_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+def _write_bgra_from_diff_vs_base(base_img: np.ndarray, full_bgr: np.ndarray, out_path: Path, threshold: int = 16) -> bool:
+    """Transformă un overlay BGR (desenat peste copie de base) în strat BGRA transparent în afara diferențelor."""
+    if full_bgr is None or base_img is None or full_bgr.shape[:2] != base_img.shape[:2]:
+        return False
+    diff = cv2.absdiff(full_bgr, base_img)
+    dg = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    m = dg > threshold
+    h, w = base_img.shape[:2]
+    bgra = np.zeros((h, w, 4), dtype=np.uint8)
+    bgra[m, 0] = full_bgr[m, 0]
+    bgra[m, 1] = full_bgr[m, 1]
+    bgra[m, 2] = full_bgr[m, 2]
+    bgra[m, 3] = 255
+    return cv2.imwrite(str(out_path), bgra)
+
+
+def _load_edited_extras_lists(raster_dir: Path) -> Tuple[List[Any], List[Any]]:
+    """Citeste roofDemolitions / stairOpenings din detections_edited.json (selectii editor)."""
+    edited_path = raster_dir / "detections_edited.json"
+    if not edited_path.exists():
+        return ([], [])
+    try:
+        with open(edited_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        demos = d.get("roofDemolitions") or []
+        stairs = d.get("stairOpenings") or []
+        if not isinstance(demos, list):
+            demos = []
+        if not isinstance(stairs, list):
+            stairs = []
+        return (demos, stairs)
+    except Exception:
+        return ([], [])
+
+
+def _polygon_points_from_demolition_item(d: Any) -> List[Tuple[int, int]]:
+    pts: List[Tuple[int, int]] = []
+    if not isinstance(d, dict):
+        return pts
+    raw = d.get("points")
+    if not isinstance(raw, list):
+        return pts
+    for p in raw:
+        if isinstance(p, dict) and "x" in p and "y" in p:
+            pts.append((int(p["x"]), int(p["y"])))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            pts.append((int(p[0]), int(p[1])))
+    return pts
+
+
+def _draw_roof_demolitions_png(base_img: np.ndarray, demolitions: List[Any], out_path: Path) -> bool:
+    if not demolitions:
+        return False
+    h, w = base_img.shape[:2]
+    bgra = np.zeros((h, w, 4), dtype=np.uint8)
+    c = (80, 80, 255)  # BGR
+    a_fill = int(round(255 * _FILL_ALPHA))
+    for d in demolitions:
+        pts = _polygon_points_from_demolition_item(d)
+        if len(pts) < 3:
+            continue
+        pts_np = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts_np], 255)
+        m = mask > 0
+        bgra[m, 0] = c[0]
+        bgra[m, 1] = c[1]
+        bgra[m, 2] = c[2]
+        bgra[m, 3] = np.maximum(bgra[m, 3], np.uint8(a_fill))
+        cv2.polylines(bgra, [pts_np], True, (c[0], c[1], c[2], 255), 2)
+    return cv2.imwrite(str(out_path), bgra)
+
+
+def _bbox_from_stair_item(s: Any) -> Optional[Tuple[int, int, int, int]]:
+    bb = None
+    if isinstance(s, dict):
+        bb = s.get("bbox")
+    elif isinstance(s, list):
+        bb = s
+    if not isinstance(bb, list) or len(bb) < 4:
+        return None
+    x1, y1, x2, y2 = [int(round(float(x))) for x in bb[:4]]
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _draw_stair_openings_png(
+    base_img: np.ndarray,
+    stair_openings: List[Any],
+    offset_xy: Tuple[int, int],
+    out_path: Path,
+) -> bool:
+    if not stair_openings:
+        return False
+    h, w = base_img.shape[:2]
+    bgra = np.zeros((h, w, 4), dtype=np.uint8)
+    ox, oy = int(offset_xy[0]), int(offset_xy[1])
+    c = (0, 200, 255)  # BGR cyan
+    a_fill = int(round(255 * 0.28))
+    for s in stair_openings:
+        bb = _bbox_from_stair_item(s)
+        if bb is None:
+            continue
+        x1, y1, x2, y2 = bb
+        x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+        m = mask > 0
+        bgra[m, 0] = c[0]
+        bgra[m, 1] = c[1]
+        bgra[m, 2] = c[2]
+        bgra[m, 3] = np.maximum(bgra[m, 3], np.uint8(a_fill))
+        cv2.rectangle(bgra, (x1, y1), (x2, y2), (c[0], c[1], c[2], 255), 2)
+    return cv2.imwrite(str(out_path), bgra)
+
+
+def _unlink_optional_review_png(p: Path) -> None:
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+def save_detections_review_image(
+    raster_dir: Path,
+    *,
+    prefer_edited_room_polygons: bool = False,
+) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
     """
     Editor verificare (Tür/Fenster + camere): o singură sursă de imagine (_load_review_base_image).
     Salvează: 1) detections_review_base.png (trimis în LiveFeed și folosit ca fundal în editor),
@@ -656,7 +799,10 @@ def save_detections_review_image(raster_dir: Path) -> Tuple[Optional[Path], Opti
       + euristică aspect (bandă lată/îngustă → window). Culori BGR: uși = verde (_COLOR_DOOR_*),
       geamuri = albastru (_COLOR_WINDOW_*). Aceeași logică folosește și detections_review_data.json
       pentru editor (vectorial).
-    Returnează (path_base, path_rooms, path_doors); doar path_base este trimis la UI (unul per plan).
+
+    prefer_edited_room_polygons: după apply_detections_edited, poligoanele finale sunt în response.json;
+    dacă True, se folosesc acestea în locul extragerii din 09_interior (altfel overlay-urile PNG rămân „AI-only”).
+    Returnează (path_base, path_rooms, path_doors).
     """
     try:
         base_img = _load_review_base_image(raster_dir)
@@ -678,8 +824,14 @@ def save_detections_review_image(raster_dir: Path) -> Tuple[Optional[Path], Opti
                 pass
         path_rooms = raster_dir / "detections_review_rooms.png"
         path_doors = raster_dir / "detections_review_doors.png"
-        # Poligoane pentru editor din 09_interior; fallback la response.json (rooms)
-        polygons_09 = _extract_room_polygons_from_09_interior(raster_dir, req_w, req_h)
+        # Poligoane camere: 09_interior (AI) sau, după confirmare editor, response.json (apply_detections_edited).
+        polygons_09: List[np.ndarray] = []
+        if prefer_edited_room_polygons:
+            polygons_09 = _get_room_polygons_from_response(raster_dir, offset_xy, req_w, req_h)
+            if polygons_09:
+                print(f"      [detections_review] Rooms din response.json (editor): {len(polygons_09)} camere")
+        if not polygons_09:
+            polygons_09 = _extract_room_polygons_from_09_interior(raster_dir, req_w, req_h)
         if not polygons_09:
             polygons_09 = _get_room_polygons_from_response(raster_dir, offset_xy, req_w, req_h)
             if polygons_09:
@@ -687,17 +839,36 @@ def save_detections_review_image(raster_dir: Path) -> Tuple[Optional[Path], Opti
         if polygons_09:
             ok_r = _draw_room_polygons_only(base_img, polygons_09, path_rooms)
         else:
-            ok_r = _draw_response_overlay(
-                base_img, raster_dir, path_rooms,
+            tmp_rooms = raster_dir / "._tmp_review_rooms_full.png"
+            ok_tmp_r = _draw_response_overlay(
+                base_img.copy(), raster_dir, tmp_rooms,
                 draw_rooms=True, draw_doors=False, draw_walls=False,
                 offset_xy=offset_xy,
             )
-        # Uși/geamuri din response.json, fără pereți
-        ok_d = _draw_response_overlay(
-            base_img, raster_dir, path_doors,
+            full_r = cv2.imread(str(tmp_rooms)) if ok_tmp_r else None
+            ok_r = bool(full_r is not None and _write_bgra_from_diff_vs_base(base_img, full_r, path_rooms))
+            _unlink_optional_review_png(tmp_rooms)
+        # Uși/geamuri: export RGBA (diff față de base) ca straturile să se poată combina în UI
+        tmp_doors = raster_dir / "._tmp_review_doors_full.png"
+        ok_tmp_d = _draw_response_overlay(
+            base_img.copy(), raster_dir, tmp_doors,
             draw_rooms=False, draw_doors=True, draw_walls=False,
             offset_xy=offset_xy,
         )
+        full_d = cv2.imread(str(tmp_doors)) if ok_tmp_d else None
+        ok_d = bool(full_d is not None and _write_bgra_from_diff_vs_base(base_img, full_d, path_doors))
+        _unlink_optional_review_png(tmp_doors)
+        demos, stairs_ex = _load_edited_extras_lists(raster_dir)
+        path_dem = raster_dir / "detections_review_demolitions.png"
+        path_stairs_png = raster_dir / "detections_review_stairs.png"
+        if demos:
+            _draw_roof_demolitions_png(base_img, demos, path_dem)
+        else:
+            _unlink_optional_review_png(path_dem)
+        if stairs_ex:
+            _draw_stair_openings_png(base_img, stairs_ex, offset_xy, path_stairs_png)
+        else:
+            _unlink_optional_review_png(path_stairs_png)
         # Date vectoriale pentru editor: camere (poligoane din 09_interior) + uși (bbox cu offset)
         _save_detections_review_data(raster_dir, polygons_09, offset_xy, req_w, req_h)
         return (
@@ -1044,8 +1215,6 @@ def apply_detections_edited(raster_dir: Path) -> bool:
         return False
 
 
-# Alpha pentru fill transparent (camere, uși, geamuri)
-_FILL_ALPHA = 0.35
 # Culori BGR: uși vs geamuri (contur + fill deschis)
 _COLOR_DOOR_BORDER = (0, 160, 0)   # verde
 _COLOR_DOOR_FILL = (100, 220, 100)

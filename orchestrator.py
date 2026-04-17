@@ -292,7 +292,7 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         return frontend_data
     out = dict(frontend_data)
     wizard_package = str(out.get("wizard_package") or "").strip().lower()
-    if wizard_package != "aufstockung":
+    if wizard_package not in ("aufstockung", "zubau"):
         return out
 
     extras = {}
@@ -520,6 +520,51 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
             floor_entry["stairOpenings"].append(stair_item)
             if floor_kind != "new":
                 stairs_flat.append({**stair_item, "plan_index": idx})
+
+        if wizard_package == "zubau" and floor_kind == "new":
+            z_best = payload.get("zubauBestandPolygons") if isinstance(payload.get("zubauBestandPolygons"), list) else []
+            z_lines_raw = payload.get("zubauWallDemolitionLines") if isinstance(payload.get("zubauWallDemolitionLines"), list) else []
+
+            def _pt_xy(p: object) -> tuple[float, float] | None:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    try:
+                        return float(p[0]), float(p[1])
+                    except Exception:
+                        return None
+                if isinstance(p, dict) and "x" in p and "y" in p:
+                    try:
+                        return float(p["x"]), float(p["y"])
+                    except Exception:
+                        return None
+                return None
+
+            z_lines_out: list[dict] = []
+            for ln in z_lines_raw:
+                if not isinstance(ln, dict):
+                    continue
+                a = _pt_xy(ln.get("a"))
+                b = _pt_xy(ln.get("b"))
+                if not a or not b:
+                    continue
+                dx = a[0] - b[0]
+                dy = a[1] - b[1]
+                len_px = (dx * dx + dy * dy) ** 0.5
+                length_m = float(len_px) * float(plan_mpp) if plan_mpp and plan_mpp > 0 else float(ln.get("length_m") or 0.0)
+                if length_m <= 0:
+                    continue
+                pk = str(ln.get("price_key") or "aufstockung_demolition_roof_basic_m2").strip()
+                z_lines_out.append(
+                    {
+                        "a": [round(a[0], 2), round(a[1], 2)],
+                        "b": [round(b[0], 2), round(b[1], 2)],
+                        "length_m": round(length_m, 4),
+                        "price_key": pk,
+                    }
+                )
+            if z_lines_out:
+                floor_entry["zubauWallDemolitionLines"] = z_lines_out
+            if z_best:
+                floor_entry["zubauBestandPolygonCount"] = len(z_best)
 
         if floor_kind == "new":
             new_floors.append(floor_entry)
@@ -750,7 +795,7 @@ def run_segmentation_and_classification_for_document(
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
     measurements_only_offer = bool(frontend_data.get("measurements_only_offer"))
     wizard_package = str(frontend_data.get("wizard_package") or "").strip().lower()
-    is_aufstockung_offer = wizard_package == "aufstockung"
+    is_aufstockung_offer = wizard_package in ("aufstockung", "zubau")
     our_floors = len(house_plans)
     floors_number = frontend_data.get("floorsNumber")
     basement = frontend_data.get("basement", False)
@@ -866,9 +911,19 @@ def run_segmentation_and_classification_for_document(
             review_paths: List[Path] = []
             for plan in plans:
                 raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-                path_base, _, _ = save_detections_review_image(raster_dir)
+                path_base, path_rooms, path_doors = save_detections_review_image(raster_dir)
                 if path_base:
                     review_paths.append(path_base)
+                if path_rooms:
+                    review_paths.append(path_rooms)
+                if path_doors:
+                    review_paths.append(path_doors)
+                dem0 = raster_dir / "detections_review_demolitions.png"
+                st0 = raster_dir / "detections_review_stairs.png"
+                if dem0.exists():
+                    review_paths.append(dem0)
+                if st0.exists():
+                    review_paths.append(st0)
 
             if not raster_scan_failed and review_paths:
                 run_dir = get_run_dir(run_id)
@@ -911,6 +966,27 @@ def run_segmentation_and_classification_for_document(
                 for plan in plans:
                     raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
                     apply_detections_edited(raster_dir)
+
+                review_paths_after_edit: List[Path] = []
+                for plan in plans:
+                    raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                    pb, pr, pd = save_detections_review_image(
+                        raster_dir, prefer_edited_room_polygons=True
+                    )
+                    if pb:
+                        review_paths_after_edit.append(pb)
+                    if pr:
+                        review_paths_after_edit.append(pr)
+                    if pd:
+                        review_paths_after_edit.append(pd)
+                    dem1 = raster_dir / "detections_review_demolitions.png"
+                    st1 = raster_dir / "detections_review_stairs.png"
+                    if dem1.exists():
+                        review_paths_after_edit.append(dem1)
+                    if st1.exists():
+                        review_paths_after_edit.append(st1)
+                if review_paths_after_edit:
+                    notify_ui_batch("detections_review", review_paths_after_edit)
 
                 if roof_only_offer:
                     seeded = seed_roof_only_rooms_from_roof_polygons(run_id, plans)

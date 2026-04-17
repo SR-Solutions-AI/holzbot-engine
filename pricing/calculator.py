@@ -10,6 +10,7 @@ from .modules.floors import calculate_floors_details
 from .modules.roof import calculate_roof_details
 from .modules.utilities import calculate_utilities_details, calculate_fireplace_details
 from .modules.stairs import calculate_stairs_details
+from area.config import WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M
 
 
 def _stair_opening_dims_m_from_bbox_and_area(bbox: object, area_m2: float) -> tuple[float | None, float | None]:
@@ -166,6 +167,81 @@ def calculate_pricing_for_plan(
     has_basement_livable = frontend_input.get("basementUse", False) or (
         "mit einfachem Ausbau" in _tfb or "Keller (mit Ausbau)" in _tfb
     )
+
+    # Zubau (neues Geschoss): Wandabbruch als Streifen L×(Raumhöhe+18cm) → Abzug von Außenwand-Flächenanteilen; Positionskosten wie Dachabbruch m².
+    cost_zubau_wall_demolition_extra = 0.0
+    cost_zubau_wall_demolition_items: list = []
+    wizard_pkg_z = str(frontend_input.get("wizard_package") or "").strip().lower() if isinstance(frontend_input, dict) else ""
+    phase1_z = frontend_input.get("aufstockungPhase1", {}) if isinstance(frontend_input, dict) else {}
+    auf_fk_z = frontend_input.get("aufstockungFloorKinds") if isinstance(frontend_input.get("aufstockungFloorKinds"), list) else []
+    phase_floor_z = None
+    if isinstance(phase1_z, dict):
+        for entry in (phase1_z.get("existingFloors") or []) + (phase1_z.get("newFloors") or []):
+            if isinstance(entry, dict):
+                try:
+                    if int(entry.get("plan_index", -1)) == int(plan_index):
+                        phase_floor_z = entry
+                        break
+                except Exception:
+                    continue
+    fk_z = str((phase_floor_z or {}).get("floorKind") or (auf_fk_z[plan_index] if plan_index < len(auf_fk_z) else "")).strip().lower()
+    tip_fb_z = str(structura_cladirii.get("tipFundatieBeci") or "")
+    has_keller_z = "Keller" in tip_fb_z and "Kein Keller" not in tip_fb_z
+    if wizard_pkg_z in ("aufstockung", "zubau") and is_basement_plan and has_keller_z:
+        fk_z = "bestand"
+    is_zubau_new_for_walls = wizard_pkg_z == "zubau" and fk_z == "new" and not is_basement_plan
+
+    if is_zubau_new_for_walls and isinstance(phase_floor_z, dict):
+        lines_z = phase_floor_z.get("zubauWallDemolitionLines") or []
+        inaltime = str(frontend_input.get("inaltimeEtaje") or structura_cladirii.get("inaltimeEtaje") or "")
+        wall_h_m = 2.5
+        if "Komfort" in inaltime or "2,70" in inaltime:
+            wall_h_m = 2.70
+        elif "Hoch" in inaltime or "2,85" in inaltime:
+            wall_h_m = 2.85
+        fhmap = pricing_coeffs.get("_floor_heights_m") if isinstance(pricing_coeffs.get("_floor_heights_m"), dict) else None
+        if fhmap and inaltime and inaltime in fhmap:
+            try:
+                wall_h_m = float(fhmap[inaltime])
+            except Exception:
+                pass
+        if is_top_floor_plan:
+            try:
+                ipm = frontend_input.get("inaltimePeretiMansarda")
+                if ipm is not None and float(ipm) > 0:
+                    wall_h_m = float(ipm)
+            except Exception:
+                pass
+        strip_h = float(wall_h_m) + float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
+        rawpz = pricing_coeffs.get("_raw_params", {}) or {}
+        w1, w2, w3 = w_int_net_finish_outer, w_ext_net_finish, w_ext_net_structure
+        tot_w = w1 + w2 + w3
+        d_total = 0.0
+        for iz, ln in enumerate(lines_z):
+            if not isinstance(ln, dict):
+                continue
+            lm = float(ln.get("length_m") or 0.0)
+            if lm <= 0:
+                continue
+            strip_m2 = lm * strip_h
+            d_total += strip_m2
+            pk = str(ln.get("price_key") or "aufstockung_demolition_roof_basic_m2").strip()
+            unit = float(rawpz.get(pk, 0.0) or 0.0)
+            cst = strip_m2 * unit
+            cost_zubau_wall_demolition_items.append(
+                {
+                    "category": "zubau_wall_demolition",
+                    "name": f"Wandabbruch (Streifen) #{iz + 1}",
+                    "area_m2": round(strip_m2, 2),
+                    "unit_price": round(unit, 2),
+                    "total_cost": round(cst, 2),
+                }
+            )
+            cost_zubau_wall_demolition_extra += cst
+        if d_total > 0 and tot_w > 0:
+            w_int_net_finish_outer = max(0.0, w1 - d_total * (w1 / tot_w))
+            w_ext_net_finish = max(0.0, w2 - d_total * (w2 / tot_w))
+            w_ext_net_structure = max(0.0, w3 - d_total * (w3 / tot_w))
     
     # ---------- Plan dedicat beci: structură pereți interiori + exteriori; finisaje doar interior; podele, utilități (fără fundație/acoperiș) ----------
     if is_basement_plan:
@@ -636,6 +712,7 @@ def calculate_pricing_for_plan(
         (cost_stairs["total_cost"] if include_stairs else 0.0) +
         (cost_fireplace["total_cost"] if include_fireplace else 0.0)
     )
+    total_plan_cost = round(total_plan_cost + float(cost_zubau_wall_demolition_extra or 0.0), 2)
 
     # Strom-/Wasseranschluss: pauschal o singură dată per proiect (doar la parter)
     has_utilitati = _fv("utilities_connection")
@@ -891,9 +968,9 @@ def calculate_pricing_for_plan(
     # Aufstockung: dacă există orice tip de Keller în structura clădirii, beciul este mereu tratat ca Bestand.
     tip_fundatie_beci_for_kind = str((frontend_input.get("structuraCladirii", {}) or {}).get("tipFundatieBeci") or "")
     has_keller_in_structure = "Keller" in tip_fundatie_beci_for_kind and "Kein Keller" not in tip_fundatie_beci_for_kind
-    if wizard_package == "aufstockung" and is_basement_plan and has_keller_in_structure:
+    if wizard_package in ("aufstockung", "zubau") and is_basement_plan and has_keller_in_structure:
         floor_kind = "bestand"
-    is_existing_aufstockung_floor = wizard_package == "aufstockung" and floor_kind != "new"
+    is_existing_aufstockung_floor = wizard_package in ("aufstockung", "zubau") and floor_kind != "new"
 
     if is_existing_aufstockung_floor and isinstance(phase_floor, dict):
         raw_params = pricing_coeffs.get("_raw_params", {}) or {}
@@ -1000,6 +1077,19 @@ def calculate_pricing_for_plan(
                 "detailed_items": items_phase1,
             }
             total_plan_cost += cost_aufstockung_phase1["total_cost"]
+
+    if (
+        wizard_package == "zubau"
+        and not is_existing_aufstockung_floor
+        and cost_zubau_wall_demolition_items
+    ):
+        prev_items = list(cost_aufstockung_phase1.get("detailed_items") or [])
+        prev_total = float(cost_aufstockung_phase1.get("total_cost") or 0.0)
+        add_t = round(sum(float(x.get("total_cost") or 0.0) for x in cost_zubau_wall_demolition_items), 2)
+        cost_aufstockung_phase1 = {
+            "total_cost": round(prev_total + add_t, 2),
+            "detailed_items": prev_items + cost_zubau_wall_demolition_items,
+        }
 
     if is_existing_aufstockung_floor:
         # Existing-floor Aufstockung pricing: keep only roof + phase1 editor-driven items.

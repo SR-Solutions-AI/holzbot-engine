@@ -555,7 +555,7 @@ def _compute_rectangle_inputs_for_gemini(
     if not isinstance(rect_json, dict):
         return []
     out: list[dict[str, Any]] = []
-    mpp_fallback_by_floor = _load_mpp_by_floor_from_scale(out_root)
+    mpp_fallback_by_floor = _load_mpp_by_floor_from_scale(out_root, run_id)
     windows_by_roof = _windows_by_roof_floor(
         win_json if isinstance(win_json, dict) else {},
         rect_json,

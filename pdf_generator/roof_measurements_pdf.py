@@ -219,12 +219,35 @@ def _load_floor_plan_order_and_labels_from_manifest(
         if isinstance(labels_raw, list):
             labels = [str(x) if x is not None else "" for x in labels_raw]
         if not isinstance(order_raw, list) or not order_raw:
-            return None, labels
+            # No order in manifest for this candidate: keep scanning candidates,
+            # then fall back to floor_order.json if needed.
+            continue
         try:
             order = [int(x) for x in order_raw]
         except (TypeError, ValueError):
-            return None, labels
+            continue
         return order, labels
+    # Fallback for older manifests that do not include floorPlanOrder:
+    # use engine floor_order.json (same source used by the final offer PDF).
+    run_roots = [OUTPUT_ROOT / run_id, RUNNER_ROOT / "output" / run_id, RUNS_ROOT / run_id]
+    for run_root in run_roots:
+        fo_path = run_root / "floor_order.json"
+        if not fo_path.exists():
+            continue
+        try:
+            fo_data = json.loads(fo_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        raw_order = fo_data.get("order_from_bottom")
+        if not isinstance(raw_order, list) or not raw_order:
+            continue
+        try:
+            order = [int(x) for x in raw_order]
+        except (TypeError, ValueError):
+            continue
+        if len(set(order)) != len(order):
+            continue
+        return order, None
     return None, None
 
 
@@ -767,6 +790,41 @@ def _append_aufstockung_bestand_indicator_table(
     story.append(Spacer(1, 8 * mm))
 
 
+def _append_zubau_new_floor_indicator_table(
+    story: list[Any],
+    sw: str,
+    heading_style: ParagraphStyle,
+    floor_entry: dict[str, Any],
+) -> None:
+    """Measurements-only block for Zubau new-floor editor: Bestand-Marker count + Wandabbruch-Linien."""
+    if not isinstance(floor_entry, dict):
+        return
+    lines = floor_entry.get("zubauWallDemolitionLines") if isinstance(floor_entry.get("zubauWallDemolitionLines"), list) else []
+    n_best = int(floor_entry.get("zubauBestandPolygonCount") or 0)
+    n_lines = len(lines) if lines else 0
+    if n_lines == 0 and n_best == 0:
+        return
+    total_len = 0.0
+    for ln in lines:
+        if not isinstance(ln, dict):
+            continue
+        try:
+            total_len += float(ln.get("length_m") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    story.append(Paragraph(f"<b>{sw} – Zubau (neues Geschoss)</b>", heading_style))
+    rows = [
+        ["Indikator", "Wert", "Einheit"],
+        ["Bestand-Marker (Polygone)", str(n_best), "Stk."],
+        ["Wandabbruch-Linien", str(n_lines), "Stk."],
+        ["Summe Linienlänge (Planmaßstab)", f"{total_len:.2f}" if total_len > 0 else "—", "m"],
+    ]
+    t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
+    _style_data_table(t)
+    story.append(t)
+    story.append(Spacer(1, 8 * mm))
+
+
 def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None) -> Path | None:
     """
     PDF: Stockwerk 1…n = aceeași ordine ca în plans_list și în editor (detections_review);
@@ -1081,8 +1139,9 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             rw_count = int(rw.get("count", 0) or 0)
             rw_area = float(rw.get("area_m2", 0.0) or 0.0)
             raw_plan_index = floor_perm[si] if isinstance(floor_perm, list) and si < len(floor_perm) else si
+            _wp_pdf = str(fd_dict.get("wizard_package") or "").strip().lower()
             is_existing_aufstockung_floor = (
-                str(fd_dict.get("wizard_package") or "").strip().lower() == "aufstockung"
+                _wp_pdf in ("aufstockung", "zubau")
                 and (
                     raw_plan_index in phase1_by_plan_index
                     or (
@@ -1112,6 +1171,15 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     floor_kinds_for_mpp=aufstockung_floor_kinds,
                     job_root=job_root,
                 )
+            if _wp_pdf == "zubau" and isinstance(aufstockung_phase1, dict):
+                z_nf = aufstockung_phase1.get("newFloors") or []
+                z_ent = None
+                for ent in z_nf:
+                    if isinstance(ent, dict) and int(ent.get("plan_index", -1)) == int(raw_plan_index):
+                        z_ent = ent
+                        break
+                if isinstance(z_ent, dict) and str(z_ent.get("floorKind") or "").strip().lower() == "new":
+                    _append_zubau_new_floor_indicator_table(story, sw, heading_style, z_ent)
 
     else:
         # Kein plans_list: nur Dachtabellen nach roof_floor_idx
