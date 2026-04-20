@@ -251,8 +251,9 @@ STATIC_TRANSLATIONS = {
     "Gesamtkostenzusammenstellung": "Gesamtkostenzusammenstellung",
     "Baukosten (Konstruktion, Ausbau, Technik)": "Baukosten (Konstruktion, Ausbau, Technik)",
     "Baustelleneinrichtung, Logistik & Planung (10%)": "Baustelleneinrichtung, Logistik & Planung",
-    "Bauleitung, Koordination & Gewinn (10%)": "Bauleitung & Koordination",
-    "Nettosumme (exkl. MwSt.)": "Nettosumme (exkl. MwSt.)",
+    "Bauleitung, Koordination & Gewinn (10%)": "Baustelleneinrichtung, Logistik & Planung",
+    "Nettosumme (exkl. MwSt.)": "Nettosumme (ohne MwSt.)",
+    "Nettosumme (ohne MwSt.)": "Nettosumme (ohne MwSt.)",
     "MwSt. (19%)": "MwSt. (19%)",
     "GESAMTSUMME BRUTTO": "GESAMTSUMME BRUTTO",
     "Position": "Position",
@@ -1327,6 +1328,36 @@ def _vat_line_label_for_offer(fd: dict | None, rate_decimal: float) -> str:
     if preset == "AT":
         return f"{pct_str}% USt."
     return _mwst_label_de(rate_decimal)
+
+
+def _resolve_selected_baustelleneinrichtung_percent(frontend_data: dict | None, summary_params: dict | None) -> tuple[str, float]:
+    """
+    Use ONLY the user-selected Baustelleneinrichtung option from form data.
+    Legacy form key fallback: accesSantier.
+    """
+    fd = frontend_data if isinstance(frontend_data, dict) else {}
+    sist = fd.get("sistemConstructiv") or {}
+    log = fd.get("logistica") or {}
+    raw_choice = (
+        sist.get("baustelleneinrichtung")
+        or log.get("baustelleneinrichtung")
+        or sist.get("accesSantier")
+        or log.get("accesSantier")
+        or ""
+    )
+    choice = str(raw_choice or "").strip().lower()
+    key = "baustelleneinrichtung_standard_percent"
+    if "erschwert" in choice or "mittel" in choice or "mediu" in choice:
+        key = "baustelleneinrichtung_erschwert_percent"
+    elif "sondertransport" in choice or "kranlogistik" in choice or "schwierig" in choice or "dificil" in choice:
+        key = "baustelleneinrichtung_sondertransport_percent"
+    elif "standard" in choice or "leicht" in choice or "ușor" in choice or "usor" in choice:
+        key = "baustelleneinrichtung_standard_percent"
+    try:
+        value = float((summary_params or {}).get(key, 0.0) or 0.0)
+    except Exception:
+        value = 0.0
+    return key, value
 
 
 def _money(x):
@@ -2833,6 +2864,14 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
     pdf_vat_rate = _parse_vat_rate_decimal(fd_ctx)
     try:
         tenant_slug = frontend_data.get("tenant_slug") if isinstance(frontend_data, dict) else None
+        try:
+            from pricing.db_loader import fetch_pricing_parameters
+            calc_mode = frontend_data.get("calc_mode") or "default"
+            pricing_coeffs = fetch_pricing_parameters(tenant_slug or "", calc_mode=calc_mode)
+            summary_params = (pricing_coeffs or {}).get("_raw_params", {}) if isinstance(pricing_coeffs, dict) else {}
+        except Exception as e:
+            print(f"⚠️ [PDF] Could not load pricing coefficients for summary margins: {e}")
+            summary_params = {}
         
         branding = _apply_branding(tenant_slug)
         assets = (branding.get("assets") or {}) if isinstance(branding, dict) else {}
@@ -3444,10 +3483,28 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                     if isinstance(cat_data, dict):
                         filtered_total += cat_data.get("total_cost", 0.0)
         
-        cost_margin_logistics = filtered_total * 0.10
-        cost_margin_oversight = filtered_total * 0.10
+        baustelle_key, baustelle_percent = _resolve_selected_baustelleneinrichtung_percent(fd_ctx, summary_params)
+        try:
+            profit_percent = float((summary_params or {}).get("profit_margin_percent", 0.0) or 0.0)
+        except Exception:
+            profit_percent = 0.0
+        total_percent = baustelle_percent + profit_percent
+        if total_percent <= 0:
+            total_percent = 10.0
+        print(
+            f"🔍 [PDF] Summary percent parts | Baustelleneinrichtung=[({baustelle_key!r}, {baustelle_percent:.4f})] "
+            f"| Profit=[('profit_margin_percent', {profit_percent:.4f})] | "
+            f"TOTAL={total_percent:.4f}",
+            flush=True,
+        )
+        cost_margin_logistics = filtered_total * (total_percent / 100.0)
+        print(
+            f"🔍 [PDF] Summary amount | filtered_total={filtered_total:.2f} | "
+            f"total_percent={total_percent:.4f} | baustelleneinrichtung_amount={cost_margin_logistics:.2f}",
+            flush=True,
+        )
         
-        net = filtered_total + cost_margin_logistics + cost_margin_oversight
+        net = filtered_total + cost_margin_logistics
         vat = net * pdf_vat_rate
         gross = net + vat
         
@@ -3464,8 +3521,7 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
         data = [
             [P(pos0_label), P(_money(filtered_total))],
             [P(enforcer.get("Baustelleneinrichtung, Logistik & Planung")), P(_money(cost_margin_logistics))],
-            [P(enforcer.get("Bauleitung & Koordination")), P(_money(cost_margin_oversight))],
-            [P(f"<b>{enforcer.get('Nettosumme (exkl. MwSt.)')}</b>"), P(_money(net), "CellBold")],
+            [P(f"<b>{enforcer.get('Nettosumme (ohne MwSt.)')}</b>"), P(_money(net), "CellBold")],
             [P(_vat_line_label_for_offer(fd_ctx, pdf_vat_rate)), P(_money(vat))],
             [P(f"<b>{enforcer.get('GESAMTSUMME BRUTTO')}</b>"), P(_money(gross), "H2")],
         ]
@@ -3896,10 +3952,29 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         
         filtered_total = sum(e["pricing"].get("total_cost_eur", 0.0) for e in plans_data)
         
-        cost_margin_logistics = filtered_total * 0.10
-        cost_margin_oversight = filtered_total * 0.10
+        summary_params = (pricing_coeffs or {}).get("_raw_params", {}) if isinstance(pricing_coeffs, dict) else {}
+        baustelle_key, baustelle_percent = _resolve_selected_baustelleneinrichtung_percent(fd_ctx, summary_params)
+        try:
+            profit_percent = float((summary_params or {}).get("profit_margin_percent", 0.0) or 0.0)
+        except Exception:
+            profit_percent = 0.0
+        total_percent = baustelle_percent + profit_percent
+        if total_percent <= 0:
+            total_percent = 10.0
+        print(
+            f"🔍 [PDF ADMIN] Summary percent parts | Baustelleneinrichtung=[({baustelle_key!r}, {baustelle_percent:.4f})] "
+            f"| Profit=[('profit_margin_percent', {profit_percent:.4f})] | "
+            f"TOTAL={total_percent:.4f}",
+            flush=True,
+        )
+        cost_margin_logistics = filtered_total * (total_percent / 100.0)
+        print(
+            f"🔍 [PDF ADMIN] Summary amount | filtered_total={filtered_total:.2f} | "
+            f"total_percent={total_percent:.4f} | baustelleneinrichtung_amount={cost_margin_logistics:.2f}",
+            flush=True,
+        )
         
-        net = filtered_total + cost_margin_logistics + cost_margin_oversight
+        net = filtered_total + cost_margin_logistics
         vat = net * admin_pdf_vat_rate
         gross = net + vat
         
@@ -3912,8 +3987,7 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
         data = [
             [P(admin_pos0), P(_money(filtered_total))],
             [P("Baustelleneinrichtung, Logistik & Planung"), P(_money(cost_margin_logistics))],
-            [P("Bauleitung & Koordination"), P(_money(cost_margin_oversight))],
-            [P("<b>Nettosumme (exkl. MwSt.)</b>"), P(_money(net), "CellBold")],
+            [P("<b>Nettosumme (ohne MwSt.)</b>"), P(_money(net), "CellBold")],
             [P(_vat_line_label_for_offer(fd_ctx, admin_pdf_vat_rate)), P(_money(vat))],
             [P("<b>GESAMTSUMME BRUTTO</b>"), P(_money(gross), "H2")],
         ]

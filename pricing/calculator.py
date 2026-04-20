@@ -193,6 +193,12 @@ def calculate_pricing_for_plan(
 
     if is_zubau_new_for_walls and isinstance(phase_floor_z, dict):
         lines_z = phase_floor_z.get("zubauWallDemolitionLines") or []
+        custom_demolition_price_z = phase_floor_z.get("customDemolitionPrice")
+        custom_demolition_total_z = (
+            float(custom_demolition_price_z)
+            if isinstance(custom_demolition_price_z, (int, float)) and float(custom_demolition_price_z) >= 0
+            else None
+        )
         inaltime = str(frontend_input.get("inaltimeEtaje") or structura_cladirii.get("inaltimeEtaje") or "")
         wall_h_m = 2.5
         if "Komfort" in inaltime or "2,70" in inaltime:
@@ -213,10 +219,10 @@ def calculate_pricing_for_plan(
             except Exception:
                 pass
         strip_h = float(wall_h_m) + float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
-        rawpz = pricing_coeffs.get("_raw_params", {}) or {}
         w1, w2, w3 = w_int_net_finish_outer, w_ext_net_finish, w_ext_net_structure
         tot_w = w1 + w2 + w3
         d_total = 0.0
+        strip_rows: list[tuple[int, float]] = []
         for iz, ln in enumerate(lines_z):
             if not isinstance(ln, dict):
                 continue
@@ -225,19 +231,22 @@ def calculate_pricing_for_plan(
                 continue
             strip_m2 = lm * strip_h
             d_total += strip_m2
-            pk = str(ln.get("price_key") or "aufstockung_demolition_roof_basic_m2").strip()
-            unit = float(rawpz.get(pk, 0.0) or 0.0)
-            cst = strip_m2 * unit
-            cost_zubau_wall_demolition_items.append(
-                {
-                    "category": "zubau_wall_demolition",
-                    "name": f"Wandabbruch (Streifen) #{iz + 1}",
-                    "area_m2": round(strip_m2, 2),
-                    "unit_price": round(unit, 2),
-                    "total_cost": round(cst, 2),
-                }
-            )
-            cost_zubau_wall_demolition_extra += cst
+            strip_rows.append((iz, strip_m2))
+        if custom_demolition_total_z is not None and strip_rows:
+            sum_area = sum(a for _, a in strip_rows)
+            for iz, strip_m2 in strip_rows:
+                alloc = custom_demolition_total_z * (strip_m2 / sum_area) if sum_area > 0 else 0.0
+                eff_unit = (alloc / strip_m2) if strip_m2 > 0 else 0.0
+                cost_zubau_wall_demolition_items.append(
+                    {
+                        "category": "zubau_wall_demolition",
+                        "name": f"Wandabbruch (Streifen) #{iz + 1}",
+                        "area_m2": round(strip_m2, 2),
+                        "unit_price": round(eff_unit, 2),
+                        "total_cost": round(alloc, 2),
+                    }
+                )
+                cost_zubau_wall_demolition_extra += alloc
         if d_total > 0 and tot_w > 0:
             w_int_net_finish_outer = max(0.0, w1 - d_total * (w1 / tot_w))
             w_ext_net_finish = max(0.0, w2 - d_total * (w2 / tot_w))
@@ -656,6 +665,7 @@ def calculate_pricing_for_plan(
         "Structură": "Rohbau/Tragwerk",
         "Structură + ferestre": "Tragwerk + Fenster",
         "Casă completă": "Schlüsselfertiges Haus",
+        "Schlüsselfertig Haus": "Schlüsselfertiges Haus",
     }
     nivel_oferta = _nivel_map.get(nivel_oferta_raw, nivel_oferta_raw)
     if nivel_oferta == nivel_oferta_raw:
@@ -664,7 +674,7 @@ def calculate_pricing_for_plan(
             nivel_oferta = "Rohbau/Tragwerk"
         elif "tragwerk" in nl and "fenster" in nl:
             nivel_oferta = "Tragwerk + Fenster"
-        elif "schlüsselfertig" in nl or "schlusselfertig" in nl:
+        elif "schlüsselfertig" in nl or "schlusselfertig" in nl or "schlüsselfertig haus" in nl:
             nivel_oferta = "Schlüsselfertiges Haus"
     # Rohbau = doar structură; Tragwerk+Fenster = + deschideri; Schlüsselfertig sau necunoscut = tot
     include_openings = nivel_oferta != "Rohbau/Tragwerk"
@@ -982,21 +992,20 @@ def calculate_pricing_for_plan(
             if isinstance(custom_demolition_price, (int, float)) and float(custom_demolition_price) >= 0
             else None
         )
-        # Rows with positive area + price_key from editor (Preisdatenbank keys).
-        demo_rows: list[tuple[int, float, str]] = []
+        # Rows with positive area from editor; demolition price is entered directly by user.
+        demo_rows: list[tuple[int, float]] = []
         for idx, sel in enumerate(demolition_items):
             if not isinstance(sel, dict):
                 continue
             area_m2 = float(sel.get("area_m2") or 0.0)
-            price_key = str(sel.get("price_key") or "").strip()
-            if area_m2 <= 0 or not price_key:
+            if area_m2 <= 0:
                 continue
-            demo_rows.append((idx, area_m2, price_key))
+            demo_rows.append((idx, area_m2))
 
         # Abbruch-Eigenpreis: editor value is a lump-sum EUR for all Aufstandsflächen on this floor (split by area).
         if custom_demolition_total is not None and demo_rows:
-            sum_area = sum(a for _, a, _ in demo_rows)
-            for idx, area_m2, _price_key in demo_rows:
+            sum_area = sum(a for _, a in demo_rows)
+            for idx, area_m2 in demo_rows:
                 alloc = custom_demolition_total * (area_m2 / sum_area) if sum_area > 0 else 0.0
                 eff_unit = (alloc / area_m2) if area_m2 > 0 else 0.0
                 items_phase1.append({
@@ -1006,21 +1015,17 @@ def calculate_pricing_for_plan(
                     "unit_price": round(eff_unit, 4),
                     "total_cost": round(alloc, 2),
                 })
-        else:
-            for idx, area_m2, price_key in demo_rows:
-                unit_price = float(raw_params.get(price_key, 0.0) or 0.0)
-                cost = area_m2 * unit_price
-                items_phase1.append({
-                    "category": "aufstockung_demolition",
-                    "name": f"Aufstandsfläche / Abreißung #{idx + 1}",
-                    "area_m2": round(area_m2, 2),
-                    "unit_price": round(unit_price, 2),
-                    "total_cost": round(cost, 2),
-                })
+        stair_cfg = pricing_coeffs.get("stairs", {}) if isinstance(pricing_coeffs.get("stairs"), dict) else {}
+        stair_map = stair_cfg.get("stair_type_price_map", {}) if isinstance(stair_cfg.get("stair_type_price_map"), dict) else {}
+        stair_default = float(stair_cfg.get("price_per_stair_unit", raw_params.get("price_per_stair_unit", 0.0)) or 0.0)
+        treppe_typ = str(
+            (frontend_input.get("structuraCladirii", {}) or {}).get("treppeTyp")
+            or frontend_input.get("treppeTyp")
+            or "Standard"
+        ).strip()
+        unit_piece = float(stair_map.get(treppe_typ, stair_default) or stair_default)
 
         stair_items = phase_floor.get("stairOpenings", []) or []
-        piece_key = "aufstockung_stair_opening_piece"
-        unit_piece = float(raw_params.get(piece_key, raw_params.get("aufstockung_stair_opening_piece", 0.0)) or 0.0)
         for idx, sel in enumerate(stair_items):
             if not isinstance(sel, dict):
                 continue
@@ -1047,29 +1052,15 @@ def calculate_pricing_for_plan(
 
         statik = phase_floor.get("statikChoice", {}) or {}
         if isinstance(statik, dict):
-            mode = str(statik.get("mode") or "none").strip().lower()
-            if mode == "stahlbetonverbunddecke":
-                unit_price = float(raw_params.get("aufstockung_statik_stahlbetonverbunddecke_m2", 0.0) or 0.0)
-                area_candidates = [float((x or {}).get("area_m2") or 0.0) for x in demolition_items if isinstance(x, dict)]
-                target_area = float(sum(area_candidates) or floor_area or 0.0)
-                cost = target_area * unit_price
+            custom_price = float(statik.get("customPiecePrice") or 0.0)
+            if custom_price > 0:
                 items_phase1.append({
                     "category": "aufstockung_statik",
-                    "name": "Statik: Stahlbetonverbunddecke",
-                    "area_m2": round(target_area, 2),
-                    "unit_price": round(unit_price, 2),
-                    "total_cost": round(cost, 2),
+                    "name": "Statik (Editor)",
+                    "quantity": 1,
+                    "unit_price": round(custom_price, 2),
+                    "total_cost": round(custom_price, 2),
                 })
-            elif mode == "sonderkonstruktion":
-                custom_price = float(statik.get("customPiecePrice") or 0.0)
-                if custom_price > 0:
-                    items_phase1.append({
-                        "category": "aufstockung_statik",
-                        "name": "Statik: Sonderkonstruktion",
-                        "quantity": 1,
-                        "unit_price": round(custom_price, 2),
-                        "total_cost": round(custom_price, 2),
-                    })
 
         if items_phase1:
             cost_aufstockung_phase1 = {
@@ -1090,6 +1081,34 @@ def calculate_pricing_for_plan(
             "total_cost": round(prev_total + add_t, 2),
             "detailed_items": prev_items + cost_zubau_wall_demolition_items,
         }
+
+    if (
+        wizard_package == "zubau"
+        and not is_existing_aufstockung_floor
+        and isinstance(phase_floor, dict)
+        and not cost_zubau_wall_demolition_items
+    ):
+        cdp = phase_floor.get("customDemolitionPrice")
+        if cdp is not None:
+            try:
+                cdp_f = float(cdp)
+                if cdp_f > 0:
+                    prev_items = list(cost_aufstockung_phase1.get("detailed_items") or [])
+                    prev_total = float(cost_aufstockung_phase1.get("total_cost") or 0.0)
+                    prev_items.append({
+                        "category": "zubau_demolition_pauschal",
+                        "name": "Abbruch (Pauschal)",
+                        "quantity": 1.0,
+                        "unit_price": round(cdp_f, 2),
+                        "total_cost": round(cdp_f, 2),
+                    })
+                    cost_aufstockung_phase1 = {
+                        "total_cost": round(prev_total + cdp_f, 2),
+                        "detailed_items": prev_items,
+                    }
+                    total_plan_cost = round(total_plan_cost + cdp_f, 2)
+            except (TypeError, ValueError):
+                pass
 
     if is_existing_aufstockung_floor:
         # Existing-floor Aufstockung pricing: keep only roof + phase1 editor-driven items.

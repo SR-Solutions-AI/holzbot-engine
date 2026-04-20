@@ -29,7 +29,12 @@ from config.settings import OUTPUT_ROOT, RUNNER_ROOT, JOBS_ROOT, RUNS_ROOT, load
 from config.frontend_loader import load_frontend_data_for_run
 from pdf_generator.utils import resolve_editor_blueprint_for_pdf
 from pdf_generator.offer_scope import get_offer_inclusions, normalize_nivel_oferta
-from area.config import STANDARD_DOOR_HEIGHT_M, STANDARD_WINDOW_HEIGHT_M
+from area.config import (
+    STANDARD_DOOR_HEIGHT_M,
+    STANDARD_WINDOW_HEIGHT_M,
+    STANDARD_WALL_HEIGHT_M,
+    WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M,
+)
 from area.calculator import _infer_window_height_from_width
 
 
@@ -812,12 +817,20 @@ def _append_zubau_new_floor_indicator_table(
             total_len += float(ln.get("length_m") or 0.0)
         except (TypeError, ValueError):
             continue
+    # Wandabbruch-Streifen: Länge × (Standard-Raumhöhe + Struktur-/Außen-Fertigungsaufschlag), wie Preisrechner
+    strip_h_m = float(STANDARD_WALL_HEIGHT_M) + float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
+    abriss_flaeche_m2 = round(total_len * strip_h_m, 2) if total_len > 0 else 0.0
     story.append(Paragraph(f"<b>{sw} – Zubau (neues Geschoss)</b>", heading_style))
     rows = [
         ["Indikator", "Wert", "Einheit"],
         ["Bestand-Marker (Polygone)", str(n_best), "Stk."],
         ["Wandabbruch-Linien", str(n_lines), "Stk."],
         ["Summe Linienlänge (Planmaßstab)", f"{total_len:.2f}" if total_len > 0 else "—", "m"],
+        [
+            "Geschätzte Abrissfläche (Streifen Wandabbruch)",
+            f"{abriss_flaeche_m2:.2f}" if abriss_flaeche_m2 > 0 else "—",
+            "m²",
+        ],
     ]
     t = Table(rows, colWidths=[90 * mm, 50 * mm, 25 * mm])
     _style_data_table(t)

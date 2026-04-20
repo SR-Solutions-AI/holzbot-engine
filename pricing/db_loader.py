@@ -43,6 +43,17 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
     for _k, _v in _aufstockung_raw_defaults.items():
         if _k not in data_map:
             data_map[_k] = _v
+    _summary_percent_defaults: dict[str, float] = {
+        "baustelleneinrichtung_standard_percent": 3.0,
+        "baustelleneinrichtung_erschwert_percent": 4.0,
+        "baustelleneinrichtung_sondertransport_percent": 3.0,
+        "profit_margin_betrieb_percent": 4.0,
+        "profit_margin_risiko_percent": 2.0,
+        "profit_margin_unternehmer_percent": 3.0,
+    }
+    for _k, _v in _summary_percent_defaults.items():
+        if _k not in data_map:
+            data_map[_k] = _v
 
     # Baustellenzufahrt (accesSantier): toate cele 3 opțiuni din form influențează prețul
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
@@ -101,18 +112,18 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "metal_price_per_m2": data_map.get("metal_price_per_m2", 0),
             "membrane_price_per_m2": data_map.get("membrane_price_per_m2", 0),
             # Dämmung (form: daemmung)
-            "daemmung_keine_price": data_map.get("daemmung_keine_price", 0),
-            "daemmung_zwischensparren_price": data_map.get("daemmung_zwischensparren_price", 55),
-            "daemmung_aufsparren_price": data_map.get("daemmung_aufsparren_price", 75),
+            "daemmung_keine_price": data_map.get("roofonly_daemmung_keine_price", data_map.get("daemmung_keine_price", 0)),
+            "daemmung_zwischensparren_price": data_map.get("roofonly_daemmung_zwischensparren_price", data_map.get("daemmung_zwischensparren_price", 55)),
+            "daemmung_aufsparren_price": data_map.get("roofonly_daemmung_aufsparren_price", data_map.get("daemmung_aufsparren_price", 75)),
             # Unterdach (form: unterdach)
-            "unterdach_folie_price": data_map.get("unterdach_folie_price", 12),
-            "unterdach_schalung_folie_price": data_map.get("unterdach_schalung_folie_price", 28),
+            "unterdach_folie_price": data_map.get("roofonly_unterdach_folie_price", data_map.get("unterdach_folie_price", 12)),
+            "unterdach_schalung_folie_price": data_map.get("roofonly_unterdach_schalung_folie_price", data_map.get("unterdach_schalung_folie_price", 28)),
             # Dachstuhl-Typ (form: dachstuhlTyp)
-            "dachstuhl_sparrendach_price": data_map.get("dachstuhl_sparrendach_price", 95),
-            "dachstuhl_pfettendach_price": data_map.get("dachstuhl_pfettendach_price", 110),
-            "dachstuhl_kehlbalkendach_price": data_map.get("dachstuhl_kehlbalkendach_price", 105),
-            "dachstuhl_sonderkonstruktion_price": data_map.get("dachstuhl_sonderkonstruktion_price", 130),
-            "sichtdachstuhl_zuschlag_price": data_map.get("sichtdachstuhl_zuschlag_price", 25),
+            "dachstuhl_sparrendach_price": data_map.get("roofonly_dachstuhl_sparrendach_price", data_map.get("dachstuhl_sparrendach_price", 95)),
+            "dachstuhl_pfettendach_price": data_map.get("roofonly_dachstuhl_pfettendach_price", data_map.get("dachstuhl_pfettendach_price", 110)),
+            "dachstuhl_kehlbalkendach_price": data_map.get("roofonly_dachstuhl_kehlbalkendach_price", data_map.get("dachstuhl_kehlbalkendach_price", 105)),
+            "dachstuhl_sonderkonstruktion_price": data_map.get("roofonly_dachstuhl_sonderkonstruktion_price", data_map.get("dachstuhl_sonderkonstruktion_price", 130)),
+            "sichtdachstuhl_zuschlag_price": data_map.get("roofonly_sichtdachstuhl_price", data_map.get("sichtdachstuhl_zuschlag_price", 25)),
             "panta_acoperis_zuschlag_per_grad": data_map.get("panta_acoperis_zuschlag_per_grad", 0.5),
             # Sadiki-specific roof cover prices (if present in DB)
             "roof_shingle_price_per_m2": data_map.get("roof_shingle_price_per_m2", 0),
@@ -147,7 +158,7 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
             "roofonly_decken_innenausbau_premium_price": data_map.get("roofonly_decken_innenausbau_premium_price", 56),
             "roofonly_decken_innenausbau_exklusiv_price": data_map.get("roofonly_decken_innenausbau_exklusiv_price", 74),
             "roofonly_tinichigerie_percent": data_map.get("roofonly_tinichigerie_percent", 5),
-            "tinichigerie_percent": data_map.get("tinichigerie_percent", 5),
+            "tinichigerie_percent": data_map.get("roofonly_tinichigerie_percent", data_map.get("tinichigerie_percent", 5)),
             # Dachfenster (Stück) – Vollhaus
             "dachfenster_stueck_standard": data_map.get("dachfenster_stueck_standard", 650),
             "dachfenster_stueck_velux": data_map.get("dachfenster_stueck_velux", 890),
