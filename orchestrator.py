@@ -292,7 +292,7 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         return frontend_data
     out = dict(frontend_data)
     wizard_package = str(out.get("wizard_package") or "").strip().lower()
-    if wizard_package not in ("aufstockung", "zubau"):
+    if wizard_package not in ("aufstockung", "zubau", "zubau_aufstockung"):
         return out
 
     extras = {}
@@ -311,10 +311,15 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
         or (out.get("structuraCladirii") or {}).get("aufstockungFloorKinds")
         or []
     )
-    floor_kinds = [
-        "new" if str(k).strip().lower() == "new" else "existing"
-        for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
-    ]
+    floor_kinds = []
+    for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else []):
+        v = str(k).strip().lower()
+        if v in ("new", "zubau"):
+            floor_kinds.append("zubau")
+        elif v == "aufstockung":
+            floor_kinds.append("aufstockung")
+        else:
+            floor_kinds.append("existing")
 
     def _polygon_area_px2(points: object) -> float:
         if not isinstance(points, list) or len(points) < 3:
@@ -474,7 +479,7 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
                 "price_key": str(d.get("price_key") or "aufstockung_roof_demolition_m2"),
             }
             floor_entry["demolitionSelections"].append(demolition_item)
-            if floor_kind != "new":
+            if floor_kind == "existing":
                 demolition_flat.append({**demolition_item, "plan_index": idx})
         for s in stair_openings:
             if not isinstance(s, dict):
@@ -518,10 +523,10 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
                 stair_item["opening_width_m"] = round(min(w_m, h_m), 3)
                 stair_item["opening_length_m"] = round(max(w_m, h_m), 3)
             floor_entry["stairOpenings"].append(stair_item)
-            if floor_kind != "new":
+            if floor_kind == "existing":
                 stairs_flat.append({**stair_item, "plan_index": idx})
 
-        if wizard_package == "zubau" and floor_kind == "new":
+        if wizard_package in ("zubau", "zubau_aufstockung") and floor_kind == "zubau":
             z_best = payload.get("zubauBestandPolygons") if isinstance(payload.get("zubauBestandPolygons"), list) else []
             z_lines_raw = payload.get("zubauWallDemolitionLines") if isinstance(payload.get("zubauWallDemolitionLines"), list) else []
 
@@ -566,7 +571,7 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
             if z_best:
                 floor_entry["zubauBestandPolygonCount"] = len(z_best)
 
-        if floor_kind == "new":
+        if floor_kind in ("new", "zubau", "aufstockung"):
             new_floors.append(floor_entry)
         else:
             existing_floors.append(floor_entry)
@@ -575,6 +580,8 @@ def _enrich_frontend_with_aufstockung_phase1(frontend_data: dict, job_root: Path
     phase1["newFloors"] = new_floors
     phase1["demolitionSelections"] = demolition_flat
     phase1["stairOpenings"] = stairs_flat
+    if isinstance(extras.get("globalCombinedPrice"), (int, float)):
+        phase1["globalCombinedPrice"] = float(extras.get("globalCombinedPrice"))
     out["aufstockungPhase1"] = phase1
     return out
 
@@ -795,7 +802,7 @@ def run_segmentation_and_classification_for_document(
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
     measurements_only_offer = bool(frontend_data.get("measurements_only_offer"))
     wizard_package = str(frontend_data.get("wizard_package") or "").strip().lower()
-    is_aufstockung_offer = wizard_package in ("aufstockung", "zubau")
+    is_aufstockung_offer = wizard_package in ("aufstockung", "zubau", "zubau_aufstockung")
     our_floors = len(house_plans)
     floors_number = frontend_data.get("floorsNumber")
     basement = frontend_data.get("basement", False)

@@ -303,21 +303,19 @@ class TestPreisdatenbankPricesApplied:
         struct = next(i for i in result["detailed_items"] if i["category"] == "stairs_structure")
         assert struct["unit_price"] == 4800.0
 
-    def test_sliding_door_priced_per_m2_and_kept_in_openings(self):
+    def test_sliding_door_uses_window_price_per_m2(self):
         from pricing.modules.openings import calculate_openings_details
 
         coeffs = {
             "door_interior_prices": {"Standard": 320.0},
             "door_exterior_prices": {"Standard": 1450.0},
             "windows_price_per_m2": {"3-fach verglast": 420.0},
-            "sliding_door_prices_per_m2": {"Standard": 690.0, "Panorama": 1040.0},
         }
         frontend = {
             "ferestreUsi": {
                 "windowQuality": "3-fach verglast",
                 "doorMaterialInterior": "Standard",
                 "doorMaterialExterior": "Standard",
-                "slidingDoorType": "Panorama",
             }
         }
 
@@ -327,8 +325,8 @@ class TestPreisdatenbankPricesApplied:
             frontend,
         )
 
-        assert result["total_cost"] == round(2.4 * 2.1 * 1040.0, 2)
+        assert result["total_cost"] == round(2.4 * 2.1 * 420.0, 2)
         item = result["items"][0]
         assert item["type"] == "sliding_door"
-        assert item["material"] == "Panorama"
+        assert item["material"] == "3-fach verglast"
         assert item["price_unit"] == "€/m²"

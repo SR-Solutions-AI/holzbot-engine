@@ -37,20 +37,22 @@ def calculate_utilities_details(
     
     items = []
     total_cost = 0.0
-    
+    vent_cost = 0.0
+    sewage_cost = 0.0
+
     # ==========================================
     # 1. ELECTRICITATE
     # ==========================================
     elec_base = float(coeffs_electricity.get("coefficient_electricity_per_m2", 60.0))
-    elec_modifiers = coeffs_electricity.get("energy_performance_modifiers", {})
-    elec_modifier = float(elec_modifiers.get(energy_level, 1.0))
-    
+    # Energieniveau aus Preisdatenbank: kein Aufschlag mehr auf Elektrik
+    elec_modifier = 1.0
+
     elec_cost = total_floor_area_m2 * elec_base * elec_modifier
     total_cost += elec_cost
-    
+
     items.append({
         "category": "electricity",
-        "name": f"Instalație electrică ({energy_level})",
+        "name": "Instalație electrică",
         "area_m2": round(total_floor_area_m2, 2),
         "base_price_per_m2": elec_base,
         "energy_modifier": elec_modifier,
@@ -63,17 +65,16 @@ def calculate_utilities_details(
     # ==========================================
     heat_base = float(coeffs_heating.get("coefficient_heating_per_m2", 70.0))
     heat_type_modifiers = coeffs_heating.get("type_coefficients", {})
-    heat_energy_modifiers = coeffs_heating.get("energy_performance_modifiers", {})
-    
     heat_type_modifier = float(heat_type_modifiers.get(heating_type, 1.0))
-    heat_energy_modifier = float(heat_energy_modifiers.get(energy_level, 1.0))
-    
+    # Energieniveau: kein Aufschlag mehr auf Heizung
+    heat_energy_modifier = 1.0
+
     heat_cost = total_floor_area_m2 * heat_base * heat_type_modifier * heat_energy_modifier
     total_cost += heat_cost
-    
+
     items.append({
         "category": "heating",
-        "name": f"Sistem încălzire ({heating_type}, {energy_level})",
+        "name": f"Sistem încălzire ({heating_type})",
         "area_m2": round(total_floor_area_m2, 2),
         "base_price_per_m2": heat_base,
         "type_modifier": heat_type_modifier,
@@ -81,22 +82,11 @@ def calculate_utilities_details(
         "final_price_per_m2": round(heat_base * heat_type_modifier * heat_energy_modifier, 2),
         "total_cost": round(heat_cost, 2)
     })
-    
+
     # ==========================================
-    # 3. VENTILAȚIE (OPȚIONAL)
+    # 3. VENTILAȚIE — entfernt aus Angebotspreis
     # ==========================================
-    if has_ventilation:
-        vent_base = float(coeffs_ventilation.get("coefficient_ventilation_per_m2", 55.0))
-        vent_cost = total_floor_area_m2 * vent_base
-        total_cost += vent_cost
-        
-        items.append({
-            "category": "ventilation",
-            "name": "Ventilație mecanică cu recuperare căldură",
-            "area_m2": round(total_floor_area_m2, 2),
-            "base_price_per_m2": vent_base,
-            "total_cost": round(vent_cost, 2)
-        })
+    _ = has_ventilation  # API-Signatur beibehalten; kein €-Anteil
     
     # ==========================================
     # 4. CANALIZARE (IMPLICIT INCLUS)
@@ -105,7 +95,7 @@ def calculate_utilities_details(
         sewage_base = float(coeffs_sewage.get("coefficient_sewage_per_m2", 45.0))
         sewage_cost = total_floor_area_m2 * sewage_base
         total_cost += sewage_cost
-        
+
         items.append({
             "category": "sewage",
             "name": "Canalizare",

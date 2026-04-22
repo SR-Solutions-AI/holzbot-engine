@@ -22,6 +22,135 @@ def _overview_floor_label_matches_omit(key: str, omit: frozenset[str]) -> bool:
     return False
 
 
+def _de_floor_display_label(label: str) -> str:
+    """German standard: «1. Obergeschoss» instead of «Obergeschoss 1» (same physical floor, clearer in PDF)."""
+    s = (label or "").strip()
+    if not s:
+        return s
+    m = re.match(r"^Obergeschoss\s+(\d+)$", s, re.I)
+    if m:
+        return f"{int(m.group(1))}. Obergeschoss"
+    return s
+
+
+def _stockwerk_label_from_form_key_suffix(suffix: str) -> str:
+    """Map form field suffix (after außenwande_/bodenaufbau_/…) to a Projektübersicht floor label."""
+    s = (suffix or "").strip()
+    if not s:
+        return s
+    sl = s.lower()
+    if sl in ("ground", "parter"):
+        return "Erdgeschoss"
+    m_plan = re.match(r"^plan_(\d+)$", s, re.I)
+    if m_plan:
+        return f"Neues Geschoss (Plan {int(m_plan.group(1)) + 1})"
+    if sl == "beci" or "beci" in sl:
+        return "Keller"
+    m = re.match(r"^floor_(\d+)$", s, re.I)
+    if m:
+        return f"Obergeschoss {int(m.group(1))}"
+    if sl == "mansarda":
+        return "Dachgeschoss"
+    if sl == "pod":
+        return "Dachboden"
+    if sl == "intermediar":
+        return "Zwischengeschoss"
+    return s.replace("_", " ").strip() or s
+
+
+def merge_plan0_form_keys_into_ground_display(values: dict | None) -> dict:
+    """
+    Zubau (primul plan): editorul poate salva *_plan_0; în Projektübersicht rândurile fixe folosesc *_ground
+    pentru «Erdgeschoss». Copiem plan_0 → ground doar dacă ground e gol (nu suprascriem wizard EG).
+    """
+    out = dict(values or {})
+
+    def _empty(v) -> bool:
+        return v is None or str(v).strip() == ""
+
+    pairs = (
+        ("außenwande_plan_0", "außenwande_ground"),
+        ("innenwande_plan_0", "innenwande_ground"),
+        ("bodenaufbau_plan_0", "bodenaufbau_ground"),
+        ("deckenaufbau_plan_0", "deckenaufbau_ground"),
+        ("bodenbelag_plan_0", "bodenbelag_ground"),
+        ("finisajInteriorInnen_plan_0", "finisajInteriorInnen_ground"),
+        ("finisajInteriorAussen_plan_0", "finisajInteriorAussen_ground"),
+        ("finisajInterior_plan_0", "finisajInterior_ground"),
+        ("fatada_plan_0", "fatada_ground"),
+    )
+    for src, dst in pairs:
+        if not _empty(out.get(src)) and _empty(out.get(dst)):
+            out[dst] = out[src]
+            try:
+                del out[src]
+            except KeyError:
+                pass
+    return out
+
+
+def merge_neues_geschoss_plan1_finishes_into_erdgeschoss(finishes_per_floor: dict | None) -> dict:
+    """După _finishes_per_floor_from_form: tier «Neues Geschoss (Plan 1)» completează «Erdgeschoss» unde lipsește."""
+    out: dict = {}
+    for k, v in (finishes_per_floor or {}).items():
+        out[k] = dict(v) if isinstance(v, dict) else v
+    nsp = "Neues Geschoss (Plan 1)"
+    eg = "Erdgeschoss"
+    if nsp not in out:
+        return out
+    src = out[nsp]
+    if not isinstance(src, dict):
+        return out
+    if eg not in out:
+        out[eg] = {"interior_inner": None, "interior_outer": None, "exterior": None}
+    egd = out[eg]
+    if not isinstance(egd, dict):
+        out[eg] = {"interior_inner": None, "interior_outer": None, "exterior": None}
+        egd = out[eg]
+    for sk in ("interior_inner", "interior_outer", "exterior"):
+        cur = egd.get(sk)
+        if (cur is None or str(cur).strip() == "") and src.get(sk) not in (None, ""):
+            egd[sk] = src[sk]
+    return out
+
+
+def _append_extra_per_floor_form_keys(
+    overview_items: list[str],
+    *,
+    prefix: str,
+    title_de: str,
+    field_tag: str,
+    values: dict,
+    known_keys: set[str],
+    omit: frozenset[str],
+    _resolve_display_value,
+    translate: bool,
+) -> None:
+    """Emit lines for e.g. außenwande_floor_4 or außenwande_intermediar saved by the detections editor."""
+    rx = re.compile(rf"^{re.escape(prefix)}_(.+)$", re.I)
+    for key in sorted(values.keys()):
+        if not isinstance(key, str):
+            continue
+        m = rx.match(key)
+        if not m:
+            continue
+        if key in known_keys:
+            continue
+        raw_val = values.get(key)
+        if raw_val is None or str(raw_val).strip() == "":
+            continue
+        label_raw = _stockwerk_label_from_form_key_suffix(m.group(1))
+        if omit and _overview_floor_label_matches_omit(label_raw, omit):
+            continue
+        rendered = (
+            _resolve_display_value(str(raw_val), field_tag, translate=translate)
+            if translate
+            else str(raw_val)
+        )
+        label_disp = _de_floor_display_label(label_raw)
+        overview_items.append(f"<b>{title_de} ({label_disp}):</b> <b>{rendered}</b>")
+
+
 def _strip_label_for_option(label: str) -> str:
     if not label or not isinstance(label, str):
         return ""
@@ -163,6 +292,9 @@ def build_selected_form_overview_items(
         overview_items.append(f"<b>{label}:</b> <b>{rendered}</b>")
 
     omit = aufstockung_omit_floor_labels or frozenset()
+    finishes_per_floor = merge_neues_geschoss_plan1_finishes_into_erdgeschoss(
+        dict(finishes_per_floor) if isinstance(finishes_per_floor, dict) else {}
+    )
 
     def _append_floor_values(prefix: str, mapping: list[tuple[str, str, str | None]], values: dict, *, translate: bool = True):
         for key, label, field_tag in mapping:
@@ -172,30 +304,42 @@ def build_selected_form_overview_items(
             if value is None or str(value).strip() == "":
                 continue
             rendered = _resolve_display_value(str(value), field_tag, translate=translate) if translate else str(value)
-            overview_items.append(f"<b>{prefix} ({label}):</b> <b>{rendered}</b>")
+            label_disp = _de_floor_display_label(label)
+            overview_items.append(f"<b>{prefix} ({label_disp}):</b> <b>{rendered}</b>")
 
     sistem_constructiv = frontend_data.get("sistemConstructiv", {}) or {}
-    materiale_finisaj = frontend_data.get("materialeFinisaj", {}) or {}
+    materiale_finisaj = merge_plan0_form_keys_into_ground_display(frontend_data.get("materialeFinisaj") or {})
     performanta = frontend_data.get("performanta", {}) or {}
-    performanta_energetica = frontend_data.get("performantaEnergetica", {}) or {}
-
-    if inclusions_ov.get("finishes") and finishes_per_floor:
+    # Popup values from detections editor must remain visible in final offer even
+    # when the package level would normally hide "finishes" sections.
+    if finishes_per_floor:
         floor_order = ["Keller", "Erdgeschoss"] + [f"Obergeschoss {i}" for i in range(1, 10)] + ["Mansardă", "Dachgeschoss"]
-        for floor_label in floor_order:
+        seen_fin = set()
+
+        def _emit_finishes_for_floor(floor_label: str) -> None:
             if omit and _overview_floor_label_matches_omit(floor_label, omit):
-                continue
+                return
             if floor_label not in finishes_per_floor:
-                continue
+                return
             floor_finishes = finishes_per_floor[floor_label]
             fin_int_inner = floor_finishes.get("interior_inner")
             fin_int_outer = floor_finishes.get("interior_outer")
             fin_ext = floor_finishes.get("exterior")
+            fl_disp = _de_floor_display_label(floor_label)
             if fin_int_inner:
-                overview_items.append(f"<b>Innenausbau Innenwände ({floor_label}):</b> <b>{_resolve_display_value(fin_int_inner, 'interior_finish_interior_walls')}</b>")
+                overview_items.append(f"<b>Innenausbau Innenwände ({fl_disp}):</b> <b>{_resolve_display_value(fin_int_inner, 'interior_finish_interior_walls')}</b>")
             if fin_int_outer:
-                overview_items.append(f"<b>Innenausbau Außenwände ({floor_label}):</b> <b>{_resolve_display_value(fin_int_outer, 'interior_finish_exterior_walls')}</b>")
+                overview_items.append(f"<b>Innenausbau Außenwände ({fl_disp}):</b> <b>{_resolve_display_value(fin_int_outer, 'interior_finish_exterior_walls')}</b>")
             if fin_ext:
-                overview_items.append(f"<b>{enforcer.get('Fațadă')} ({floor_label}):</b> <b>{_resolve_display_value(fin_ext, 'exterior_facade')}</b>")
+                overview_items.append(f"<b>{enforcer.get('Fațadă')} ({fl_disp}):</b> <b>{_resolve_display_value(fin_ext, 'exterior_facade')}</b>")
+
+        for floor_label in floor_order:
+            seen_fin.add(floor_label)
+            _emit_finishes_for_floor(floor_label)
+        for floor_label in sorted(finishes_per_floor.keys(), key=lambda s: str(s).lower()):
+            if floor_label in seen_fin:
+                continue
+            _emit_finishes_for_floor(floor_label)
 
     overview_items.append(f"<b>{enforcer.get('Anzahl der Stockwerke')}:</b> <b>{num_floors}</b>")
     overview_items.append(f"<b>{enforcer.get('Bausystem')}:</b> <b>{tip_sistem_de}</b>")
@@ -205,7 +349,22 @@ def build_selected_form_overview_items(
     _append_overview_value("Gelände", sistem_constructiv.get("teren"))
     if tip_fundatie_de != "—":
         overview_items.append(f"<b>{enforcer.get('Tip fundație')}:</b> <b>{tip_fundatie_de}</b>")
-    _append_overview_value("Raumhöhe", frontend_data.get("structuraCladirii", {}).get("inaltimeEtaje"), field_tag="floor_height")
+    sc_ov = frontend_data.get("structuraCladirii") or {}
+    rh_raw = frontend_data.get("raumhoeheCm", sc_ov.get("raumhoeheCm"))
+    rh_display = None
+    if rh_raw not in (None, ""):
+        try:
+            rh_display = f"{float(str(rh_raw).replace(',', '.')):g} cm"
+        except (TypeError, ValueError):
+            rh_display = str(rh_raw)
+    if rh_display:
+        overview_items.append(f"<b>Raumhöhe:</b> <b>{rh_display}</b>")
+    else:
+        _append_overview_value(
+            "Raumhöhe",
+            frontend_data.get("inaltimeEtaje") or sc_ov.get("inaltimeEtaje"),
+            field_tag="floor_height",
+        )
     _append_overview_value("Treppentyp", frontend_data.get("structuraCladirii", {}).get("treppeTyp"), field_tag="stairs_type")
     overview_items.append(f"<b>{enforcer.get('Dachtyp')}:</b> <b>{tip_acoperis_de}</b>")
     if inclusions_ov.get("finishes", False) and material_acoperis_de != "—":
@@ -246,23 +405,20 @@ def build_selected_form_overview_items(
                 overview_items.append(f"<b>{enforcer.get('Kaminabzug')}:</b> <b>für {num_floors} Geschosse</b>")
         if incalzire_de != "—":
             overview_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> <b>{_resolve_display_value(incalzire_de, 'heating_type')}</b>")
-        if nivel_energetic_de != "—":
-            overview_items.append(f"<b>{enforcer.get('Nivel energetic')}:</b> <b>{_resolve_display_value(nivel_energetic_de, 'energy_level')}</b>")
-        _append_overview_value(
-            "Lüftung / Wärmerückgewinnung",
-            performanta_energetica.get("ventilatie") if "ventilatie" in performanta_energetica else performanta.get("ventilatie"),
-            force_bool=True,
-            translate=False,
-        )
     if inclusions_ov.get("finishes"):
         overview_items.append(f"<b>{enforcer.get('Fertigstellungsgrad')}:</b> <b>{nivel_finisare_de}</b>")
 
     ferestre_usi = frontend_data.get("ferestreUsi", {}) or {}
     if inclusions_ov.get("openings"):
-        _append_overview_value("Fensterart", ferestre_usi.get("windowQuality") or materiale_finisaj.get("tamplarie"), field_tag="window_quality")
+        _append_overview_value("Glasflächen / Fensterart", ferestre_usi.get("windowQuality") or materiale_finisaj.get("tamplarie"), field_tag="window_quality")
+        th_raw = frontend_data.get("tuerhoeheCm", ferestre_usi.get("tuerhoeheCm"))
+        if th_raw not in (None, ""):
+            try:
+                overview_items.append(f"<b>Türhöhe:</b> <b>{float(str(th_raw).replace(',', '.')):g} cm</b>")
+            except (TypeError, ValueError):
+                overview_items.append(f"<b>Türhöhe:</b> <b>{th_raw}</b>")
         _append_overview_value("Innentüren", ferestre_usi.get("doorMaterialInterior"), field_tag="door_material_interior")
         _append_overview_value("Außentüren", ferestre_usi.get("doorMaterialExterior"), field_tag="door_material_exterior")
-        _append_overview_value("Schiebetür", ferestre_usi.get("slidingDoorType"), field_tag="sliding_door_type")
         garage_desired = ferestre_usi.get("garagentorGewuenscht")
         if garage_desired is not None:
             garage_type = (ferestre_usi.get("garageDoorType") or "").strip()
@@ -273,75 +429,110 @@ def build_selected_form_overview_items(
                 garage_text = f"Ja ({_resolve_display_value(garage_type, 'garage_door_type')})"
             overview_items.append(f"<b>Garagentor:</b> <b>{garage_text}</b>")
 
-    extras = frontend_data.get("wintergaertenBalkone", {}) or {}
-    if inclusions_ov.get("finishes"):
-        _append_overview_value("Wintergarten", extras.get("wintergartenTyp"), field_tag="wintergarten_type")
-        _append_overview_value("Balkon", extras.get("balkonTyp"), field_tag="balkon_type")
+    wandaufbau = merge_plan0_form_keys_into_ground_display(frontend_data.get("wandaufbau") or {})
+    _wa_aussen_static = [
+        ("außenwandeBeci", "Keller", "wandaufbau_aussen"),
+        ("außenwande_ground", "Erdgeschoss", "wandaufbau_aussen"),
+        ("außenwande_floor_1", "Obergeschoss 1", "wandaufbau_aussen"),
+        ("außenwande_floor_2", "Obergeschoss 2", "wandaufbau_aussen"),
+        ("außenwande_floor_3", "Obergeschoss 3", "wandaufbau_aussen"),
+        ("außenwandeMansarda", "Dachgeschoss", "wandaufbau_aussen"),
+    ]
+    _wa_innen_static = [
+        ("innenwandeBeci", "Keller", "wandaufbau_innen"),
+        ("innenwande_ground", "Erdgeschoss", "wandaufbau_innen"),
+        ("innenwande_floor_1", "Obergeschoss 1", "wandaufbau_innen"),
+        ("innenwande_floor_2", "Obergeschoss 2", "wandaufbau_innen"),
+        ("innenwande_floor_3", "Obergeschoss 3", "wandaufbau_innen"),
+        ("innenwandeMansarda", "Dachgeschoss", "wandaufbau_innen"),
+    ]
+    _append_floor_values("Wandaufbau Außenwände", _wa_aussen_static, wandaufbau)
+    _append_extra_per_floor_form_keys(
+        overview_items,
+        prefix="außenwande",
+        title_de="Wandaufbau Außenwände",
+        field_tag="wandaufbau_aussen",
+        values=wandaufbau,
+        known_keys={t[0] for t in _wa_aussen_static},
+        omit=omit,
+        _resolve_display_value=_resolve_display_value,
+        translate=True,
+    )
+    _append_floor_values("Wandaufbau Innenwände", _wa_innen_static, wandaufbau)
+    _append_extra_per_floor_form_keys(
+        overview_items,
+        prefix="innenwande",
+        title_de="Wandaufbau Innenwände",
+        field_tag="wandaufbau_innen",
+        values=wandaufbau,
+        known_keys={t[0] for t in _wa_innen_static},
+        omit=omit,
+        _resolve_display_value=_resolve_display_value,
+        translate=True,
+    )
 
-        wandaufbau = frontend_data.get("wandaufbau", {}) or {}
-        _append_floor_values(
-            "Wandaufbau Außenwände",
-            [
-                ("außenwandeBeci", "Keller", "wandaufbau_aussen"),
-                ("außenwande_ground", "Erdgeschoss", "wandaufbau_aussen"),
-                ("außenwande_floor_1", "Obergeschoss 1", "wandaufbau_aussen"),
-                ("außenwande_floor_2", "Obergeschoss 2", "wandaufbau_aussen"),
-                ("außenwande_floor_3", "Obergeschoss 3", "wandaufbau_aussen"),
-                ("außenwandeMansarda", "Dachgeschoss", "wandaufbau_aussen"),
-            ],
-            wandaufbau,
-        )
-        _append_floor_values(
-            "Wandaufbau Innenwände",
-            [
-                ("innenwandeBeci", "Keller", "wandaufbau_innen"),
-                ("innenwande_ground", "Erdgeschoss", "wandaufbau_innen"),
-                ("innenwande_floor_1", "Obergeschoss 1", "wandaufbau_innen"),
-                ("innenwande_floor_2", "Obergeschoss 2", "wandaufbau_innen"),
-                ("innenwande_floor_3", "Obergeschoss 3", "wandaufbau_innen"),
-                ("innenwandeMansarda", "Dachgeschoss", "wandaufbau_innen"),
-            ],
-            wandaufbau,
-        )
-
-        boden_decke = frontend_data.get("bodenDeckeBelag", {}) or {}
-        _append_floor_values(
-            "Bodenaufbau",
-            [
-                ("bodenaufbau_ground", "Erdgeschoss", "bodenaufbau"),
-                ("bodenaufbau_floor_1", "Obergeschoss 1", "bodenaufbau"),
-                ("bodenaufbau_floor_2", "Obergeschoss 2", "bodenaufbau"),
-                ("bodenaufbau_floor_3", "Obergeschoss 3", "bodenaufbau"),
-                ("bodenaufbauMansarda", "Dachgeschoss", "bodenaufbau"),
-                ("bodenaufbauPod", "Dachboden", "bodenaufbau"),
-            ],
-            boden_decke,
-        )
-        _append_floor_values(
-            "Deckenaufbau",
-            [
-                ("deckenaufbauBeci", "Keller", "deckenaufbau"),
-                ("deckenaufbau_ground", "Erdgeschoss", "deckenaufbau"),
-                ("deckenaufbau_floor_1", "Obergeschoss 1", "deckenaufbau"),
-                ("deckenaufbau_floor_2", "Obergeschoss 2", "deckenaufbau"),
-                ("deckenaufbau_floor_3", "Obergeschoss 3", "deckenaufbau"),
-                ("deckenaufbauMansarda", "Dachgeschoss", "deckenaufbau"),
-                ("deckenaufbauPod", "Dachboden", "deckenaufbau"),
-            ],
-            boden_decke,
-        )
-        _append_floor_values(
-            "Bodenbelag",
-            [
-                ("bodenbelagBeci", "Keller", "bodenbelag"),
-                ("bodenbelag_ground", "Erdgeschoss", "bodenbelag"),
-                ("bodenbelag_floor_1", "Obergeschoss 1", "bodenbelag"),
-                ("bodenbelag_floor_2", "Obergeschoss 2", "bodenbelag"),
-                ("bodenbelag_floor_3", "Obergeschoss 3", "bodenbelag"),
-                ("bodenbelagMansarda", "Dachgeschoss", "bodenbelag"),
-                ("bodenbelagPod", "Dachboden", "bodenbelag"),
-            ],
-            boden_decke,
-        )
+    boden_decke = merge_plan0_form_keys_into_ground_display(frontend_data.get("bodenDeckeBelag") or {})
+    _bd_static = [
+        ("bodenaufbau_ground", "Erdgeschoss", "bodenaufbau"),
+        ("bodenaufbau_floor_1", "Obergeschoss 1", "bodenaufbau"),
+        ("bodenaufbau_floor_2", "Obergeschoss 2", "bodenaufbau"),
+        ("bodenaufbau_floor_3", "Obergeschoss 3", "bodenaufbau"),
+        ("bodenaufbauMansarda", "Dachgeschoss", "bodenaufbau"),
+        ("bodenaufbauPod", "Dachboden", "bodenaufbau"),
+    ]
+    _dc_static = [
+        ("deckenaufbauBeci", "Keller", "deckenaufbau"),
+        ("deckenaufbau_ground", "Erdgeschoss", "deckenaufbau"),
+        ("deckenaufbau_floor_1", "Obergeschoss 1", "deckenaufbau"),
+        ("deckenaufbau_floor_2", "Obergeschoss 2", "deckenaufbau"),
+        ("deckenaufbau_floor_3", "Obergeschoss 3", "deckenaufbau"),
+        ("deckenaufbauMansarda", "Dachgeschoss", "deckenaufbau"),
+        ("deckenaufbauPod", "Dachboden", "deckenaufbau"),
+    ]
+    _bb_static = [
+        ("bodenbelagBeci", "Keller", "bodenbelag"),
+        ("bodenbelag_ground", "Erdgeschoss", "bodenbelag"),
+        ("bodenbelag_floor_1", "Obergeschoss 1", "bodenbelag"),
+        ("bodenbelag_floor_2", "Obergeschoss 2", "bodenbelag"),
+        ("bodenbelag_floor_3", "Obergeschoss 3", "bodenbelag"),
+        ("bodenbelagMansarda", "Dachgeschoss", "bodenbelag"),
+        ("bodenbelagPod", "Dachboden", "bodenbelag"),
+    ]
+    _append_floor_values("Bodenaufbau", _bd_static, boden_decke)
+    _append_extra_per_floor_form_keys(
+        overview_items,
+        prefix="bodenaufbau",
+        title_de="Bodenaufbau",
+        field_tag="bodenaufbau",
+        values=boden_decke,
+        known_keys={t[0] for t in _bd_static},
+        omit=omit,
+        _resolve_display_value=_resolve_display_value,
+        translate=True,
+    )
+    _append_floor_values("Deckenaufbau", _dc_static, boden_decke)
+    _append_extra_per_floor_form_keys(
+        overview_items,
+        prefix="deckenaufbau",
+        title_de="Deckenaufbau",
+        field_tag="deckenaufbau",
+        values=boden_decke,
+        known_keys={t[0] for t in _dc_static},
+        omit=omit,
+        _resolve_display_value=_resolve_display_value,
+        translate=True,
+    )
+    _append_floor_values("Bodenbelag", _bb_static, boden_decke)
+    _append_extra_per_floor_form_keys(
+        overview_items,
+        prefix="bodenbelag",
+        title_de="Bodenbelag",
+        field_tag="bodenbelag",
+        values=boden_decke,
+        known_keys={t[0] for t in _bb_static},
+        omit=omit,
+        _resolve_display_value=_resolve_display_value,
+        translate=True,
+    )
 
     return overview_items

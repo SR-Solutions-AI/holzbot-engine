@@ -143,8 +143,8 @@ def _aufstockung_new_floor_mpp(out_root: Path, floor_kinds: list[str], job_root:
     if not plan_dirs:
         return None
     for idx, pd in enumerate(plan_dirs):
-        kind = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
-        if kind != "new":
+        kind = str(floor_kinds[idx] if idx < len(floor_kinds) else "existing").strip().lower()
+        if kind not in ("zubau", "aufstockung", "new"):
             continue
         mpp = _scale_mpp_for_plan_dir(pd)
         if mpp and mpp > 0:
@@ -172,7 +172,14 @@ def _load_aufstockung_floor_kinds(run_id: str, fd_dict: dict[str, Any], job_root
     )
     if not isinstance(kinds_raw, list):
         return []
-    return ["new" if str(k).strip().lower() == "new" else "existing" for k in kinds_raw]
+    out: list[str] = []
+    for k in kinds_raw:
+        v = str(k).strip().lower()
+        if v in ("new", "zubau", "aufstockung"):
+            out.append(v if v != "new" else "zubau")
+        else:
+            out.append("existing")
+    return out
 
 
 def _lista_etaje_from_frontend(fd: dict[str, Any]) -> list[Any]:
@@ -347,6 +354,9 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
             elif "window" in t:
                 num_windows += 1
 
+        balkon_floor_m2 = 0.0
+        wintergarten_floor_m2 = 0.0
+        wintergarten_glass_facade_m2 = 0.0
         mp_path = plan_dir / "measurements_plan.json"
         if mp_path.exists():
             try:
@@ -390,6 +400,11 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
                 wall_openings = wi_o + we_o
                 if wall_openings > openings_area:
                     openings_area = wall_openings
+                extm = areas.get("extensions_measurements") or {}
+                if isinstance(extm, dict):
+                    balkon_floor_m2 = float(extm.get("balkon_floor_m2") or 0.0)
+                    wintergarten_floor_m2 = float(extm.get("wintergarten_floor_m2") or 0.0)
+                    wintergarten_glass_facade_m2 = float(extm.get("wintergarten_glass_facade_m2") or 0.0)
             except Exception:
                 pass
 
@@ -406,6 +421,9 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
             "num_doors": int(num_doors),
             "num_windows": int(num_windows),
             "openings_area_m2": round(openings_area, 2),
+            "balkon_floor_m2": round(balkon_floor_m2, 2),
+            "wintergarten_floor_m2": round(wintergarten_floor_m2, 2),
+            "wintergarten_glass_facade_m2": round(wintergarten_glass_facade_m2, 2),
         }
     return out
 
@@ -688,6 +706,15 @@ def _append_building_measurements_table(
             ["Deckenfläche", f"{fd['ceiling_area_m2']:.2f}", "m²"],
         ]
     )
+    balkon_floor = max(0.0, float(fd.get("balkon_floor_m2", 0.0) or 0.0))
+    wintergarten_floor = max(0.0, float(fd.get("wintergarten_floor_m2", 0.0) or 0.0))
+    wintergarten_glass = max(0.0, float(fd.get("wintergarten_glass_facade_m2", 0.0) or 0.0))
+    if balkon_floor > 0:
+        rows.append(["Balkonfläche", f"{balkon_floor:.2f}", "m²"])
+    if wintergarten_floor > 0:
+        rows.append(["Wintergartenfläche", f"{wintergarten_floor:.2f}", "m²"])
+    if wintergarten_glass > 0:
+        rows.append(["Wintergarten Glasfläche", f"{wintergarten_glass:.2f}", "m²"])
     if show_doors:
         rows.append(["Anzahl Türen", str(fd["num_doors"]), "Stk."])
     if show_win:
@@ -709,6 +736,7 @@ def _append_aufstockung_bestand_indicator_table(
     out_root: Path | None = None,
     floor_kinds_for_mpp: list[str] | None = None,
     job_root: Path | None = None,
+    section_title_de: str = "Aufstockung",
 ) -> None:
     """Measurements-only indicator block for Aufstockung existing-floor editor selections (no EUR)."""
     if not isinstance(floor_phase1, dict):
@@ -742,7 +770,7 @@ def _append_aufstockung_bestand_indicator_table(
         total_stair_area += a
     has_custom_demo_price = isinstance(floor_phase1.get("customDemolitionPrice"), (int, float))
 
-    story.append(Paragraph(f"<b>{sw} – Aufstockung Bestand-Auswahl</b>", heading_style))
+    story.append(Paragraph(f"<b>{sw} – {section_title_de}</b>", heading_style))
     rows = [
         ["Indikator", "Wert", "Einheit"],
         ["Aufstandsflächen (Polygone)", str(len(demo)), "Stk."],
@@ -795,6 +823,22 @@ def _append_aufstockung_bestand_indicator_table(
     story.append(Spacer(1, 8 * mm))
 
 
+def _has_phase1_indicator_content(floor_phase1: dict[str, Any]) -> bool:
+    if not isinstance(floor_phase1, dict):
+        return False
+    demo = floor_phase1.get("demolitionSelections")
+    stairs = floor_phase1.get("stairOpenings")
+    if isinstance(demo, list) and len(demo) > 0:
+        return True
+    if isinstance(stairs, list) and len(stairs) > 0:
+        return True
+    statik = floor_phase1.get("statikChoice")
+    if isinstance(statik, dict) and str(statik.get("mode") or "").strip().lower() not in ("", "none"):
+        return True
+    cdp = floor_phase1.get("customDemolitionPrice")
+    return isinstance(cdp, (int, float)) and float(cdp) > 0
+
+
 def _append_zubau_new_floor_indicator_table(
     story: list[Any],
     sw: str,
@@ -820,7 +864,7 @@ def _append_zubau_new_floor_indicator_table(
     # Wandabbruch-Streifen: Länge × (Standard-Raumhöhe + Struktur-/Außen-Fertigungsaufschlag), wie Preisrechner
     strip_h_m = float(STANDARD_WALL_HEIGHT_M) + float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
     abriss_flaeche_m2 = round(total_len * strip_h_m, 2) if total_len > 0 else 0.0
-    story.append(Paragraph(f"<b>{sw} – Zubau (neues Geschoss)</b>", heading_style))
+    story.append(Paragraph(f"<b>{sw} – Zubau</b>", heading_style))
     rows = [
         ["Indikator", "Wert", "Einheit"],
         ["Bestand-Marker (Polygone)", str(n_best), "Stk."],
@@ -875,10 +919,13 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                 or ((fd_dict.get("structuraCladirii") or {}).get("aufstockungFloorKinds") if isinstance(fd_dict, dict) else None)
                 or []
             )
-            floor_kinds = [
-                "new" if str(k).strip().lower() == "new" else "existing"
-                for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
-            ]
+            floor_kinds = []
+            for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else []):
+                v = str(k).strip().lower()
+                if v in ("new", "zubau", "aufstockung"):
+                    floor_kinds.append(v if v != "new" else "zubau")
+                else:
+                    floor_kinds.append("existing")
             fallback_global_statik = extras.get("statikChoice") if isinstance(extras, dict) and isinstance(extras.get("statikChoice"), dict) else {}
             manifest_path = job_root / "detections_review_manifest.json"
             plan_roots: list[Path] = []
@@ -900,7 +947,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     except Exception:
                         payload = {}
                 floor_kind = floor_kinds[idx] if idx < len(floor_kinds) else "existing"
-                if floor_kind == "new":
+                if str(floor_kind).strip().lower() in ("zubau", "aufstockung", "new"):
                     continue
                 statik = payload.get("statikChoice") if isinstance(payload.get("statikChoice"), dict) else fallback_global_statik
                 existing_floors.append({
@@ -911,6 +958,8 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     "statikChoice": statik if isinstance(statik, dict) else {},
                 })
             aufstockung_phase1 = {"existingFloors": existing_floors}
+            if isinstance(extras, dict) and isinstance(extras.get("globalCombinedPrice"), (int, float)):
+                aufstockung_phase1["globalCombinedPrice"] = float(extras.get("globalCombinedPrice"))
         except Exception:
             aufstockung_phase1 = {}
     existing_phase_entries = (
@@ -954,19 +1003,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
 
     plan_id_to_stockwerk: dict[str, str] = {}
     for i, p in enumerate(plans_ordered):
-        if floor_perm is not None and manifest_labels:
-            oi = floor_perm[i]
-            if 0 <= oi < len(manifest_labels):
-                lbl = (manifest_labels[oi] or "").strip()
-                if lbl:
-                    plan_id_to_stockwerk[p.plan_id] = lbl
-                    continue
         plan_id_to_stockwerk[p.plan_id] = f"Stockwerk {i + 1}"
-
-    # Ultimul plan în ordinea PDF = etajul cel mai de sus. La mansardă (nu pod), DE: Dachgeschoss.
-    if _gebaudestruktur_last_floor_is_mansard(_lista_etaje_from_frontend(fd_dict)) and plans_pdf_sequence:
-        top_pid = plans_pdf_sequence[-1].plan_id
-        plan_id_to_stockwerk[top_pid] = "Dachgeschoss"
 
     roof_floor_idx_to_plan, plan_id_to_roof_floor_idx = _roof_floor_mapping_for_pdf(run_id, out_root)
 
@@ -1153,17 +1190,7 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
             rw_area = float(rw.get("area_m2", 0.0) or 0.0)
             raw_plan_index = floor_perm[si] if isinstance(floor_perm, list) and si < len(floor_perm) else si
             _wp_pdf = str(fd_dict.get("wizard_package") or "").strip().lower()
-            is_existing_aufstockung_floor = (
-                _wp_pdf in ("aufstockung", "zubau")
-                and (
-                    raw_plan_index in phase1_by_plan_index
-                    or (
-                        0 <= raw_plan_index < len(aufstockung_floor_kinds)
-                        and aufstockung_floor_kinds[raw_plan_index] != "new"
-                    )
-                )
-            )
-            if not roof_only and plan.plan_id in floors_by_plan and not is_existing_aufstockung_floor:
+            if not roof_only and plan.plan_id in floors_by_plan:
                 _append_building_measurements_table(
                     story,
                     floors_by_plan[plan.plan_id],
@@ -1174,7 +1201,16 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     inc=pdf_inclusions,
                 )
             phase1_entry = phase1_by_plan_index.get(raw_plan_index)
-            if phase1_entry:
+            if (
+                _wp_pdf in ("aufstockung", "zubau", "zubau_aufstockung")
+                and _has_phase1_indicator_content(phase1_entry or {})
+            ):
+                fk_tab = (
+                    str(aufstockung_floor_kinds[raw_plan_index]).strip().lower()
+                    if 0 <= raw_plan_index < len(aufstockung_floor_kinds)
+                    else "existing"
+                )
+                section_de = "Zubau" if fk_tab == "zubau" else "Aufstockung"
                 _append_aufstockung_bestand_indicator_table(
                     story,
                     sw,
@@ -1183,15 +1219,16 @@ def generate_roof_measurements_pdf(run_id: str, output_path: Path | None = None)
                     out_root=out_root,
                     floor_kinds_for_mpp=aufstockung_floor_kinds,
                     job_root=job_root,
+                    section_title_de=section_de,
                 )
-            if _wp_pdf == "zubau" and isinstance(aufstockung_phase1, dict):
+            if _wp_pdf in ("zubau", "zubau_aufstockung") and isinstance(aufstockung_phase1, dict):
                 z_nf = aufstockung_phase1.get("newFloors") or []
                 z_ent = None
                 for ent in z_nf:
                     if isinstance(ent, dict) and int(ent.get("plan_index", -1)) == int(raw_plan_index):
                         z_ent = ent
                         break
-                if isinstance(z_ent, dict) and str(z_ent.get("floorKind") or "").strip().lower() == "new":
+                if isinstance(z_ent, dict) and str(z_ent.get("floorKind") or "").strip().lower() in ("new", "zubau"):
                     _append_zubau_new_floor_indicator_table(story, sw, heading_style, z_ent)
 
     else:

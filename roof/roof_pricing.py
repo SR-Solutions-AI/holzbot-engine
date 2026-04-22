@@ -323,7 +323,7 @@ def _apply_aufstockung_new_floor_mpp_override(
     Aufstockung rule: use m/px from a NEW floor for all roof surfaces.
     """
     base = dict(mpp_by_floor or {})
-    if str((frontend_data or {}).get("wizard_package") or "").strip().lower() != "aufstockung":
+    if str((frontend_data or {}).get("wizard_package") or "").strip().lower() not in ("aufstockung", "zubau", "zubau_aufstockung"):
         return base
 
     floor_kinds_raw = (
@@ -332,10 +332,10 @@ def _apply_aufstockung_new_floor_mpp_override(
         or ((frontend_data or {}).get("structuraCladirii") or {}).get("aufstockungFloorKinds")
         or []
     )
-    floor_kinds = [
-        "new" if str(k).strip().lower() == "new" else "existing"
-        for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else [])
-    ]
+    floor_kinds = []
+    for k in (floor_kinds_raw if isinstance(floor_kinds_raw, list) else []):
+        v = str(k).strip().lower()
+        floor_kinds.append("new" if v in ("new", "zubau", "aufstockung") else "existing")
 
     # Logical plan index -> plan_id from scale/plan_* order.
     scale_root = out_root / "scale"

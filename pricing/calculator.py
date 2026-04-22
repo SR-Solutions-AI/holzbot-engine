@@ -11,6 +11,7 @@ from .modules.roof import calculate_roof_details
 from .modules.utilities import calculate_utilities_details, calculate_fireplace_details
 from .modules.stairs import calculate_stairs_details
 from area.config import WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M
+from pricing.height_resolve import resolve_room_height_m
 
 
 def _stair_opening_dims_m_from_bbox_and_area(bbox: object, area_m2: float) -> tuple[float | None, float | None]:
@@ -187,9 +188,14 @@ def calculate_pricing_for_plan(
     fk_z = str((phase_floor_z or {}).get("floorKind") or (auf_fk_z[plan_index] if plan_index < len(auf_fk_z) else "")).strip().lower()
     tip_fb_z = str(structura_cladirii.get("tipFundatieBeci") or "")
     has_keller_z = "Keller" in tip_fb_z and "Kein Keller" not in tip_fb_z
-    if wizard_pkg_z in ("aufstockung", "zubau") and is_basement_plan and has_keller_z:
+    if wizard_pkg_z in ("aufstockung", "zubau", "zubau_aufstockung") and is_basement_plan and has_keller_z:
         fk_z = "bestand"
-    is_zubau_new_for_walls = wizard_pkg_z == "zubau" and fk_z == "new" and not is_basement_plan
+    _fkz = str(fk_z).strip().lower()
+    is_zubau_new_for_walls = (
+        wizard_pkg_z in ("zubau", "zubau_aufstockung")
+        and _fkz in ("new", "zubau")
+        and not is_basement_plan
+    )
 
     if is_zubau_new_for_walls and isinstance(phase_floor_z, dict):
         lines_z = phase_floor_z.get("zubauWallDemolitionLines") or []
@@ -199,18 +205,8 @@ def calculate_pricing_for_plan(
             if isinstance(custom_demolition_price_z, (int, float)) and float(custom_demolition_price_z) >= 0
             else None
         )
-        inaltime = str(frontend_input.get("inaltimeEtaje") or structura_cladirii.get("inaltimeEtaje") or "")
-        wall_h_m = 2.5
-        if "Komfort" in inaltime or "2,70" in inaltime:
-            wall_h_m = 2.70
-        elif "Hoch" in inaltime or "2,85" in inaltime:
-            wall_h_m = 2.85
-        fhmap = pricing_coeffs.get("_floor_heights_m") if isinstance(pricing_coeffs.get("_floor_heights_m"), dict) else None
-        if fhmap and inaltime and inaltime in fhmap:
-            try:
-                wall_h_m = float(fhmap[inaltime])
-            except Exception:
-                pass
+        fhmap = pricing_coeffs.get("area", {}).get("floor_height_m") if isinstance(pricing_coeffs.get("area"), dict) else None
+        wall_h_m = float(resolve_room_height_m(frontend_input, fhmap))
         if is_top_floor_plan:
             try:
                 ipm = frontend_input.get("inaltimePeretiMansarda")
@@ -406,9 +402,47 @@ def calculate_pricing_for_plan(
     # 
     # În frontend, totalFloors = 1 + etajeIntermediare (ground + etaje intermediare, fără mansardă/pod)
     # Mansardă/Pod este afișat separat dacă există.
-    
+
+    # Primul plan Zubau: editorul salvează *_plan_0, nu *_ground (evită coliziunea cu EG din wizard).
+    use_plan_slug_keys = (
+        wizard_pkg_z in ("zubau", "zubau_aufstockung")
+        and int(plan_index) == 0
+        and _fkz in ("zubau", "new")
+        and not is_basement_plan
+    )
+    # Oferte vechi: datele pot fi încă pe *_ground; folosim plan_0 doar dacă există cel puțin o valoare acolo.
+    if use_plan_slug_keys:
+        wb = wandaufbau_data if isinstance(wandaufbau_data, dict) else {}
+        bdb = frontend_input.get("bodenDeckeBelag", {}) if isinstance(frontend_input, dict) else {}
+        if not isinstance(bdb, dict):
+            bdb = {}
+        plan0_any = (
+            any(str(wb.get(x) or "").strip() for x in ("außenwande_plan_0", "innenwande_plan_0"))
+            or any(
+                str(mat_finisaj.get(x) or "").strip()
+                for x in (
+                    "finisajInterior_plan_0",
+                    "finisajInteriorInnen_plan_0",
+                    "finisajInteriorAussen_plan_0",
+                    "fatada_plan_0",
+                )
+            )
+            or any(
+                str(bdb.get(x) or "").strip()
+                for x in ("bodenaufbau_plan_0", "deckenaufbau_plan_0", "bodenbelag_plan_0")
+            )
+        )
+        if not plan0_any:
+            use_plan_slug_keys = False
+
     # Determinăm cheile de finisaje bazat pe tipul etajului
-    if is_ground_floor:
+    if use_plan_slug_keys:
+        ps = "plan_0"
+        finish_int_key = f"finisajInterior_{ps}"
+        finish_int_inner_key = f"finisajInteriorInnen_{ps}"
+        finish_int_outer_key = f"finisajInteriorAussen_{ps}"
+        finish_ext_key = f"fatada_{ps}"
+    elif is_ground_floor:
         # Ground floor
         finish_int_key = "finisajInterior_ground"
         finish_int_inner_key = "finisajInteriorInnen_ground"
@@ -460,7 +494,9 @@ def calculate_pricing_for_plan(
     )
     
     # Determinăm eticheta etajului pentru afișare în PDF
-    if is_ground_floor:
+    if use_plan_slug_keys:
+        floor_label = "Zubau (Plan 1)"
+    elif is_ground_floor:
         floor_label = "Erdgeschoss"
     elif is_top_floor_plan:
         if is_mansarda:
@@ -510,7 +546,14 @@ def calculate_pricing_for_plan(
     _win = (finish_int_key or "").replace("finisajInterior_", "innenwande_").replace("finisajInteriorMansarda", "innenwandeMansarda").replace("finisajInteriorBeci", "innenwandeBeci")
     sel_aussen = (wandaufbau_data.get(_wau) or "").strip() if _wau else ""
     sel_innen = (wandaufbau_data.get(_win) or "").strip() if _win else ""
-    use_wandaufbau = wandaufbau_coeffs and (sel_aussen or sel_innen or wandaufbau_data.get("außenwande_ground") or wandaufbau_data.get("innenwande_ground"))
+    use_wandaufbau = wandaufbau_coeffs and (
+        sel_aussen
+        or sel_innen
+        or wandaufbau_data.get("außenwande_ground")
+        or wandaufbau_data.get("innenwande_ground")
+        or wandaufbau_data.get("außenwande_plan_0")
+        or wandaufbau_data.get("innenwande_plan_0")
+    )
     if use_wandaufbau:
         aussen_map = wandaufbau_coeffs.get("aussen", {})
         innen_map = wandaufbau_coeffs.get("innen", {})
@@ -554,7 +597,18 @@ def calculate_pricing_for_plan(
     # Podea / tavan: dacă există alegere Bodenaufbau, Deckenaufbau, Bodenbelag per etaj, folosim prețurile din aceste opțiuni
     bdb_data = frontend_input.get("bodenDeckeBelag", {})
     bdb_coeffs = pricing_coeffs.get("boden_decke_belag", {})
-    use_boden_decke_belag = bool(bdb_coeffs and (bdb_data.get("bodenaufbau_ground") or bdb_data.get("deckenaufbau_ground") or bdb_data.get("bodenbelagBeci") or bdb_data.get("deckenaufbauBeci")))
+    use_boden_decke_belag = bool(
+        bdb_coeffs
+        and (
+            bdb_data.get("bodenaufbau_ground")
+            or bdb_data.get("deckenaufbau_ground")
+            or bdb_data.get("bodenbelagBeci")
+            or bdb_data.get("deckenaufbauBeci")
+            or bdb_data.get("bodenaufbau_plan_0")
+            or bdb_data.get("deckenaufbau_plan_0")
+            or bdb_data.get("bodenbelag_plan_0")
+        )
+    )
     if use_boden_decke_belag:
         bodenaufbau_map = bdb_coeffs.get("bodenaufbau", {})
         deckenaufbau_map = bdb_coeffs.get("deckenaufbau", {})
@@ -573,7 +627,9 @@ def calculate_pricing_for_plan(
                 cost_ceil_str = ceiling_area * price_d_beci
                 items.append({"category": "deckenaufbau", "name": f"Deckenaufbau Keller ({opt_decken_beci})", "area_m2": round(ceiling_area, 2), "unit_price": round(price_d_beci, 2), "cost": round(cost_ceil_str, 2)})
         else:
-            if is_ground_floor:
+            if use_plan_slug_keys:
+                suffix = "plan_0"
+            elif is_ground_floor:
                 suffix = "ground"
             elif is_mansarda:
                 suffix = "Mansarda"
@@ -581,7 +637,7 @@ def calculate_pricing_for_plan(
                 suffix = f"floor_{intermediate_floor_index + 1}"
             # Fără beci: la parter nu cerem/calculăm structura podei (Bodenaufbau), doar pardoseală și tavan
             has_basement = tip_fundatie_beci and "Keller" in str(tip_fundatie_beci) and "Kein Keller" not in str(tip_fundatie_beci)
-            skip_bodenaufbau = (suffix == "ground" and not has_basement)
+            skip_bodenaufbau = (suffix == "ground" and not has_basement) and not use_plan_slug_keys
             bodenaufbau_key = "bodenaufbauMansarda" if suffix == "Mansarda" else f"bodenaufbau_{suffix}"
             bodenbelag_key = "bodenbelagMansarda" if suffix == "Mansarda" else f"bodenbelag_{suffix}"
             if not skip_bodenaufbau:
@@ -888,69 +944,40 @@ def calculate_pricing_for_plan(
         basement_type = "locuibil" if has_basement_livable else "nelocuibil"
         print(f"✅ [PRICING] Basement calculat ({basement_type}): {cost_basement['total_cost']:,.0f} EUR")
 
-    # Wintergärten & Balkone: din măsurători (boundary_m + area_m2) când există, altfel pauschal
+    # Balkon: Raster extensions_measurements (Boden). Wintergarten = cameră normală (fără poziții separate).
     cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
-    if is_ground_floor:
-        struct_clad = frontend_input.get("structuraCladirii", {})
-        wg_balkone = frontend_input.get("wintergaertenBalkone", {})
-        wb_coeffs = pricing_coeffs.get("wintergaerten_balkone", {}) or {}
-        bw_measurements = area_data.get("balcon_wintergarden") or []
-        items = []
+    extm = area_data.get("extensions_measurements") if isinstance(area_data, dict) else None
+    if isinstance(extm, dict) and extm:
+        try:
+            bfloor = float(extm.get("balkon_floor_m2") or 0.0)
+            ext_cfg = pricing_coeffs.get("extensions") or {}
+            bf_map = ext_cfg.get("balkon_floor_price_per_m2") or {}
+            sc = frontend_input.get("structuraCladirii") if isinstance(frontend_input.get("structuraCladirii"), dict) else {}
+            bdeck = str(
+                _fv("balkon_boden") or sc.get("balkonBoden") or frontend_input.get("balkonBoden") or "Holz"
+            ).strip()
+            bprice = float(bf_map.get(bdeck, next(iter(bf_map.values()), 95.0)) if bf_map else 95.0)
+            items_bw: list[dict] = []
+            tot_bw = 0.0
+            if bfloor > 0 and bprice > 0:
+                c = round(bfloor * bprice, 2)
+                tot_bw += c
+                items_bw.append(
+                    {
+                        "category": "balkon_floor",
+                        "name": f"Balkonboden ({bdeck})",
+                        "area_m2": round(bfloor, 2),
+                        "unit_price": bprice,
+                        "total_cost": c,
+                    }
+                )
+            if items_bw:
+                cost_wintergaerten_balkone = {"total_cost": round(tot_bw, 2), "detailed_items": items_bw}
+        except Exception as _ex:
+            print(f"      ⚠️ [PRICING] extensions Balkon: {_ex}")
 
-        if bw_measurements:
-            # Cost din lungime perimetru (EUR/m) + suprafață (EUR/m²) pentru podea/tavan
-            for entry in bw_measurements:
-                t = (entry.get("type") or "balcon").strip().lower()
-                boundary_m = float(entry.get("boundary_m") or 0)
-                area_m2 = float(entry.get("area_m2") or 0)
-                idx = entry.get("index", 0)
-                if t == "balcon" and struct_clad.get("hasBalkone"):
-                    typ = (wg_balkone.get("balkonTyp") or "").strip() or "default"
-                    coeffs = (wb_coeffs.get("balkon") or {})
-                    raw = coeffs.get(typ) if isinstance(coeffs, dict) else None
-                    if isinstance(raw, (int, float)):
-                        eur_m, eur_m2 = float(raw), 0.0
-                    elif isinstance(raw, dict):
-                        eur_m = float(raw.get("perimeter_eur_m") or raw.get("eur_m", 0))
-                        eur_m2 = float(raw.get("area_eur_m2", 0))
-                    else:
-                        eur_m = float(coeffs.get("perimeter_eur_m", 0) or coeffs.get("eur_m", 0)) if isinstance(coeffs, dict) else 0.0
-                        eur_m2 = float(coeffs.get("area_eur_m2", 0)) if isinstance(coeffs, dict) else 0.0
-                    cost = boundary_m * eur_m + area_m2 * eur_m2
-                    name = f"Balkon {idx + 1}" if len(bw_measurements) > 1 else "Balkone"
-                    items.append({"category": "balkon", "name": name, "cost": round(cost, 2), "total_cost": round(cost, 2), "boundary_m": boundary_m, "area_m2": area_m2})
-                elif t == "wintergarden" and struct_clad.get("hasWintergarden"):
-                    typ = (wg_balkone.get("wintergartenTyp") or "").strip() or "default"
-                    coeffs = (wb_coeffs.get("wintergarten") or {})
-                    raw = coeffs.get(typ) if isinstance(coeffs, dict) else None
-                    if isinstance(raw, (int, float)):
-                        eur_m, eur_m2 = float(raw), 0.0
-                    elif isinstance(raw, dict):
-                        eur_m = float(raw.get("perimeter_eur_m") or raw.get("eur_m", 0))
-                        eur_m2 = float(raw.get("area_eur_m2", 0))
-                    else:
-                        eur_m = float(coeffs.get("perimeter_eur_m", 0) or coeffs.get("eur_m", 0)) if isinstance(coeffs, dict) else 0.0
-                        eur_m2 = float(coeffs.get("area_eur_m2", 0)) if isinstance(coeffs, dict) else 0.0
-                    cost = boundary_m * eur_m + area_m2 * eur_m2
-                    name = f"Wintergarten {idx + 1}" if len(bw_measurements) > 1 else "Wintergärten"
-                    items.append({"category": "wintergarten", "name": name, "cost": round(cost, 2), "total_cost": round(cost, 2), "boundary_m": boundary_m, "area_m2": area_m2})
-        if not items and (struct_clad.get("hasWintergarden") or struct_clad.get("hasBalkone")):
-            # Fallback pauschal (preț fix per tip)
-            if struct_clad.get("hasWintergarden") and wg_balkone.get("wintergartenTyp"):
-                typ = (wg_balkone.get("wintergartenTyp") or "").strip()
-                price = float(wb_coeffs.get("wintergarten", {}).get(typ, 0) if isinstance(wb_coeffs.get("wintergarten"), dict) else 0)
-                items.append({"category": "wintergarten", "name": f"Wintergärten ({typ})", "cost": round(price, 2), "total_cost": round(price, 2)})
-            if struct_clad.get("hasBalkone") and wg_balkone.get("balkonTyp"):
-                typ = (wg_balkone.get("balkonTyp") or "").strip()
-                price = float(wb_coeffs.get("balkon", {}).get(typ, 0) if isinstance(wb_coeffs.get("balkon"), dict) else 0)
-                items.append({"category": "balkon", "name": f"Balkone ({typ})", "cost": round(price, 2), "total_cost": round(price, 2)})
-        if items:
-            cost_wintergaerten_balkone = {"total_cost": round(sum(i.get("cost", 0) for i in items), 2), "detailed_items": items}
-            if include_finishes:
-                total_plan_cost += cost_wintergaerten_balkone["total_cost"]
-                print(f"✅ [PRICING] Wintergärten & Balkone: {cost_wintergaerten_balkone['total_cost']:,.0f} EUR")
-            else:
-                cost_wintergaerten_balkone = {"total_cost": 0.0, "detailed_items": []}
+    if include_finishes and float(cost_wintergaerten_balkone.get("total_cost") or 0.0) > 0:
+        total_plan_cost = round(total_plan_cost + float(cost_wintergaerten_balkone["total_cost"]), 2)
 
     # Aufstockung Phase 1 (Bestand): per-floor Rückbau / Treppenöffnung / Statik.
     cost_aufstockung_phase1 = {"total_cost": 0.0, "detailed_items": []}
@@ -978,9 +1005,18 @@ def calculate_pricing_for_plan(
     # Aufstockung: dacă există orice tip de Keller în structura clădirii, beciul este mereu tratat ca Bestand.
     tip_fundatie_beci_for_kind = str((frontend_input.get("structuraCladirii", {}) or {}).get("tipFundatieBeci") or "")
     has_keller_in_structure = "Keller" in tip_fundatie_beci_for_kind and "Kein Keller" not in tip_fundatie_beci_for_kind
-    if wizard_package in ("aufstockung", "zubau") and is_basement_plan and has_keller_in_structure:
+    if wizard_package in ("aufstockung", "zubau", "zubau_aufstockung") and is_basement_plan and has_keller_in_structure:
         floor_kind = "bestand"
-    is_existing_aufstockung_floor = wizard_package in ("aufstockung", "zubau") and floor_kind != "new"
+    floor_kind_norm = str(floor_kind).strip().lower()
+    is_unified_offer = wizard_package in ("aufstockung", "zubau", "zubau_aufstockung")
+    is_existing_aufstockung_floor = is_unified_offer and floor_kind_norm not in ("new", "zubau", "aufstockung")
+    is_zubau_floor = is_unified_offer and floor_kind_norm in ("new", "zubau")
+    global_combined_price = (
+        float(phase1_data.get("globalCombinedPrice"))
+        if isinstance(phase1_data, dict) and isinstance(phase1_data.get("globalCombinedPrice"), (int, float))
+        else None
+    )
+    use_global_combined_price = global_combined_price is not None and global_combined_price >= 0
 
     if is_existing_aufstockung_floor and isinstance(phase_floor, dict):
         raw_params = pricing_coeffs.get("_raw_params", {}) or {}
@@ -992,6 +1028,8 @@ def calculate_pricing_for_plan(
             if isinstance(custom_demolition_price, (int, float)) and float(custom_demolition_price) >= 0
             else None
         )
+        if use_global_combined_price:
+            custom_demolition_total = None
         # Rows with positive area from editor; demolition price is entered directly by user.
         demo_rows: list[tuple[int, float]] = []
         for idx, sel in enumerate(demolition_items):
@@ -1051,7 +1089,7 @@ def calculate_pricing_for_plan(
             })
 
         statik = phase_floor.get("statikChoice", {}) or {}
-        if isinstance(statik, dict):
+        if isinstance(statik, dict) and not use_global_combined_price:
             custom_price = float(statik.get("customPiecePrice") or 0.0)
             if custom_price > 0:
                 items_phase1.append({
@@ -1070,7 +1108,7 @@ def calculate_pricing_for_plan(
             total_plan_cost += cost_aufstockung_phase1["total_cost"]
 
     if (
-        wizard_package == "zubau"
+        is_zubau_floor
         and not is_existing_aufstockung_floor
         and cost_zubau_wall_demolition_items
     ):
@@ -1083,10 +1121,11 @@ def calculate_pricing_for_plan(
         }
 
     if (
-        wizard_package == "zubau"
+        is_zubau_floor
         and not is_existing_aufstockung_floor
         and isinstance(phase_floor, dict)
         and not cost_zubau_wall_demolition_items
+        and not use_global_combined_price
     ):
         cdp = phase_floor.get("customDemolitionPrice")
         if cdp is not None:
@@ -1109,6 +1148,22 @@ def calculate_pricing_for_plan(
                     total_plan_cost = round(total_plan_cost + cdp_f, 2)
             except (TypeError, ValueError):
                 pass
+
+    if use_global_combined_price and plan_index == 0:
+        prev_items = list(cost_aufstockung_phase1.get("detailed_items") or [])
+        prev_total = float(cost_aufstockung_phase1.get("total_cost") or 0.0)
+        prev_items.append({
+            "category": "aufstockung_global_combined",
+            "name": "Abbruch + Statik (global)",
+            "quantity": 1.0,
+            "unit_price": round(float(global_combined_price or 0.0), 2),
+            "total_cost": round(float(global_combined_price or 0.0), 2),
+        })
+        cost_aufstockung_phase1 = {
+            "total_cost": round(prev_total + float(global_combined_price or 0.0), 2),
+            "detailed_items": prev_items,
+        }
+        total_plan_cost = round(total_plan_cost + float(global_combined_price or 0.0), 2)
 
     if is_existing_aufstockung_floor:
         # Existing-floor Aufstockung pricing: keep only roof + phase1 editor-driven items.

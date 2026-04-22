@@ -1,5 +1,7 @@
 import re
 
+from pricing.height_resolve import resolve_door_height_m
+
 
 def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float:
     t = str(obj_type or "").lower()
@@ -101,15 +103,6 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
     windows_prices = coeffs.get("windows_price_per_m2", {})
     window_quality = _resolve_window_quality(frontend_data, ferestre_usi)
     window_price_per_m2 = float(windows_prices.get(window_quality, windows_prices.get("3-fach verglast", 0)))
-    sliding_prices = coeffs.get("sliding_door_prices_per_m2", {}) or {}
-    sliding_type = _pick_ferestre_field(
-        frontend_data,
-        ferestre_usi,
-        field="slidingDoorType",
-        tag="sliding_door_type",
-        default="Standard",
-    )
-    sliding_price_per_m2 = float(sliding_prices.get(sliding_type, sliding_prices.get("Standard", 0)))
 
     garage_prices = coeffs.get("garage_door_prices", {}) or {}
     garage_type = _pick_ferestre_field(
@@ -129,17 +122,7 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
         garage_prices.get(garage_type, garage_prices.get("Sektionaltor Standard", 0)),
     )
 
-    door_height_map = coeffs.get("door_height_m", {}) or {}
-    door_height_label = (
-        (ferestre_usi.get("doorHeightOption") or ferestre_usi.get("turhohe") or "Standard (2,01 m)")
-        if frontend_data
-        else "Standard (2,01 m)"
-    )
-    selected_door_height_m = float(door_height_map.get(door_height_label, 2.05))
-    if door_height_label not in door_height_map:
-        parsed_h = _parse_height_from_label(door_height_label)
-        if parsed_h and parsed_h > 0:
-            selected_door_height_m = parsed_h
+    selected_door_height_m = resolve_door_height_m(frontend_data, coeffs.get("door_height_m"))
 
     for op in openings_list:
         obj_type = op.get("type", "unknown")
@@ -195,14 +178,10 @@ def calculate_openings_details(coeffs: dict, openings_list: list, frontend_data:
             door_status = op.get("status", "interior")
         else:
             is_exterior = True
-            if ot == "sliding_door":
-                cost = area * sliding_price_per_m2
-                price_factor = sliding_price_per_m2
-                material_label = sliding_type
-            else:
-                cost = area * window_price_per_m2
-                price_factor = window_price_per_m2
-                material_label = window_quality
+            # Schiebetüren: gleicher €/m² wie gewählte Glasfläche / Fensterart
+            cost = area * window_price_per_m2
+            price_factor = window_price_per_m2
+            material_label = window_quality
             unit_label = "€/m²"
             door_status = None
 

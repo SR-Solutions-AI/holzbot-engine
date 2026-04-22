@@ -774,7 +774,8 @@ def generate_walls_from_room_coordinates(
     
     output_dir = Path(steps_dir) / "raster_processing" / "walls_from_coords"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+    _extensions_holder: Dict[str, Any] = {}
+
     h_orig, w_orig = original_img.shape[:2]
 
     # Plan complet pe disc pentru Gemini (openings cu context). Pe calea manuală nu exista `original_path`.
@@ -935,8 +936,20 @@ def generate_walls_from_room_coordinates(
         # 09_interior.png din aceleași poligoane (spațiu liber raster) ca ordinea să coincidă cu Gemini și editorul
         if rooms_polygons:
             interior_img_skip = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-            for rp in rooms_polygons:
-                cv2.fillPoly(interior_img_skip, [rp], [0, 165, 255])
+            try:
+                from . import walls_extensions as _wext
+
+                int_skip = np.zeros((h_orig, w_orig), dtype=np.uint8)
+                for rp in rooms_polygons:
+                    cv2.fillPoly(int_skip, [rp], 255)
+                rt_list = _wext.load_room_types_parallel(raster_dir, len(rooms_polygons))
+                vis_skip, _, _, _ = _wext.build_typed_interior_layer(
+                    h_orig, w_orig, int_skip, rooms_polygons, rt_list
+                )
+                interior_img_skip[int_skip > 0] = vis_skip[int_skip > 0]
+            except Exception:
+                for rp in rooms_polygons:
+                    cv2.fillPoly(interior_img_skip, [rp], [0, 165, 255])
             cv2.imwrite(str(output_dir / "09_interior.png"), interior_img_skip)
             _log(f"      💾 Salvat: 09_interior.png (skip path, aceleași camere ca pentru Gemini)")
         # Poligoanele sunt cele de la rooms (boss); după modificări le folosim pentru walls_from_coords
@@ -1790,6 +1803,48 @@ def generate_walls_from_room_coordinates(
         except Exception as e:
             _log(f"      ⚠️ Skeleton 1px pentru 01_walls_from_coords eșuat: {e}")
 
+    # --- Balkon / Wintergarten: interior colorat, parapet / perete sticlă, eliminare din masca 01 + vizualizări ---
+    try:
+        from . import walls_extensions as _wext
+
+        polys_for_types = (
+            rooms_polygons_original if len(rooms_polygons_original) > 0 else rooms_polygons
+        )
+        rt_list = _wext.load_room_types_parallel(raster_dir, len(polys_for_types))
+        flood_ext_vis, interior_vis_mask = _wext.flood_exterior_from_wall_1px(accepted_wall_segments_mask)
+        vis_bgr, b_m, w_m, main_m = _wext.build_typed_interior_layer(
+            h_orig, w_orig, interior_vis_mask, polys_for_types, rt_list
+        )
+        parapet = _wext.mask_balkon_parapet_walls(
+            accepted_wall_segments_mask, b_m, main_m, flood_ext_vis
+        )
+        wg_glass = _wext.mask_wintergarten_exterior_glass_walls(
+            accepted_wall_segments_mask, w_m, main_m, flood_ext_vis
+        )
+        stripped = _wext.strip_masks_from_wall_binary(accepted_wall_segments_mask, parapet, wg_glass)
+        accepted_wall_segments_mask = stripped
+        walls_mask_validated = accepted_wall_segments_mask.copy()
+        walls_overlay_mask = accepted_wall_segments_mask.copy()
+        _extensions_holder["balkon_floor_px"] = int(np.count_nonzero(b_m > 0))
+        _extensions_holder["wintergarten_floor_px"] = int(np.count_nonzero(w_m > 0))
+        _extensions_holder["wintergarten_glass_wall_px"] = int(np.count_nonzero(wg_glass > 0))
+        _extensions_holder["balkon_parapet_wall_px"] = int(np.count_nonzero(parapet > 0))
+        seg_bin = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+        seg_bin[accepted_wall_segments_mask > 0] = (255, 255, 255)
+        marked = _wext.compose_01_walls_marked(seg_bin, vis_bgr)
+        ext13 = _wext.compose_13_extensions(parapet, wg_glass)
+        _bp = 20
+        _H, _W = h_orig + 2 * _bp, w_orig + 2 * _bp
+        marked_b = np.zeros((_H, _W, 3), dtype=np.uint8)
+        ext13_b = np.zeros((_H, _W, 3), dtype=np.uint8)
+        marked_b[_bp : _bp + h_orig, _bp : _bp + w_orig] = marked
+        ext13_b[_bp : _bp + h_orig, _bp : _bp + w_orig] = ext13
+        cv2.imwrite(str(output_dir / "01_walls_from_coords_marked.png"), marked_b)
+        cv2.imwrite(str(output_dir / "13_extensions.png"), ext13_b)
+        _log("      💾 Salvat: 01_walls_from_coords_marked.png, 13_extensions.png (Balkon/Wintergarten)")
+    except Exception as e:
+        _log(f"      ⚠️ Balkon/Wintergarten extensions: {e}")
+
     # Acoperiș: fără regulă balcon din zone Gemini/OCR; mască = pereții finali după flood cleanup.
     walls_mask_for_roof = accepted_wall_segments_mask.copy()
     include_balcon_in_roof = False
@@ -2069,14 +2124,23 @@ def generate_walls_from_room_coordinates(
         traceback.print_exc()
         rendering_success = False
     
-    # 9. Generăm interiorul casei (pixelii negri din flood fill devin portocaliu) -> 09_interior.png
+    # 9. Generăm interiorul casei -> 09_interior.png (Balkon albastru, camere + Wintergarten mov; legacy portocaliu la fallback)
     _log(f"      🏠 Generez interiorul casei...")
     interior_img = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-    
-    # Pixelii negri (nu au fost atinși de flood fill) devin portocaliu
     interior_mask = (flood_fill_result == 0) & (walls_thick == 0)
-    interior_img[interior_mask] = [0, 165, 255]  # BGR: portocaliu
-    
+    try:
+        from . import walls_extensions as _wext
+
+        polys_09 = rooms_polygons_original if len(rooms_polygons_original) > 0 else rooms_polygons
+        rt_09 = _wext.load_room_types_parallel(raster_dir, len(polys_09))
+        vis_09, _, _, _ = _wext.build_typed_interior_layer(
+            h_orig, w_orig, (interior_mask.astype(np.uint8) * 255), polys_09, rt_09
+        )
+        interior_img[interior_mask] = vis_09[interior_mask]
+    except Exception as e:
+        _log(f"      ⚠️ 09_interior culori tip cameră fallback portocaliu: {e}")
+        interior_img[interior_mask] = [0, 165, 255]
+
     cv2.imwrite(str(output_dir / "09_interior.png"), interior_img)
     _log(f"      💾 Salvat: 09_interior.png")
     _tick()
@@ -3027,6 +3091,22 @@ Respond ONLY with JSON: {"type": "window"} or {"type": "door"} or {"type": "stai
         with open(output_dir / "room_scales.json", 'w', encoding='utf-8') as f:
             json.dump(scale_data, f, indent=2, ensure_ascii=False)
         _log(f"      💾 Salvat: room_scales.json ({len(room_scales)} camere)")
+        if _extensions_holder:
+            try:
+                from .walls_extensions import write_extensions_json
+
+                write_extensions_json(
+                    output_dir / "extensions_measurements.json",
+                    float(m_px) if m_px is not None and float(m_px) > 0 else None,
+                    int(_extensions_holder.get("balkon_floor_px", 0)),
+                    int(_extensions_holder.get("wintergarten_floor_px", 0)),
+                    int(_extensions_holder.get("wintergarten_glass_wall_px", 0)),
+                    int(_extensions_holder.get("balkon_parapet_wall_px", 0)),
+                    None,
+                )
+                _log("      💾 Salvat: extensions_measurements.json (Balkon / Wintergarten)")
+            except Exception as _ex:
+                _log(f"      ⚠️ extensions_measurements.json: {_ex}")
         _tick()
     except Exception as e:
         import traceback

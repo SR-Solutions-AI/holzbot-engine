@@ -189,7 +189,7 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
     frontend_data = _enrich_frontend_with_aufstockung_phase1(frontend_data, job_root)
     roof_only_offer = bool(frontend_data.get("roof_only_offer"))
     wizard_package = str(frontend_data.get("wizard_package") or "").strip().lower()
-    is_aufstockung_offer = wizard_package == "aufstockung"
+    is_aufstockung_offer = wizard_package in ("aufstockung", "zubau", "zubau_aufstockung")
 
     plans = load_plan_infos(run_id, "scale")
     if not plans:

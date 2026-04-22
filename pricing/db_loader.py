@@ -55,6 +55,14 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
         if _k not in data_map:
             data_map[_k] = _v
 
+    for _k, _v in (
+        ("balkon_boden_holz_price", 95.0),
+        ("balkon_boden_wpc_price", 110.0),
+        ("balkon_boden_fliesen_price", 85.0),
+    ):
+        if _k not in data_map:
+            data_map[_k] = _v
+
     # Baustellenzufahrt (accesSantier): toate cele 3 opțiuni din form influențează prețul
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
     _heat_base = float(data_map.get("heating_base_price", 70.0))
@@ -232,12 +240,6 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "3-fach verglast": data_map.get("window_3_fach_price", data_map.get("window_3fach_verglast_price", 420)),
                 "3-fach verglast, Passiv": data_map.get("window_3fach_passiv_price", 580),
             },
-            "sliding_door_prices_per_m2": {
-                "Standard": float(data_map.get("sliding_door_standard_price", 690)),
-                "Hebeschiebetür": float(data_map.get("sliding_door_hebeschiebetuer_price", 880)),
-                "Panorama": float(data_map.get("sliding_door_panorama_price", 1040)),
-                "Aluminium Premium": float(data_map.get("sliding_door_aluminium_premium_price", 980)),
-            },
             # Garagentor: €/Stück (doar dacă formular: Garagentor gewünscht)
             "garage_door_prices": {
                 "Sektionaltor Standard": float(
@@ -254,6 +256,13 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Standard (2,01 m)": float(data_map.get("door_height_standard_m", 2.01)),
                 "Komfort (2,10 m)": float(data_map.get("door_height_komfort_m", 2.10)),
                 "Hoch (2,20 m)": float(data_map.get("door_height_hoch_m", 2.20)),
+            },
+        },
+        "extensions": {
+            "balkon_floor_price_per_m2": {
+                "Holz": float(data_map.get("balkon_boden_holz_price", 95)),
+                "WPC": float(data_map.get("balkon_boden_wpc_price", 110)),
+                "Fliesen": float(data_map.get("balkon_boden_fliesen_price", 85)),
             },
         },
         "area": {
@@ -349,17 +358,6 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Beton 30cm": data_map.get("wandaufbau_innen_beton_30", 160),
             },
         },
-        "wintergaerten_balkone": {
-            "wintergarten": {
-                "Glaswand": data_map.get("wintergarten_glaswand_price", 560),
-                "Plexiglaswand": data_map.get("wintergarten_plexiglaswand_price", 150),
-            },
-            "balkon": {
-                "Holzgeländer": data_map.get("balkon_holzgelander_price", 560),
-                "Stahlgeländer": data_map.get("balkon_stahlgelander_price", 150),
-                "Glasgeländer": data_map.get("balkon_glasgelander_price", 700),
-            },
-        },
         "boden_decke_belag": {
             "bodenaufbau": {
                 "Geschossdecke Holz Standard": data_map.get("bodenaufbau_holz_standard_price", 560),
@@ -405,8 +403,6 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                     out.setdefault("finishes", {}).setdefault("interior_inner", {})[label] = val
                 elif tag == "interior_finish_exterior_walls":
                     out.setdefault("finishes", {}).setdefault("interior_outer", {})[label] = val
-                elif tag == "sliding_door_type":
-                    out.setdefault("openings", {}).setdefault("sliding_door_prices_per_m2", {})[label] = val
                 elif tag == "garage_door_type":
                     out.setdefault("openings", {}).setdefault("garage_door_prices", {})[label] = val
                 elif tag == "door_height":

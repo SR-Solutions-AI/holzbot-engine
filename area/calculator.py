@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 from typing import Dict
-import re
+
+from pricing.height_resolve import resolve_door_height_m, resolve_room_height_m
 
 from .config import (
     STANDARD_WALL_HEIGHT_M,
@@ -29,18 +30,6 @@ def _infer_window_height_from_width(width_m: float, obj_type: str = "") -> float
     if width_m >= 1.35:
         return 1.5
     return 1.0
-
-
-def _parse_height_from_label(label: str | None) -> float | None:
-    if not label:
-        return None
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m", str(label).lower())
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", "."))
-    except Exception:
-        return None
 
 
 def calculate_areas_for_plan(
@@ -75,24 +64,13 @@ def calculate_areas_for_plan(
     interior_length_m_structure = float(avg.get("interior_meters_structure", avg.get("interior_meters", 0.0)))  # Skeleton interior
     # Exterior rămâne același (outline albastru) pentru structură
     
-    # Determinăm înălțimea pereților: din Preisdatenbank (floor_height_m_by_option) sau fallback din eticheta din formular
-    wall_height_m = STANDARD_WALL_HEIGHT_M  # Default
-    if frontend_data:
-        inaltime_etaje = frontend_data.get("inaltimeEtaje", "")
-        if floor_height_m_by_option and inaltime_etaje and inaltime_etaje in floor_height_m_by_option:
-            wall_height_m = float(floor_height_m_by_option[inaltime_etaje])
-        elif "Komfort" in inaltime_etaje or "2,70" in inaltime_etaje:
-            wall_height_m = 2.70
-        elif "Hoch" in inaltime_etaje or "2,85" in inaltime_etaje:
-            wall_height_m = 2.85
-        else:
-            wall_height_m = 2.50
-
-        # Pentru ultimul etaj (mansardă), folosim înălțimea pereților mansardei dacă e specificată
-        if is_top_floor:
-            inaltime_pereti_mansarda = frontend_data.get("inaltimePeretiMansarda")
-            if inaltime_pereti_mansarda and float(inaltime_pereti_mansarda) > 0:
-                wall_height_m = float(inaltime_pereti_mansarda)
+    wall_height_m = float(
+        resolve_room_height_m(frontend_data, floor_height_m_by_option),
+    )
+    if frontend_data and is_top_floor:
+        inaltime_pereti_mansarda = frontend_data.get("inaltimePeretiMansarda")
+        if inaltime_pereti_mansarda and float(inaltime_pereti_mansarda) > 0:
+            wall_height_m = float(inaltime_pereti_mansarda)
 
     _h_extra = float(WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M)
     # Finisaj interior: strict înălțimea din formular. Structură int/ext + finisaj exterior: +18 cm.
@@ -130,23 +108,10 @@ def calculate_areas_for_plan(
     # Prioritate: height_m din detecție/editor, fallback pe euristică din lățime.
     window_height_m_default = STANDARD_WINDOW_HEIGHT_M  # fallback final
 
-    selected_door_height_m = STANDARD_DOOR_HEIGHT_M
-    if frontend_data:
-        fu = frontend_data.get("ferestreUsi") if isinstance(frontend_data.get("ferestreUsi"), dict) else frontend_data
-        selected_door_height_label = (
-            fu.get("doorHeightOption") or fu.get("turhohe")
-        ) if isinstance(fu, dict) else None
-        if (
-            door_height_m_by_option
-            and selected_door_height_label
-            and selected_door_height_label in door_height_m_by_option
-        ):
-            selected_door_height_m = float(door_height_m_by_option[selected_door_height_label])
-        else:
-            parsed_h = _parse_height_from_label(selected_door_height_label)
-            if parsed_h and parsed_h > 0:
-                selected_door_height_m = parsed_h
-    
+    selected_door_height_m = float(
+        resolve_door_height_m(frontend_data, door_height_m_by_option),
+    )
+
     for opening in openings_all:
         obj_type = opening.get("type", "").lower()
         width_m = float(opening.get("width_m", 0.0))

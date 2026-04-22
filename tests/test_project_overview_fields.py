@@ -20,7 +20,7 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
             },
             "structuraCladirii": {
                 "tipFundatieBeci": "Keller (mit Ausbau)",
-                "inaltimeEtaje": "Komfort (2,70 m)",
+                "raumhoeheCm": 270,
                 "treppeTyp": "Holz",
             },
             "daemmungDachdeckung": {
@@ -36,20 +36,14 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
                 "windowQuality": "3-fach verglast",
                 "doorMaterialInterior": "Holz",
                 "doorMaterialExterior": "Aluminium",
-                "slidingDoorType": "Panorama",
+                "tuerhoeheCm": 210,
                 "garagentorGewuenscht": True,
                 "garageDoorType": "Rolltor",
             },
             "materialeFinisaj": {"materialAcoperis": "Țiglă"},
             "performantaEnergetica": {
                 "tipIncalzire": "Wärmepumpe",
-                "nivelEnergetic": "KfW 40",
                 "tipSemineu": "Klassischer Holzofen",
-                "ventilatie": True,
-            },
-            "wintergaertenBalkone": {
-                "wintergartenTyp": "Glaswand",
-                "balkonTyp": "Glasgeländer",
             },
             "wandaufbau": {
                 "außenwande_ground": "CLT 35cm",
@@ -65,9 +59,6 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
                     "window_quality": [
                         {"label": "Premium Glas Plus", "value": "3-fach verglast", "price_key": "window_quality_3fach_price"}
                     ],
-                    "sliding_door_type": [
-                        {"label": "Panorama XL", "value": "Panorama", "price_key": "sliding_door_panorama_price"}
-                    ],
                     "interior_finish_interior_walls": [
                         {"label": "Innenputz Fine", "value": "Tencuială", "price_key": "interior_tencuiala"}
                     ],
@@ -77,12 +68,10 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
                 },
                 "paramLabelOverrides": {
                     "window_quality_3fach_price": "Premium Glas Plus",
-                    "sliding_door_panorama_price": "Panorama XL",
                     "interior_tencuiala": "Innenputz Fine",
                     "garage_door_sectional_price": "Sektionaltor Premium",
                     "tip_semineu_holzofen_price": "Holzofen",
                     "tip_incalzire_waermepumpe_price": "Pelletheizung",
-                    "nivel_energetic_kfw40_price": "Effizienzhaus 40",
                     "bodenbelag_parkett_price": "Vinyl / Designboden",
                     "deckenaufbau_gipskarton_akustik_price": "Holz-Beton-Verbunddecke",
                     "bodenbelag_2_price": "Vinyl / Designboden",
@@ -117,13 +106,11 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
         joined = "\n".join(items)
 
         for expected in [
-            "Fensterart",
+            "Glasflächen / Fensterart",
+            "Türhöhe",
             "Innentüren",
             "Außentüren",
-            "Schiebetür",
             "Garagentor",
-            "Wintergarten",
-            "Balkon",
             "Wandaufbau Außenwände",
             "Wandaufbau Innenwände",
             "Bodenaufbau",
@@ -133,17 +120,16 @@ class ProjectOverviewFieldsTest(unittest.TestCase):
             "Raumhöhe",
             "Sichtdachstuhl",
             "Dachfenster",
-            "Lüftung / Wärmerückgewinnung",
         ]:
             self.assertIn(expected, joined)
 
         self.assertIn("Premium Glas Plus", joined)
-        self.assertIn("Panorama XL", joined)
+        self.assertIn("210 cm", joined)
+        self.assertIn("270 cm", joined)
         self.assertIn("Innenputz Fine", joined)
         self.assertIn("Sektionaltor Premium", joined)
         self.assertIn("Holzofen", joined)
         self.assertIn("Pelletheizung", joined)
-        self.assertIn("Effizienzhaus 40", joined)
         self.assertIn("Vinyl / Designboden", joined)
         self.assertTrue(
             "Holz-Beton-Verbunddecke" in joined or "Brettsperrholzdecke massiv (CLT)" in joined

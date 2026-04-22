@@ -49,10 +49,20 @@ def _compute_interior_mask_area_m2(scale_dir: Path) -> tuple[float | None, int |
     img = cv2.imread(str(interior_png), cv2.IMREAD_COLOR)
     if img is None:
         return None, None, None
-    # 09_interior uses orange BGR around [0,165,255]; use tolerance for robustness.
-    lower = np.array([0, 120, 200], dtype=np.uint8)
-    upper = np.array([80, 210, 255], dtype=np.uint8)
-    mask = cv2.inRange(img, lower, upper)
+    # 09_interior: portocaliu legacy + mov / albastru / verde (Balkon / Wintergarten)
+    lower_o = np.array([0, 120, 200], dtype=np.uint8)
+    upper_o = np.array([80, 210, 255], dtype=np.uint8)
+    m_orange = cv2.inRange(img, lower_o, upper_o)
+    lower_p = np.array([200, 0, 200], dtype=np.uint8)
+    upper_p = np.array([255, 60, 255], dtype=np.uint8)
+    m_purple = cv2.inRange(img, lower_p, upper_p)
+    lower_b = np.array([200, 0, 0], dtype=np.uint8)
+    upper_b = np.array([255, 50, 50], dtype=np.uint8)
+    m_blue = cv2.inRange(img, lower_b, upper_b)
+    lower_g = np.array([0, 200, 0], dtype=np.uint8)
+    upper_g = np.array([50, 255, 50], dtype=np.uint8)
+    m_green = cv2.inRange(img, lower_g, upper_g)
+    mask = cv2.bitwise_or(cv2.bitwise_or(m_orange, m_purple), cv2.bitwise_or(m_blue, m_green))
     area_px = int(np.count_nonzero(mask))
     if area_px <= 0:
         return None, 0, mpp
@@ -339,6 +349,33 @@ def _run_for_single_plan(
                     floor_height_m_by_option=pricing_coeffs.get("area", {}).get("floor_height_m"),
                     door_height_m_by_option=pricing_coeffs.get("openings", {}).get("door_height_m"),
                 )
+                ext_json = (
+                    scale_dir
+                    / "cubicasa_steps"
+                    / "raster_processing"
+                    / "walls_from_coords"
+                    / "extensions_measurements.json"
+                )
+                if ext_json.exists():
+                    try:
+                        ext_raw = json.loads(ext_json.read_text(encoding="utf-8"))
+                        from pricing.height_resolve import resolve_room_height_m
+
+                        rh = resolve_room_height_m(
+                            frontend_data if isinstance(frontend_data, dict) else {},
+                            pricing_coeffs.get("area", {}).get("floor_height_m")
+                            if isinstance(pricing_coeffs, dict)
+                            else None,
+                        )
+                        mpp_e = ext_raw.get("mpp")
+                        wg_px = float(ext_raw.get("wintergarten_glass_wall_px") or 0)
+                        if mpp_e and float(mpp_e) > 0 and wg_px > 0 and rh > 0:
+                            ext_raw["wintergarten_glass_facade_m2"] = round(
+                                wg_px * float(mpp_e) * float(rh), 4
+                            )
+                        area_data["extensions_measurements"] = ext_raw
+                    except Exception as e:
+                        print(f"       ⚠️ extensions_measurements.json: {e}")
                 area_data["surface_area_source"] = area_source
                 if area_source == "09_interior_mask":
                     area_data["surface_area_from_09_interior_px"] = int(total_area_px or 0)
@@ -390,6 +427,17 @@ def _run_for_single_plan(
         floor_type = area_data.get("floor_type", "unknown")
         is_ground_floor = ("ground" in floor_type or "parter" in floor_type) or (total_plans == 1)
         is_top_floor = ("top" in floor_type.lower() or "mansard" in floor_type.lower())
+
+        # În fluxurile Aufstockung/Zubau, floor_type din area_data poate rămâne "ground" pentru toate planurile
+        # după editări în review editor; folosim ordinea planurilor pentru a evita maparea greșită a finisajelor.
+        wizard_pkg = str(frontend_data.get("wizard_package") or "").strip().lower() if isinstance(frontend_data, dict) else ""
+        if wizard_pkg in ("aufstockung", "zubau", "zubau_aufstockung") and total_plans > 1:
+            non_basement_indices = [i for i in range(total_plans) if basement_plan_index is None or i != basement_plan_index]
+            if non_basement_indices:
+                ground_idx = non_basement_indices[0]
+                top_idx = non_basement_indices[-1]
+                is_ground_floor = plan_index == ground_idx
+                is_top_floor = plan_index == top_idx
 
         # ✅ PRIORITATE: Folosim openings din raster dacă există (FĂRĂ fallback)
         openings_data = []
