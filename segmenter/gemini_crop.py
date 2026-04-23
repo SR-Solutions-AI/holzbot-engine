@@ -8,13 +8,16 @@ Format așteptat: [{"box_2d": [ymin, xmin, ymax, xmax], "label": "..."}, ...] cu
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
-from .classifier import ClassificationResult, ConfidenceLevel, setup_gemini_client, setup_openai_client
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, gemini_api_key, generate_json
+
+from .classifier import ClassificationResult, ConfidenceLevel, setup_gemini_client
 from .common import STEP_DIRS
 
 _GEMINI_SAFETY = [
@@ -337,31 +340,38 @@ Text from the other AI:
 ---"""
 
 
-def _repair_json_with_chatgpt(raw_gemini_text: str) -> list[dict[str, Any]]:
-    """La eroare de parsare, trimite răspunsul Gemini la ChatGPT ca să returneze JSON corect."""
-    client = setup_openai_client()
-    if not client:
-        print("   [Gemini Crop] ChatGPT indisponibil (OPENAI_API_KEY) – nu pot repara JSON.")
+def _repair_json_with_gemini_second_pass(raw_gemini_text: str) -> list[dict[str, Any]]:
+    """La eroare de parsare, al doilea apel Gemini (REST) reconstruiește JSON-ul (array de cutii)."""
+    api_key = gemini_api_key()
+    if not api_key:
+        print("   [Gemini Crop] GEMINI_API_KEY lipsește – nu pot repara JSON.")
         return []
-    # Trimitem tot răspunsul (până la 25k caractere) ca ChatGPT să vadă toate zonele (ex. KG, EG, OG)
     prompt = PROMPT_REPAIR_JSON.format(raw_text=raw_gemini_text[:25000])
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
+        result = generate_json(
+            api_key,
+            [{"text": prompt}],
+            system_instruction="Return ONLY a JSON array as specified. No markdown.",
+            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             temperature=0.0,
-            max_tokens=4096,
+            max_output_tokens=8192,
+            timeout=120,
         )
-        text = (response.choices[0].message.content or "").strip()
     except Exception as e:
-        print(f"   [Gemini Crop] Eroare la apel ChatGPT pentru reparare: {e}")
+        print(f"   [Gemini Crop] Eroare la reparare JSON (Gemini): {e}")
         return []
-    if not text:
-        return []
-    items = _extract_json_array(text)
-    if items:
-        print("   [Gemini Crop] ChatGPT a reparat JSON-ul din răspunsul Gemini.")
-    return items
+
+    if isinstance(result, list):
+        items = [x for x in result if isinstance(x, dict)]
+        if items:
+            print("   [Gemini Crop] Reparare Gemini: array JSON valid.")
+        return items
+    if isinstance(result, dict) and "items" in result and isinstance(result["items"], list):
+        items = [x for x in result["items"] if isinstance(x, dict)]
+        if items:
+            print("   [Gemini Crop] Reparare Gemini: extras din cheia 'items'.")
+        return items
+    return []
 
 
 def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
@@ -413,7 +423,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
         print("⚠️ [Gemini Crop] Nu am putut parsa JSON din raspuns. Primele caractere:")
         print(f"   {preview!r}")
         print("   [Gemini Crop] Încerc reparare cu ChatGPT...")
-        items = _repair_json_with_chatgpt(raw)
+        items = _repair_json_with_gemini_second_pass(raw)
         floor_order = []
     if not items:
         print("   [Gemini Crop] Retry: re-apel Gemini pentru aceeași pagină...")
@@ -431,7 +441,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
                     items = _extract_json_array(raw2)
                     floor_order = []
                 if not items:
-                    items = _repair_json_with_chatgpt(raw2)
+                    items = _repair_json_with_gemini_second_pass(raw2)
                     floor_order = []
         except Exception as e:
             print(f"   [Gemini Crop] Retry Gemini eroare: {e}")
@@ -521,7 +531,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
                     items = _extract_json_array(raw_retry)
                     floor_order = []
                 if not items:
-                    items = _repair_json_with_chatgpt(raw_retry)
+                    items = _repair_json_with_gemini_second_pass(raw_retry)
                     floor_order = []
                 if items:
                     valid = _validate_items(items)
@@ -531,7 +541,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
             print(f"   [Gemini Crop] Retry Gemini (box invalid) eroare: {e}")
         if len(valid) == 0 and len(items) > 0:
             print("   [Gemini Crop] Încerc reparare cu ChatGPT (text → JSON)...")
-            items_repaired = _repair_json_with_chatgpt(raw)
+            items_repaired = _repair_json_with_gemini_second_pass(raw)
             if items_repaired:
                 items = items_repaired
                 valid = _validate_items(items)
@@ -555,7 +565,7 @@ def get_gemini_boxes_for_page(image_path: Path) -> list[dict[str, Any]]:
                     items_floor = _extract_json_array(raw_floor)
                     order_floor = []
                 if not items_floor:
-                    items_floor = _repair_json_with_chatgpt(raw_floor)
+                    items_floor = _repair_json_with_gemini_second_pass(raw_floor)
                     order_floor = []
                 if items_floor:
                     valid_floor = _validate_items(items_floor)

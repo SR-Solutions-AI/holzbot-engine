@@ -332,10 +332,9 @@ def _try_parse_truncated_zone_labels(raw_text: str) -> dict | None:
     return _parse_zone_labels_object(s)
 
 
-def _repair_zone_labels_json_with_chatgpt(raw_text: str) -> dict | None:
+def _repair_zone_labels_json_with_gemini(raw_text: str) -> dict | None:
     """
-    Același pattern ca la segmentare (Gemini Crop): trimitem raw la ChatGPT, extragem obiect JSON din răspuns,
-    parsează fără acces direct la chei. Nu propagăm nicio excepție.
+    Repară JSON zone labels folosind Gemini (text-only), același contract ca PROMPT_REPAIR_ZONE_LABELS.
     """
     try:
         # 1) Întâi încercăm reparare locală (trunchiere), ca la segmentare când _extract_json_array e gol
@@ -344,64 +343,33 @@ def _repair_zone_labels_json_with_chatgpt(raw_text: str) -> dict | None:
             print("   [Gemini zone labels] JSON trunchiat reparat local (paranteze închise).")
             return parsed
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
         if not api_key:
-            print("   [Gemini zone labels] OPENAI_API_KEY lipsește – nu pot repara cu ChatGPT.")
+            print("   [Gemini zone labels] GEMINI_API_KEY lipsește – nu pot repara JSON zone labels.")
             return None
 
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-        except Exception:
-            return None
+        from common.gemini_rest import DEFAULT_GEMINI_MODEL_FAST, generate_json
 
         prompt = PROMPT_REPAIR_ZONE_LABELS.format(raw_text=(raw_text or "")[:8000])
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You output only valid JSON. No markdown, no explanation, no extra text."},
-                {"role": "user", "content": prompt},
-            ],
+        data = generate_json(
+            api_key,
+            [{"text": prompt}],
+            system_instruction="You output only valid JSON. No markdown, no explanation, no extra text.",
+            model=DEFAULT_GEMINI_MODEL_FAST,
             temperature=0.0,
-            max_tokens=1024,
+            max_output_tokens=2048,
+            timeout=90,
         )
-
-        content = ""
-        if response and getattr(response, "choices", None) and len(response.choices) > 0:
-            msg = getattr(response.choices[0], "message", None)
-            if msg is not None:
-                content = (getattr(msg, "content", None) or "").strip()
-
-        if not content:
+        if not isinstance(data, dict):
             return None
 
-        # Elimină markdown code block (ca la segmentare: regex pentru ```json ... ```)
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content)
-        if m:
-            content = m.group(1).strip()
-        if "```" in content:
-            for part in content.split("```"):
-                part = part.strip()
-                if part.startswith("{"):
-                    content = part
-                    break
-
-        json_str = _extract_json_object_from_text(content)
-        if not json_str:
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start >= 0 and end > start:
-                json_str = content[start:end]
-        if not json_str:
-            return None
-
-        parsed = _parse_zone_labels_object(json_str)
+        parsed = _parse_zone_labels_object(json.dumps(data, ensure_ascii=False))
         if parsed is not None:
             n = len(parsed.get("detections") or [])
             if n > 0:
-                print(f"   [Gemini zone labels] ChatGPT a construit JSON valid din răspunsul Gemini ({n} zone).")
+                print(f"   [Gemini zone labels] Reparare Gemini: JSON valid ({n} zone).")
             else:
-                print("   [Gemini zone labels] ChatGPT a returnat JSON valid dar fără zone (detections gol) → se va folosi OCR.")
+                print("   [Gemini zone labels] Reparare Gemini: JSON valid dar fără zone (detections gol) → se va folosi OCR.")
             return parsed
         return None
     except Exception as e:
@@ -427,7 +395,7 @@ def call_gemini_zone_labels(
             GEMINI_PROMPT_ZONE_LABELS,
             api_key,
             max_retries=1,
-            repair_callback=_repair_zone_labels_json_with_chatgpt,
+            repair_callback=_repair_zone_labels_json_with_gemini,
             max_output_tokens=2048,
         )
         if not result or "detections" not in result:
@@ -1109,7 +1077,7 @@ def call_gemini_rooms_batch(image_paths: list, api_key: str, max_retries: int = 
             if out is not None:
                 return out
             # Reparare cu GPT dacă e disponibil
-            if attempt == max_retries and os.getenv("OPENAI_API_KEY"):
+            if attempt == max_retries and os.getenv("GEMINI_API_KEY"):
                 try:
                     import sys
                     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1246,7 +1214,7 @@ def _call_gemini_doors_batch_single(
             out, err = _parse_doors_batch_text(text, n)
             if out is not None:
                 return out
-            if attempt == max_retries and os.getenv("OPENAI_API_KEY"):
+            if attempt == max_retries and os.getenv("GEMINI_API_KEY"):
                 try:
                     import sys
 

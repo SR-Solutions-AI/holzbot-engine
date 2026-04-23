@@ -14,10 +14,6 @@ try:
     import google.generativeai as genai
 except Exception:
     genai = None
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 from config.settings import OUTPUT_ROOT, JOBS_ROOT, RUNNER_ROOT
 from pricing.db_loader import fetch_pricing_parameters
@@ -810,41 +806,6 @@ def _call_gemini_for_rectangle(payload: dict[str, Any], api_key: str | None) -> 
         return None
 
 
-def _call_chatgpt_for_rectangle(payload: dict[str, Any], api_key: str | None) -> dict[str, Any] | None:
-    if not api_key or OpenAI is None:
-        return None
-    try:
-        client = OpenAI(api_key=api_key)
-        model = os.environ.get("OPENAI_ROOF_MODEL", "gpt-4o")
-        prompt_input = {
-            "suprafata_utila_m2": payload.get("amprenta_fara_overhang_m2"),
-            "perimetru_m": payload.get("perimetru_fara_overhang_m"),
-            "unghi_grade": payload.get("roof_angle_deg"),
-            "overhang_m": payload.get("overhang_m"),
-            "nr_colturi_exterioare": payload.get("nr_colturi_exterioare"),
-            "nr_colturi_interioare": payload.get("nr_colturi_interioare"),
-            "suprafata_geamuri_m2": payload.get("suprafata_geamuri_m2"),
-        }
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.1,
-            messages=[
-                {"role": "system", "content": GEMINI_ROOF_SYSTEM_PROMPT},
-                {"role": "user", "content": f"INPUT:\n{json.dumps(prompt_input, ensure_ascii=False)}"},
-            ],
-        )
-        txt = (response.choices[0].message.content or "").strip()
-        if txt.startswith("```json"):
-            txt = txt[7:].strip()
-        elif txt.startswith("```"):
-            txt = txt[3:].strip()
-        if txt.endswith("```"):
-            txt = txt[:-3].strip()
-        return json.loads(txt) if txt else None
-    except Exception:
-        return None
-
-
 def _local_roof_calc(payload: dict[str, Any]) -> dict[str, Any]:
     """Deterministic local fallback with the same formula as AI prompt."""
     area = float(payload.get("amprenta_fara_overhang_m2") or 0.0)
@@ -1571,16 +1532,12 @@ def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Pat
     roof_measurements["by_rectangle_input"] = rect_inputs
 
     gemini_key = (frontend_data or {}).get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
-    openai_key = (frontend_data or {}).get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     gemini_by_rect: list[dict[str, Any]] = []
     sum_ai_without = 0.0
     sum_ai_with = 0.0
     for r in rect_inputs:
         g = _call_gemini_for_rectangle(r, gemini_key)
         source = "gemini"
-        if g is None:
-            g = _call_chatgpt_for_rectangle(r, openai_key)
-            source = "chatgpt" if g is not None else "none"
         if g is None:
             g = _local_roof_calc(r)
             source = "local"

@@ -1,10 +1,12 @@
 """
 Resume pipelines for „Angebot bearbeiten“ (variables-only or post–detection-editor).
 
-  python -m orchestrator_resume --job-id <offer_uuid> --engine-run-id <output_run_id> --mode variables|post_editor
+  python -m orchestrator_resume --job-id <offer_uuid> --engine-run-id <output_run_id> --mode variables|post_editor|from_walls
 
 variables: pricing + offer JSON + PDFs (reuses existing output/<engine_run_id>).
 post_editor: from apply_detections_edited through scale/count/roof/pricing/PDF.
+from_walls: same as post_editor but skips apply_detections_edited — pornește direct la
+  walls_from_coords (response.json / raster existent), apoi scale → roof → pricing → PDF.
 """
 
 from __future__ import annotations
@@ -174,7 +176,7 @@ def run_variables(engine_run_id: str, job_id: str) -> int:
     return 0
 
 
-def run_post_editor(engine_run_id: str, job_id: str) -> int:
+def run_post_editor(engine_run_id: str, job_id: str, *, from_walls_only: bool = False) -> int:
     job_root = JOBS_ROOT / job_id
     if not job_root.is_dir():
         print(f">>> ERROR: job_root missing: {job_root}", flush=True)
@@ -197,10 +199,22 @@ def run_post_editor(engine_run_id: str, job_id: str) -> int:
         return 1
 
     raster_scan_failed = False
-    with Timer("RESUME: apply detections + walls") as t:
-        for plan in plans:
-            raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
-            apply_detections_edited(raster_dir)
+    _walls_step_label = (
+        "RESUME: walls_from_coords (skip apply_detections)"
+        if from_walls_only
+        else "RESUME: apply detections + walls"
+    )
+    with Timer(_walls_step_label) as t:
+        if not from_walls_only:
+            for plan in plans:
+                raster_dir = plan.stage_work_dir / "cubicasa_steps" / "raster"
+                apply_detections_edited(raster_dir)
+        else:
+            print(
+                "🔸 [resume] from_walls: omit apply_detections_edited — "
+                "folosesc response.json / raster existent; regener walls_from_coords.",
+                flush=True,
+            )
 
         if roof_only_offer:
             seeded = seed_roof_only_rooms_from_roof_polygons(run_id, plans)
@@ -341,10 +355,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-id", required=True)
     ap.add_argument("--engine-run-id", required=True)
-    ap.add_argument("--mode", choices=["variables", "post_editor"], required=True)
+    ap.add_argument(
+        "--mode",
+        choices=["variables", "post_editor", "from_walls"],
+        required=True,
+    )
     args = ap.parse_args()
     if args.mode == "variables":
         return run_variables(args.engine_run_id, args.job_id)
+    if args.mode == "from_walls":
+        return run_post_editor(args.engine_run_id, args.job_id, from_walls_only=True)
     return run_post_editor(args.engine_run_id, args.job_id)
 
 

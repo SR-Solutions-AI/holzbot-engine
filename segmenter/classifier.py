@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Any
 from enum import Enum
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -168,22 +168,6 @@ def parse_label(text: str) -> Optional[str]:
 # CLIENT SETUP
 # ============================================================================
 
-def setup_openai_client():
-    """Inițializează clientul OpenAI"""
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    
-    if not api_key:
-        return None
-    
-    try:
-        from openai import OpenAI
-        return OpenAI(api_key=api_key)
-    except Exception as e:
-        debug_print(f"⚠️  Eroare OpenAI init: {e}")
-        return None
-
-
 def setup_gemini_client():
     """Inițializează clientul Gemini cu FALLBACK AUTOMAT de modele"""
     load_dotenv()
@@ -216,45 +200,6 @@ def setup_gemini_client():
 
     except Exception as e:
         debug_print(f"⚠️  Eroare Gemini init: {e}")
-        return None
-
-
-# ============================================================================
-# CLASIFICARE CU FIECARE MODEL
-# ============================================================================
-
-def classify_with_gpt(client, img_path: Path, prompt: str) -> Optional[str]:
-    """Clasificare cu GPT-4o"""
-    if client is None:
-        return None
-    
-    try:
-        pil_img = prep_for_vlm(img_path)
-        b64 = pil_to_base64(pil_img)
-        
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                        }
-                    ]
-                }
-            ],
-            temperature=0.0,
-            max_tokens=50
-        )
-        
-        result = response.choices[0].message.content
-        return parse_label(result)
-    
-    except Exception as e:
-        debug_print(f"❌ GPT error for {img_path.name}: {e}")
         return None
 
 
@@ -424,135 +369,73 @@ def local_classify(img_path: Path) -> str:
 
 def arbitrate_classification(
     img_path: Path,
-    gpt_client,
+    _gpt_client_unused,
     gemini_client,
-    round_num: int
+    round_num: int,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Rundă de arbitraj pentru clasificare"""
+    """Rundă de arbitraj: doar Gemini (același label returnat de două ori pentru compatibilitate cu vechiul flux)."""
     prompts = [
         PROMPT_ROUND_1_BASE,
         PROMPT_ROUND_2_EXPLICIT,
-        PROMPT_ROUND_3_EXTREME
+        PROMPT_ROUND_3_EXTREME,
     ]
-    
     prompt = prompts[min(round_num, 2)]
-    
-    gpt_label = classify_with_gpt(gpt_client, img_path, prompt)
-    gemini_label = classify_with_gemini(gemini_client, img_path, prompt)
-    
-    return gpt_label, gemini_label
+    label = classify_with_gemini(gemini_client, img_path, prompt)
+    return label, label
 
 
 # ============================================================================
-# CLASIFICARE PRINCIPALĂ CU DUAL-MODEL + FAST FAILOVER
+# CLASIFICARE PRINCIPALĂ (Gemini SDK + fallback heuristici)
 # ============================================================================
 
 def classify_image_robust(
     img_path: Path,
-    gpt_client,
-    gemini_client
+    _gpt_client_unused,
+    gemini_client,
 ) -> ClassificationResult:
-    """Clasificare cu sistem dual-model + Fast Failover"""
+    """Clasificare cu Gemini (prompturi progresive R1→R3). Al doilea argument e ignorat (compat API vechi)."""
     img_name = img_path.name
     debug_print(f"\n🔍 Clasificare: {img_name}")
-    
-    gpt_label = classify_with_gpt(gpt_client, img_path, PROMPT_ROUND_1_BASE)
-    gemini_label = classify_with_gemini(gemini_client, img_path, PROMPT_ROUND_1_BASE)
-    
-    debug_print(f"   Round 1 → GPT: {gpt_label}, Gemini: {gemini_label}")
-    
-    if gpt_label and gemini_label and gpt_label == gemini_label:
-        debug_print(f"   ✅ Acord imediat: {gpt_label}")
-        return ClassificationResult(
-            image_path=img_path,
-            label=gpt_label,  # type: ignore
-            confidence=ConfidenceLevel.HIGH,
-            gpt_vote=gpt_label,
-            gemini_vote=gemini_label,
-            arbitration_rounds=0
-        )
 
-    if not gemini_label and gpt_label:
-        debug_print(f"   ⚠️ Gemini failed. Trusting GPT: {gpt_label}")
-        return ClassificationResult(
-            image_path=img_path,
-            label=gpt_label,  # type: ignore
-            confidence=ConfidenceLevel.HIGH,
-            gpt_vote=gpt_label,
-            gemini_vote=None,
-            arbitration_rounds=0
-        )
-
-    if not gpt_label and gemini_label:
-        debug_print(f"   ⚠️ GPT failed. Trusting Gemini: {gemini_label}")
-        return ClassificationResult(
-            image_path=img_path,
-            label=gemini_label,  # type: ignore
-            confidence=ConfidenceLevel.HIGH,
-            gpt_vote=None,
-            gemini_vote=gemini_label,
-            arbitration_rounds=0
-        )
-
-    if not gpt_label and not gemini_label:
-        debug_print("   ❌ Ambele AI au eșuat. Execut fallback heuristici...")
+    gem = gemini_client or setup_gemini_client()
+    if not gem:
+        debug_print("   ❌ Gemini indisponibil (GEMINI_API_KEY?). Heuristici locale.")
         local_label = local_classify(img_path)
         return ClassificationResult(
             image_path=img_path,
-            label=local_label, # type: ignore
+            label=local_label,  # type: ignore
             confidence=ConfidenceLevel.LOW,
             gpt_vote=None,
             gemini_vote=None,
-            arbitration_rounds=0
+            arbitration_rounds=0,
         )
 
-    debug_print("   ⚔️  Dezbatere necesară (Modelele nu sunt de acord).")
-    
-    for round_num in range(1, 3):
-        debug_print(f"   ⚖️  Round {round_num + 1} - Arbitraj...")
-        
-        gpt_label, gemini_label = arbitrate_classification(
-            img_path, gpt_client, gemini_client, round_num
-        )
-        
-        debug_print(f"   Round {round_num + 1} → GPT: {gpt_label}, Gemini: {gemini_label}")
-        
-        if gpt_label and gemini_label and gpt_label == gemini_label:
-            debug_print(f"   ✅ Acord după arbitraj: {gpt_label}")
+    prompts = [PROMPT_ROUND_1_BASE, PROMPT_ROUND_2_EXPLICIT, PROMPT_ROUND_3_EXTREME]
+    last_label: Optional[str] = None
+    for i, pr in enumerate(prompts):
+        lab = classify_with_gemini(gem, img_path, pr)
+        debug_print(f"   Round {i + 1} → Gemini: {lab}")
+        if lab:
+            conf = ConfidenceLevel.HIGH if i == 0 else ConfidenceLevel.MEDIUM
             return ClassificationResult(
                 image_path=img_path,
-                label=gpt_label,  # type: ignore
-                confidence=ConfidenceLevel.MEDIUM,
-                gpt_vote=gpt_label,
-                gemini_vote=gemini_label,
-                arbitration_rounds=round_num + 1
+                label=lab,  # type: ignore
+                confidence=conf,
+                gpt_vote=None,
+                gemini_vote=lab,
+                arbitration_rounds=i,
             )
-        
-        if gpt_label and not gemini_label:
-             return ClassificationResult(image_path, gpt_label, ConfidenceLevel.MEDIUM, gpt_label, None, round_num + 1) # type: ignore
-        if gemini_label and not gpt_label:
-             return ClassificationResult(image_path, gemini_label, ConfidenceLevel.MEDIUM, None, gemini_label, round_num + 1) # type: ignore
+        last_label = lab
 
-    debug_print("   🔧 Fallback la heuristici locale (Arbitraj eșuat)...")
+    debug_print("   🔧 Fallback la heuristici locale (Gemini fără etichetă clară)...")
     local_label = local_classify(img_path)
-    
-    votes = [v for v in [gpt_label, gemini_label, local_label] if v]
-    
-    if len(votes) >= 2:
-        vote_counts = Counter(votes)
-        final_label = vote_counts.most_common(1)[0][0]
-    else:
-        final_label = local_label
-    
-    debug_print(f"   ⚠️  Voting final: {final_label} (votes: {votes})")
-    
     return ClassificationResult(
         image_path=img_path,
-        label=final_label,  # type: ignore
+        label=local_label,  # type: ignore
         confidence=ConfidenceLevel.LOW,
-        gpt_vote=gpt_label,
-        gemini_vote=gemini_label,
-        arbitration_rounds=3
+        gpt_vote=None,
+        gemini_vote=last_label,
+        arbitration_rounds=len(prompts),
     )
 
 
@@ -600,85 +483,39 @@ CRITICAL:
 """
 
     try:
-        # Încercăm GPT
-        if ai_client and hasattr(ai_client, 'chat'):
-            try:
-                pil_img = prep_for_vlm(img_path, min_long_edge=1280)
-                b64 = pil_to_base64(pil_img)
-                
-                response = ai_client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": PROMPT},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                            ]
-                        }
-                    ],
-                    temperature=0.0,
-                    max_tokens=500
-                )
-                
-                result = response.choices[0].message.content.strip()
-                
-                # Parse JSON
+        client = ai_client if (ai_client and hasattr(ai_client, "generate_content")) else setup_gemini_client()
+        if not client:
+            return {"rooms": [], "total_area": 0}
+        try:
+            pil_img = prep_for_vlm(img_path, min_long_edge=1280)
+
+            response = client.generate_content(
+                [PROMPT, pil_img],
+                generation_config={"temperature": 0.0, "max_output_tokens": 500},
+            )
+
+            if response.parts:
+                result = response.text.strip()
+
                 if result.startswith("```"):
-                    start = result.find('{')
-                    end = result.rfind('}') + 1
+                    start = result.find("{")
+                    end = result.rfind("}") + 1
                     if start != -1 and end > start:
                         result = result[start:end]
-                
+
                 data = json.loads(result)
-                
-                # Calculăm total
+
                 if "rooms" in data:
                     total = sum(r.get("area_m2", 0) for r in data["rooms"])
                     data["total_area"] = round(total, 2)
-                
+
                 return data
-                
-            except Exception as e:
-                debug_print(f"⚠️ GPT room extraction failed: {e}")
-                return {"rooms": [], "total_area": 0}
-        
-        # Încercăm Gemini
-        elif ai_client and hasattr(ai_client, 'generate_content'):
-            try:
-                pil_img = prep_for_vlm(img_path, min_long_edge=1280)
-                
-                response = ai_client.generate_content(
-                    [PROMPT, pil_img],
-                    generation_config={"temperature": 0.0, "max_output_tokens": 500}
-                )
-                
-                if response.parts:
-                    result = response.text.strip()
-                    
-                    # Parse JSON
-                    if result.startswith("```"):
-                        start = result.find('{')
-                        end = result.rfind('}') + 1
-                        if start != -1 and end > start:
-                            result = result[start:end]
-                    
-                    data = json.loads(result)
-                    
-                    # Calculăm total
-                    if "rooms" in data:
-                        total = sum(r.get("area_m2", 0) for r in data["rooms"])
-                        data["total_area"] = round(total, 2)
-                    
-                    return data
-                
-                return {"rooms": [], "total_area": 0}
-                
-            except Exception as e:
-                debug_print(f"⚠️ Gemini room extraction failed: {e}")
-                return {"rooms": [], "total_area": 0}
-        
-        return {"rooms": [], "total_area": 0}
+
+            return {"rooms": [], "total_area": 0}
+
+        except Exception as e:
+            debug_print(f"⚠️ Gemini room extraction failed: {e}")
+            return {"rooms": [], "total_area": 0}
     
     except Exception as e:
         debug_print(f"❌ Eroare la extragere măsurători: {e}")
@@ -785,56 +622,25 @@ Answer with EXACTLY ONE WORD:
 Your answer:"""
 
     try:
-        # STEP 1: Verificare vizuală AI (ca înainte)
+        # STEP 1: Verificare vizuală Gemini
         is_duplicate_visual = False
         visual_response = "NO_CHECK"
-        
-        # Încercăm GPT
-        if ai_client and hasattr(ai_client, 'chat'):
+
+        client = ai_client if (ai_client and hasattr(ai_client, "generate_content")) else setup_gemini_client()
+        if client:
             try:
                 pil_img1 = prep_for_vlm(img1_path, min_long_edge=1024)
                 pil_img2 = prep_for_vlm(img2_path, min_long_edge=1024)
-                
-                b64_1 = pil_to_base64(pil_img1)
-                b64_2 = pil_to_base64(pil_img2)
-                
-                response = ai_client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": PROMPT},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_1}"}},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_2}"}}
-                            ]
-                        }
-                    ],
-                    temperature=0.0,
-                    max_tokens=10
-                )
-                
-                visual_response = response.choices[0].message.content.strip().upper()
-                is_duplicate_visual = "YES" in visual_response
-                
-            except Exception as e:
-                debug_print(f"⚠️ GPT visual check failed: {e}")
-        
-        # Încercăm Gemini
-        elif ai_client and hasattr(ai_client, 'generate_content'):
-            try:
-                pil_img1 = prep_for_vlm(img1_path, min_long_edge=1024)
-                pil_img2 = prep_for_vlm(img2_path, min_long_edge=1024)
-                
-                response = ai_client.generate_content(
+
+                response = client.generate_content(
                     [PROMPT, pil_img1, "---SECOND IMAGE---", pil_img2],
-                    generation_config={"temperature": 0.0, "max_output_tokens": 10}
+                    generation_config={"temperature": 0.0, "max_output_tokens": 10},
                 )
-                
+
                 if response.parts:
                     visual_response = response.text.strip().upper()
                     is_duplicate_visual = "YES" in visual_response
-                
+
             except Exception as e:
                 debug_print(f"⚠️ Gemini visual check failed: {e}")
         
@@ -1100,21 +906,16 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
         debug_print(f"ℹ️ Nu există crops_dir cu planuri: {crops_dir}")
         return []
     
-    print("\n[STEP 7A] Inițializare AI clients...")
-    gpt_client = setup_openai_client()
+    print("\n[STEP 7A] Inițializare client Gemini...")
     gemini_client = setup_gemini_client()
-    
-    clients = []
-    if gpt_client: clients.append("GPT-4o")
-    if gemini_client: clients.append("Gemini (Auto-Detect)")
-    
-    if not clients:
-        print("⚠️  Niciun client AI disponibil - folosesc DOAR heuristici locale")
+
+    if not gemini_client:
+        print("⚠️  Gemini indisponibil (GEMINI_API_KEY?) - folosesc DOAR heuristici locale")
     else:
-        print(f"✅ Clienți activi: {', '.join(clients)}")
-    
+        print("✅ Client activ: Gemini (SDK)")
+
     # CLASIFICARE
-    print("[STEP 8] Clasificare cu Dual-Model Validation (GPT-4o + Gemini)...")
+    print("[STEP 8] Clasificare planuri (Gemini)...")
     
     results: list[ClassificationResult] = []
     
@@ -1127,7 +928,7 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
     print(f"📊 Clasificare {len(image_files)} planuri...\n")
     
     for img_file in image_files:
-        result = classify_image_robust(img_file, gpt_client, gemini_client)
+        result = classify_image_robust(img_file, None, gemini_client)
         
         label_to_dir = {
             "house_blueprint": bp_dir,
@@ -1166,9 +967,8 @@ def classify_segmented_plans(segmentation_out: str | Path) -> list[Classificatio
     print("\n✅ Clasificare finalizată!\n")
     
     # DETECTARE ȘI ELIMINARE DUPLICATE (DOAR PENTRU BLUEPRINT-URI FINALE)
-    # Folosim primul client disponibil (prioritate GPT)
-    ai_client = gpt_client if gpt_client else gemini_client
-    
+    ai_client = gemini_client
+
     if ai_client and bp_dir.exists():
         blueprint_files = list(bp_dir.glob("*.jpg")) + list(bp_dir.glob("*.png"))
         if len(blueprint_files) >= 2:

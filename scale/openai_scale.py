@@ -1,13 +1,12 @@
 # new/runner/scale/openai_scale.py
+# Detectare scară cu Gemini (REST). Numele fișierului rămâne pentru compatibilitate importuri vechi.
 from __future__ import annotations
 
-import base64
-import json
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Any
 
-from openai import OpenAI
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, gemini_api_key, generate_json, image_part_from_path
 
 
 SCALE_DETECTION_PROMPT = """
@@ -44,74 +43,52 @@ Returnează strict un JSON cu structura următoare:
 """
 
 
-def detect_scale_with_openai(image_path: Path) -> dict:
+def detect_scale_with_openai(image_path: Path) -> dict[str, Any]:
     """
-    Trimite imaginea planului către GPT-4o pentru detectare scară.
-    
+    Trimite imaginea planului către Gemini (vision) pentru detectare scară.
+
     Args:
         image_path: Path către imaginea planului (plan.jpg)
-    
+
     Returns:
         Dict cu meters_per_pixel și detalii despre estimare
     """
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = gemini_api_key()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY lipsește din environment")
-    
-    client = OpenAI(api_key=api_key)
-    
-    print(f"  📐 Trimit {image_path.name} către GPT-4o pentru detectare scară...")
-    
-    # Codificare imagine în base64
-    with open(image_path, "rb") as f:
-        image_base64 = base64.b64encode(f.read()).decode("utf-8")
-    
+        raise RuntimeError("GEMINI_API_KEY lipsește din environment")
+
+    print(f"  📐 Trimit {image_path.name} către Gemini ({DEFAULT_GEMINI_MODEL}) pentru detectare scară...")
+
+    parts = [
+        image_part_from_path(image_path),
+        {"text": SCALE_DETECTION_PROMPT + "\n\nReturn ONLY valid JSON matching the schema above."},
+    ]
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ești un expert în arhitectură și interpretare vizuală a planurilor de construcții. Estimează scara imaginilor în mod descriptiv și rațional."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": SCALE_DETECTION_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
-                        }
-                    ]
-                }
-            ]
+        result = generate_json(
+            api_key,
+            parts,
+            system_instruction=(
+                "Ești un expert în arhitectură și interpretare vizuală a planurilor de construcții. "
+                "Estimează scara imaginilor în mod descriptiv și rațional. Răspunde doar cu JSON valid."
+            ),
+            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+            temperature=0.0,
+            max_output_tokens=4096,
+            timeout=120,
         )
     except Exception as e:
-        raise RuntimeError(f"Eroare la apelul OpenAI: {e}")
-    
-    reply = response.choices[0].message.content.strip()
-    
-    # Curăță JSON (elimină markdown code fences)
-    if reply.startswith("```json"):
-        reply = reply[7:].strip()
-    elif reply.startswith("```"):
-        reply = reply[3:].strip()
-    
-    if reply.endswith("```"):
-        reply = reply[:-3].strip()
-    
-    try:
-        result = json.loads(reply)
-    except json.JSONDecodeError as e:
-        print("⚠️  Răspuns invalid de la GPT-4o:")
-        print(reply[:500])
-        raise ValueError(f"Nu pot parsa JSON-ul returnat de GPT-4o: {e}")
-    
-    # Validare structură răspuns
+        raise RuntimeError(f"Eroare la apelul Gemini: {e}") from e
+
+    if not isinstance(result, dict):
+        raise ValueError("Răspunsul Gemini nu este un obiect JSON")
+
     if "meters_per_pixel" not in result:
-        raise ValueError("Răspunsul GPT-4o nu conține cheia 'meters_per_pixel'")
-    
-    print(f"  ✅ Scară detectată: {result['meters_per_pixel']:.6f} m/pixel")
-    
+        raise ValueError("Răspunsul Gemini nu conține cheia 'meters_per_pixel'")
+
+    print(f"  ✅ Scară detectată: {float(result['meters_per_pixel']):.6f} m/pixel")
+
     return result
+
+
+# Alias explicit pentru cod nou
+detect_scale_with_gemini = detect_scale_with_openai

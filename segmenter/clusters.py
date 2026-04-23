@@ -5,6 +5,8 @@ import math
 import os
 import io
 import base64
+import re
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -14,10 +16,20 @@ from dotenv import load_dotenv
 
 from sklearn.cluster import KMeans
 
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_MODEL_FAST, gemini_api_key, generate_text, image_part_from_path
+
 from .common import STEP_DIRS, save_debug, resize_bgr_max_side, get_output_dir
 from .classifier import setup_gemini_client
 
 load_dotenv()
+
+
+def _write_bgr_temp_jpeg(bgr: np.ndarray) -> Path:
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    p = Path(path)
+    cv2.imwrite(str(p), bgr)
+    return p
 
 
 def _box_inside(inner: list[int], outer: list[int], tolerance: int = 2) -> bool:
@@ -428,21 +440,12 @@ def _bgr_to_base64_png(bgr_img: np.ndarray, max_size: int = 2000) -> str:
 
 
 def _ask_ai_how_many_plans(orig_img: np.ndarray) -> int:
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        print("  ⚠️  [AI] OPENAI_API_KEY lipsă - returnez 1 (default)")
+    api_key = gemini_api_key()
+    if not api_key:
+        print("  ⚠️  [AI] GEMINI_API_KEY lipsă - returnez 1 (default)")
         return 1
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-    except Exception as e:
-        print(f"  ⚠️  [AI] Eroare inițializare client OpenAI: {e}")
-        return 1
-    
-    print("  🤖 [AI] Trimit imaginea pentru numărare planuri...")
-    b64_img = _bgr_to_base64_png(orig_img)
-    
+
+    print("  🤖 [AI] Trimit imaginea către Gemini pentru numărare planuri...")
     prompt = """You are an architectural floor plan analyst.
 Look at this image and count how many DISTINCT house floor plans you can see.
 IMPORTANT:
@@ -451,41 +454,32 @@ IMPORTANT:
 - If you see a site plan, elevation view, or text-heavy page, return 1.
 Return ONLY a number (1, 2, 3...). No text."""
 
+    tmp = _write_bgr_temp_jpeg(orig_img)
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                        }
-                    ]
-                }
-            ],
-            max_tokens=10,
-            temperature=0.0
+        answer = generate_text(
+            api_key,
+            [image_part_from_path(tmp), {"text": prompt}],
+            model=os.environ.get("GEMINI_MODEL_FAST", DEFAULT_GEMINI_MODEL_FAST),
+            temperature=0.0,
+            max_output_tokens=32,
+            timeout=60,
         )
-        
-        answer = response.choices[0].message.content.strip()
         print(f"  💬 [AI] Răspuns brut: '{answer}'")
-        
-        import re
-        match = re.search(r'\d+', answer)
+        match = re.search(r"\d+", (answer or "").strip())
         if match:
             count = int(match.group())
             print(f"  ✅ [AI] Detectat: {count} planuri.")
-            return count
-        else:
-            print(f"  ⚠️  [AI] Nu am găsit un număr în răspuns. Returnez 1.")
-            return 1
-            
-    except Exception as e:
-        print(f"  ⚠️  [AI] Eroare la apelare API: {e}")
+            return max(1, count)
+        print("  ⚠️  [AI] Nu am găsit un număr în răspuns. Returnez 1.")
         return 1
+    except Exception as e:
+        print(f"  ⚠️  [AI] Eroare la apelare Gemini: {e}")
+        return 1
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _detect_frame_geometric(orig_img: np.ndarray, largest_cluster_box: list[int]) -> bool:
@@ -586,8 +580,7 @@ def _detect_frame_geometric(orig_img: np.ndarray, largest_cluster_box: list[int]
 
 def _ask_ai_if_has_frame(orig_img: np.ndarray) -> bool:
     """
-    ✅ FUNCȚIE NOUĂ: Întreabă AI-ul (Gemini sau ChatGPT) dacă imaginea conține un frame/cadru în jurul planului.
-    Încearcă mai întâi Gemini (mai bun), apoi ChatGPT ca fallback.
+    Întreabă AI-ul (Gemini SDK, apoi fallback REST Gemini) dacă imaginea conține un frame/cadru în jurul planului.
     Returnează True dacă există frame, False altfel.
     """
     # Prompt simplificat și mai neutru pentru a evita blocarea de safety
@@ -666,7 +659,7 @@ Answer ONLY: YES or NO"""
                         
                         # finish_reason=2 înseamnă SAFETY (blocat din motive de siguranță)
                         if finish_reason == 2:
-                            print(f"  ⚠️  [AI] Gemini a blocat răspunsul (SAFETY). Încerc ChatGPT...")
+                            print("  ⚠️  [AI] Gemini a blocat răspunsul (SAFETY).")
                         else:
                             # Încercăm să obținem răspunsul de la Gemini
                             answer = None
@@ -694,75 +687,53 @@ Answer ONLY: YES or NO"""
                     
                     # Dacă ajungem aici, Gemini nu a dat răspuns valid
                     if finish_reason != 2:
-                        print(f"  ⚠️  [AI] Gemini nu a returnat răspuns valid. Încerc ChatGPT...")
-                        
+                        print("  ⚠️  [AI] Gemini nu a returnat răspuns valid.")
+
                 except Exception as e:
                     import traceback
                     print(f"  ⚠️  [AI] Eroare la apelare Gemini: {e}")
                     print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
-                    print(f"  ⚠️  [AI] Încerc ChatGPT ca fallback...")
             else:
-                print("  ⚠️  [AI] Nu s-a putut crea model Gemini. Încerc ChatGPT...")
+                print("  ⚠️  [AI] Nu s-a putut crea model Gemini.")
         else:
-            print("  ⚠️  [AI] GEMINI_API_KEY lipsă. Încerc ChatGPT...")
+            print("  ⚠️  [AI] GEMINI_API_KEY lipsă.")
     except Exception as e:
         import traceback
         print(f"  ⚠️  [AI] Eroare inițializare Gemini: {e}")
         print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
-        print(f"  ⚠️  [AI] Încerc ChatGPT ca fallback...")
-    
-    # ========== ÎNCERCARE 2: CHATGPT (fallback) ==========
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        print("  ⚠️  [AI] OPENAI_API_KEY lipsă - returnez False (nu eliminăm cluster)")
-        return False
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-    except Exception as e:
-        print(f"  ⚠️  [AI] Eroare inițializare client OpenAI: {e}")
-        return False
-    
-    try:
-        print("  🤖 [AI] Trimit imaginea către ChatGPT pentru verificare frame...")
-        
-        b64_img = _bgr_to_base64_png(orig_img)
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                        }
-                    ]
-                }
-            ],
-            max_tokens=10,
-            temperature=0.0
-        )
-        
-        if response.choices and response.choices[0].message.content:
-            answer = response.choices[0].message.content.strip().upper()
-            print(f"  💬 [AI] ChatGPT răspuns: '{answer}'")
-            
-            has_frame = "YES" in answer or "DA" in answer
-            print(f"  ✅ [AI] ChatGPT detectat frame: {has_frame}")
-            return has_frame
-        else:
-            print(f"  ⚠️  [AI] ChatGPT nu a returnat răspuns valid. Returnez False (nu eliminăm cluster).")
-            return False
-            
-    except Exception as e:
-        import traceback
-        print(f"  ⚠️  [AI] Eroare la apelare ChatGPT: {e}")
-        print(f"  ⚠️  [AI] Traceback: {traceback.format_exc()}")
-        return False
+
+    # Fallback REST (uneori SDK eșuează diferit față de REST)
+    gkey = gemini_api_key()
+    if gkey:
+        tmp = _write_bgr_temp_jpeg(orig_img)
+        try:
+            print("  🤖 [AI] Fallback REST Gemini pentru verificare frame...")
+            ans = (
+                generate_text(
+                    gkey,
+                    [image_part_from_path(tmp), {"text": prompt}],
+                    model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+                    temperature=0.0,
+                    max_output_tokens=16,
+                    timeout=60,
+                )
+                or ""
+            ).strip().upper()
+            if ans:
+                print(f"  💬 [AI] Gemini REST răspuns: '{ans}'")
+                has_frame = "YES" in ans or "DA" in ans
+                print(f"  ✅ [AI] Gemini REST detectat frame: {has_frame}")
+                return has_frame
+        except Exception as e:
+            print(f"  ⚠️  [AI] Fallback REST Gemini: {e}")
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    print("  ⚠️  [AI] Nu s-a putut determina frame-ul - returnez False (nu eliminăm cluster).")
+    return False
 
 
 def _detect_sub_clusters_in_image(crop_img: np.ndarray) -> list[list[int]]:
@@ -1263,27 +1234,14 @@ def _check_blueprint_and_sideview_in_cluster(crop_img: np.ndarray) -> bool:
     care verifică dacă există ambele tipuri în imagine.
     """
     try:
-        from .classifier import prep_for_vlm, pil_to_base64, parse_label, setup_gemini_client
-        import os
-        from openai import OpenAI
-        from PIL import Image
+        from .classifier import prep_for_vlm, classify_image_robust, setup_gemini_client
         import tempfile
-        
-        # Setup clients pentru clasificare
-        gpt_client = None
-        gemini_client = None
-        
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            try:
-                gpt_client = OpenAI(api_key=openai_key)
-            except:
-                pass
-        
+
         gemini_client = setup_gemini_client()
-        
-        if not gpt_client and not gemini_client:
-            print("     ⚠️ Nu pot clasifica - lipsesc API keys. Presupun că nu are blueprint + sideview.")
+        gkey = gemini_api_key()
+
+        if not gemini_client and not gkey:
+            print("     ⚠️ Nu pot clasifica - GEMINI_API_KEY lipsă. Presupun că nu are blueprint + sideview.")
             return False
         
         # Salvăm temporar crop-ul pentru clasificare
@@ -1308,64 +1266,49 @@ If it contains NEITHER (or is text_area), respond with: "neither"
 
 Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sideview_only | neither"""
             
-            # Încercăm mai întâi cu GPT
             has_both = False
-            if gpt_client:
+            if gemini_client:
                 try:
                     pil_img = prep_for_vlm(tmp_path)
-                    b64 = pil_to_base64(pil_img)
-                    
-                    response = gpt_client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": PROMPT_MIXED},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                                    }
-                                ]
-                            }
-                        ],
-                        temperature=0.0,
-                        max_tokens=50
-                    )
-                    
-                    result = response.choices[0].message.content.strip().lower()
-                    print(f"     📋 GPT mixed classification: {result}")
-                    
-                    if "mixed_blueprint_sideview" in result:
-                        has_both = True
-                        print(f"     ✅ GPT detectat blueprint + sideview în același cluster!")
-                        return True
-                except Exception as e:
-                    print(f"     ⚠️ GPT mixed classification failed: {e}")
-            
-            # Dacă GPT nu a detectat, încercăm cu Gemini
-            if not has_both and gemini_client:
-                try:
-                    pil_img = prep_for_vlm(tmp_path)
-                    
+
                     response = gemini_client.generate_content(
                         [PROMPT_MIXED, pil_img],
                         generation_config={
                             "temperature": 0.0,
                             "max_output_tokens": 50,
-                        }
+                        },
                     )
-                    
+
                     if response.parts:
                         result = response.text.strip().lower()
                         print(f"     📋 Gemini mixed classification: {result}")
-                        
+
                         if "mixed_blueprint_sideview" in result:
                             has_both = True
-                            print(f"     ✅ Gemini detectat blueprint + sideview în același cluster!")
+                            print("     ✅ Gemini detectat blueprint + sideview în același cluster!")
                             return True
                 except Exception as e:
                     print(f"     ⚠️ Gemini mixed classification failed: {e}")
+
+            if not has_both and gkey:
+                try:
+                    txt = (
+                        generate_text(
+                            gkey,
+                            [image_part_from_path(tmp_path), {"text": PROMPT_MIXED}],
+                            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+                            temperature=0.0,
+                            max_output_tokens=64,
+                            timeout=90,
+                        )
+                        or ""
+                    ).strip().lower()
+                    print(f"     📋 Gemini REST mixed classification: {txt}")
+                    if "mixed_blueprint_sideview" in txt:
+                        print("     ✅ Gemini REST detectat blueprint + sideview în același cluster!")
+                        return True
+                except Exception as e:
+                    print(f"     ⚠️ Gemini REST mixed classification failed: {e}")
             
             # Dacă niciunul nu a detectat mixed, folosim metoda de detectare cluster:
             # analizăm densitatea pentru a găsi gap-uri și să împărțim inteligent
@@ -1392,7 +1335,7 @@ Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sid
                                 tmp_paths.append(tmp_sub_path)
                             
                             # Clasificăm sub-cluster-ul
-                            result_sub = classify_image_robust(tmp_sub_path, gpt_client, gemini_client)
+                            result_sub = classify_image_robust(tmp_sub_path, None, gemini_client)
                             label_sub = result_sub.label if result_sub else None
                             
                             print(f"     📋 Sub-cluster {idx+1} ({x1},{y1}-{x2},{y2}): {label_sub}")
@@ -1409,7 +1352,7 @@ Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sid
                                         sub_crop2 = crop_img[y1_2:y2_2, x1_2:x2_2]
                                         cv2.imwrite(str(tmp_sub2_path), sub_crop2)
                                     
-                                    result_sub2 = classify_image_robust(tmp_sub2_path, gpt_client, gemini_client)
+                                    result_sub2 = classify_image_robust(tmp_sub2_path, None, gemini_client)
                                     label_sub2 = result_sub2.label if result_sub2 else None
                                     
                                     if label_sub2 == "side_view":
@@ -1442,7 +1385,7 @@ Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sid
                                         sub_crop2 = crop_img[y1_2:y2_2, x1_2:x2_2]
                                         cv2.imwrite(str(tmp_sub2_path), sub_crop2)
                                     
-                                    result_sub2 = classify_image_robust(tmp_sub2_path, gpt_client, gemini_client)
+                                    result_sub2 = classify_image_robust(tmp_sub2_path, None, gemini_client)
                                     label_sub2 = result_sub2.label if result_sub2 else None
                                     
                                     if label_sub2 in ("house_blueprint", "site_blueprint"):
@@ -1500,8 +1443,8 @@ Return ONLY one of these labels: mixed_blueprint_sideview | blueprint_only | sid
                     
                     try:
                         # Clasificăm ambele părți folosind sistemul robust
-                        result_left = classify_image_robust(tmp_left_path, gpt_client, gemini_client)
-                        result_right = classify_image_robust(tmp_right_path, gpt_client, gemini_client)
+                        result_left = classify_image_robust(tmp_left_path, None, gemini_client)
+                        result_right = classify_image_robust(tmp_right_path, None, gemini_client)
                         
                         label_left = result_left.label if result_left else None
                         label_right = result_right.label if result_right else None
@@ -1552,20 +1495,11 @@ def _ask_ai_how_many_buildings_in_cluster(crop_img: np.ndarray) -> int:
     """
     Întreabă AI-ul câte clădiri separate există într-un cluster (side-by-side).
     """
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        print("     [AI] OPENAI_API_KEY lipsă - returnez 1 (default)")
+    api_key = gemini_api_key()
+    if not api_key:
+        print("     [AI] GEMINI_API_KEY lipsă - returnez 1 (default)")
         return 1
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-    except Exception as e:
-        print(f"     [AI] Eroare inițializare: {e}")
-        return 1
-    
-    b64_img = _bgr_to_base64_png(crop_img)
-    
+
     prompt = """You are an architectural analyst.
 Look at this floor plan cluster image.
 Count how many SEPARATE, DISTINCT BUILDINGS or HOUSE PLANS you can see (side by side).
@@ -1575,39 +1509,30 @@ IMPORTANT:
 - If you see just one house/building, return 1.
 Return ONLY a number (1, 2, 3...). No text."""
 
+    tmp = _write_bgr_temp_jpeg(crop_img)
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                        }
-                    ]
-                }
-            ],
-            max_tokens=10,
-            temperature=0.0
+        answer = generate_text(
+            api_key,
+            [image_part_from_path(tmp), {"text": prompt}],
+            model=os.environ.get("GEMINI_MODEL_FAST", DEFAULT_GEMINI_MODEL_FAST),
+            temperature=0.0,
+            max_output_tokens=32,
+            timeout=60,
         )
-        
-        answer = response.choices[0].message.content.strip()
-        
-        import re
-        match = re.search(r'\d+', answer)
+        match = re.search(r"\d+", (answer or "").strip())
         if match:
             count = int(match.group())
             print(f"     [AI] Detectat {count} clădiri în cluster.")
-            return count
-        else:
-            return 1
-            
+            return max(1, count)
+        return 1
     except Exception as e:
         print(f"     [AI] Eroare: {e}")
         return 1
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _ask_ai_how_many_floors_in_cluster(crop_img: np.ndarray) -> int:
@@ -1615,18 +1540,10 @@ def _ask_ai_how_many_floors_in_cluster(crop_img: np.ndarray) -> int:
     Întreabă AI-ul câte PLANURI DE ETAJ (etaje) separate sunt în cluster.
     Ex.: parter + etaj 1 stacked vertical = 2. Folosit pentru a împărți clustere cu mai multe etaje.
     """
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
+    api_key = gemini_api_key()
+    if not api_key:
         return 1
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-    except Exception:
-        return 1
-    
-    b64_img = _bgr_to_base64_png(crop_img)
-    
+
     prompt = """You are an architectural analyst.
 Look at this image. It may contain one or more FLOOR PLAN drawings (planuri de etaj).
 Count how many SEPARATE FLOOR PLAN drawings you see.
@@ -1637,24 +1554,17 @@ IMPORTANT:
 - Count each distinct floor plan as one, even if they belong to the same building.
 Return ONLY a number (1, 2, 3...). No text."""
 
+    tmp = _write_bgr_temp_jpeg(crop_img)
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                    ]
-                }
-            ],
-            max_tokens=10,
-            temperature=0.0
+        answer = generate_text(
+            api_key,
+            [image_part_from_path(tmp), {"text": prompt}],
+            model=os.environ.get("GEMINI_MODEL_FAST", DEFAULT_GEMINI_MODEL_FAST),
+            temperature=0.0,
+            max_output_tokens=32,
+            timeout=60,
         )
-        answer = response.choices[0].message.content.strip()
-        import re
-        match = re.search(r'\d+', answer)
+        match = re.search(r"\d+", (answer or "").strip())
         if match:
             count = int(match.group())
             if count >= 1:
@@ -1664,6 +1574,11 @@ Return ONLY a number (1, 2, 3...). No text."""
     except Exception as e:
         print(f"     [AI] Eroare etaje: {e}")
         return 1
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _split_cluster_by_buildings(

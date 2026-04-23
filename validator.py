@@ -5,13 +5,12 @@ import json
 import os
 import requests
 import fitz  # PyMuPDF
-import base64
 from io import BytesIO
 from PIL import Image
-from openai import OpenAI
+
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, gemini_api_key, generate_json, image_part_from_bytes
 
 # Config
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MAX_PDF_PAGES = 20  # limită pentru numărul de imagini trimise într-un singur request
 
 SYSTEM_PROMPT = """You are an architect assistant. You will receive one or more images (e.g. pages of a PDF or a single image).
@@ -43,25 +42,40 @@ def _collect_images_from_pdf(file_bytes):
     return out
 
 
-def _run_vision(client, content_list, num_images):
-    """Apelează Vision cu content_list (text + N image_url). content_list = [text_block, img1, img2, ...]."""
-    chat_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": content_list},
-        ],
-        max_tokens=300,
-        response_format={"type": "json_object"},
+def _run_gemini_vision(api_key: str, user_text: str, images_for_api: list, num_images: int) -> dict:
+    parts: list = [{"text": user_text}]
+    for buf, _w, _h in images_for_api:
+        buf.seek(0)
+        parts.append(image_part_from_bytes(buf.read(), "image/png"))
+
+    data = generate_json(
+        api_key,
+        parts,
+        system_instruction=SYSTEM_PROMPT,
+        model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        temperature=0.0,
+        max_output_tokens=1024,
+        timeout=120,
     )
-    result_text = chat_response.choices[0].message.content
-    data = json.loads(result_text)
+    if not isinstance(data, dict):
+        raise ValueError("Gemini returned non-object JSON")
+
     hp = data.get("has_floor_plan", False)
     hv = data.get("has_side_view", False)
     if "valid" not in data:
         data["valid"] = bool(hp)
     if "reason" not in data:
-        data["reason"] = "OK" if data["valid"] else ("No floor plan (Grundriss) found in the provided pages." if num_images > 1 else "No floor plan (Grundriss) found.")
+        data["reason"] = (
+            "OK"
+            if data["valid"]
+            else (
+                "No floor plan (Grundriss) found in the provided pages."
+                if num_images > 1
+                else "No floor plan (Grundriss) found."
+            )
+        )
+    data.setdefault("has_side_view", hv)
+    data.setdefault("has_floor_plan", hp)
     return data
 
 
@@ -71,7 +85,14 @@ def validate_plan(file_url):
     Cerință: în cel puțin una dintre pagini/imagine să existe un floor plan (Grundriss). Ansicht/Schnitt nu e obligatoriu.
     Returnează: { "valid": bool, "reason": str, "has_floor_plan": bool, "has_side_view": bool }
     """
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    api_key = gemini_api_key()
+    if not api_key:
+        return {
+            "valid": False,
+            "reason": "GEMINI_API_KEY missing",
+            "has_floor_plan": False,
+            "has_side_view": False,
+        }
 
     try:
         response = requests.get(file_url)
@@ -93,24 +114,18 @@ def validate_plan(file_url):
                 img.save(buf, format="PNG")
                 buf.seek(0)
                 images_for_api = [(buf, img.width, img.height)]
-            except Exception as e:
+            except Exception:
                 return {"valid": False, "reason": "Invalid Image Format", "has_floor_plan": False, "has_side_view": False}
 
         if not images_for_api:
             return {"valid": False, "reason": "No pages in PDF", "has_floor_plan": False, "has_side_view": False}
 
-        text = (
+        user_text = (
             f"Validate these {len(images_for_api)} image(s). "
             "Across all of them, there must be at least one FLOOR PLAN (Grundriss). Side views are optional."
         )
-        content_list = [{"type": "text", "text": text}]
-        for buf, _w, _h in images_for_api:
-            buf.seek(0)
-            b64 = base64.b64encode(buf.read()).decode("utf-8")
-            data_url = f"data:image/png;base64,{b64}"
-            content_list.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
 
-        result = _run_vision(client, content_list, len(images_for_api))
+        result = _run_gemini_vision(api_key, user_text, images_for_api, len(images_for_api))
         result.setdefault("has_floor_plan", False)
         result.setdefault("has_side_view", False)
         result["valid"] = bool(result.get("has_floor_plan"))

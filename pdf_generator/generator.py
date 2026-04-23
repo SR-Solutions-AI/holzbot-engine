@@ -10,11 +10,7 @@ from datetime import datetime
 import random
 import contextvars
 
-# --- NEW: OpenAI Import ---
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+from common.gemini_rest import DEFAULT_GEMINI_MODEL_FAST, gemini_api_key, generate_json
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -1063,8 +1059,7 @@ STATIC_TRANSLATIONS = {
 # ---------- 2. AI TRANSLATION SERVICE (AGRESIV) ----------
 class GermanEnforcer:
     def __init__(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        self.client = OpenAI(api_key=api_key) if OpenAI and api_key else None
+        self.api_key = gemini_api_key()
         self.cache = STATIC_TRANSLATIONS.copy()
 
     def get(self, text):
@@ -1085,7 +1080,7 @@ class GermanEnforcer:
         Traduce un batch de texte DIRECT pentru tabele.
         Filtrează automat: > 3 caractere, nu e preț/număr.
         """
-        if not self.client:
+        if not self.api_key:
             return {t: t for t in texts}
         
         # Filtrează ce merită tradus
@@ -1126,22 +1121,23 @@ class GermanEnforcer:
             )
             
             try:
-                response = self.client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": json.dumps(missing)}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.3
+                translations_obj = generate_json(
+                    self.api_key,
+                    [{"text": json.dumps(missing, ensure_ascii=False)}],
+                    system_instruction=prompt,
+                    model=os.environ.get("GEMINI_MODEL_FAST", DEFAULT_GEMINI_MODEL_FAST),
+                    temperature=0.3,
+                    max_output_tokens=8192,
+                    timeout=120,
                 )
-                
-                translations = json.loads(response.choices[0].message.content)
+                if not isinstance(translations_obj, dict):
+                    raise ValueError("Gemini did not return a JSON object")
+                translations = translations_obj
                 self.cache.update(translations)
                 results.update(translations)
-                
+
                 print(f"✅ [TableTranslation] Cached {len(translations)} new translations")
-                
+
             except Exception as e:
                 print(f"⚠️ [TableTranslation] Error: {e}")
                 for text in missing:

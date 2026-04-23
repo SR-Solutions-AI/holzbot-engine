@@ -1725,6 +1725,8 @@ def generate_walls_from_room_coordinates(
 
     # Eliminăm pixelii de perete care au ≥2 vecini flood în părți OPUSE (N-S sau E-W).
     # Un pixel este șters doar dacă are 0, 1 sau 2 vecini pereți (8-conectivitate).
+    # Regulă dură: NU ștergem un perete (alb) dacă are cel puțin un vecin cardinal (N,S,E,V)
+    # care nu e perete (negru în mască), chiar dacă flood opus + vecini pereți ar permite ștergerea.
     # Variantă vectorizată (NumPy/OpenCV) în loc de buclă Python pe milioane de pixeli.
     flood_mask = (flood_any > 0)
     wall_bin = (accepted_wall_segments_mask > 0).astype(np.uint8)
@@ -1747,8 +1749,21 @@ def generate_walls_from_room_coordinates(
     kernel_neighbors = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
     wall_neighbors = cv2.filter2D(wall_bin, -1, kernel_neighbors)
 
-    # 3. Pixelii de șters: perete + flood opus + < 3 vecini pereți
-    to_remove = wall_bin.astype(bool) & has_opposite_flood & (wall_neighbors < 3)
+    # Vecin cardinal direct care nu e perete — graniță perete / gol (masca binară).
+    wb = wall_bin.astype(bool)
+    touches_non_wall_cardinal = np.zeros((h_orig, w_orig), dtype=bool)
+    touches_non_wall_cardinal[1:, :] |= ~wb[:-1, :]  # N
+    touches_non_wall_cardinal[:-1, :] |= ~wb[1:, :]  # S
+    touches_non_wall_cardinal[:, 1:] |= ~wb[:, :-1]  # V (stânga)
+    touches_non_wall_cardinal[:, :-1] |= ~wb[:, 1:]  # E (dreapta)
+
+    # 3. Pixelii de șters: perete + flood opus + < 3 vecini pereți, DAR nu cei de pe marginea 4-vecini
+    to_remove = (
+        wall_bin.astype(bool)
+        & has_opposite_flood
+        & (wall_neighbors < 3)
+        & (~touches_non_wall_cardinal)
+    )
     removed_total = int(np.sum(to_remove))
     accepted_wall_segments_mask[to_remove] = 0
 
@@ -1786,7 +1801,10 @@ def generate_walls_from_room_coordinates(
     walls_mask_validated = accepted_wall_segments_mask.copy()
     walls_overlay_mask = walls_mask_validated.copy()
     if removed_total > 0:
-        _log(f"      ✅ Eliminat {removed_total} pixeli de perete (≥2 vecini flood în părți opuse)")
+        _log(
+            f"      ✅ Eliminat {removed_total} pixeli de perete "
+            f"(flood opus + <3 vecini pereți; excl. pereți cu vecin cardinal negru)"
+        )
     else:
         _log(f"      ℹ️ Nu s-au găsit pixeli de perete de eliminat (din {total_non_black} pixeli non-negri verificați)")
     

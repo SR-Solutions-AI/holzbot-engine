@@ -1,13 +1,11 @@
 # new/runner/floor_classifier/openai_classifier.py
 from __future__ import annotations
 
-import base64
-import json
 import os
 from pathlib import Path
 from typing import List, Tuple
 
-from openai import OpenAI
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, gemini_api_key, generate_json, image_part_from_path
 
 
 FLOOR_CLASSIFICATION_PROMPT = """
@@ -163,11 +161,11 @@ def classify_floors_with_openai(
     plans: List[Tuple[str, Path]],  # [(plan_id, image_path), ...]
 ) -> dict:
     """
-    Trimite toate planurile house_blueprint la GPT-4o pentru clasificare etaje.
-    
+    Trimite toate planurile house_blueprint la Gemini (vision) pentru clasificare etaje.
+
     Args:
         plans: Listă de tupluri (plan_id, path_către_imagine)
-    
+
     Returns:
         {
           "building_info": {...},
@@ -175,71 +173,41 @@ def classify_floors_with_openai(
           "validation": {...}
         }
     """
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = gemini_api_key()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY lipsește din environment")
-    
-    client = OpenAI(api_key=api_key)
-    
-    print(f"  🧠 Trimit {len(plans)} planuri către GPT-4o pentru clasificare...")
-    
-    # Construiește mesajul cu toate imaginile
-    content = [{"type": "text", "text": FLOOR_CLASSIFICATION_PROMPT}]
-    
+        raise RuntimeError("GEMINI_API_KEY lipsește din environment")
+
+    print(f"  🧠 Trimit {len(plans)} planuri către Gemini ({DEFAULT_GEMINI_MODEL}) pentru clasificare...")
+
+    parts: list = [{"text": FLOOR_CLASSIFICATION_PROMPT}]
     for idx, (plan_id, img_path) in enumerate(plans, start=1):
-        with open(img_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        
-        content.append({
-            "type": "text",
-            "text": f"\n{'='*60}\nPlan #{idx} - ID: {plan_id}\n{'='*60}"
-        })
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{b64}",
-                "detail": "high"  # IMPORTANT: high detail pentru text recognition
-            }
-        })
-    
+        parts.append({"text": f"\n{'='*60}\nPlan #{idx} - ID: {plan_id}\n{'='*60}"})
+        parts.append(image_part_from_path(img_path))
+
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert architectural analyst specializing in residential floor plan interpretation."
-                },
-                {"role": "user", "content": content}
-            ],
-            temperature=0,
-            max_tokens=3000
+        result = generate_json(
+            api_key,
+            parts,
+            system_instruction=(
+                "You are an expert architectural analyst specializing in residential floor plan interpretation."
+            ),
+            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+            temperature=0.0,
+            max_output_tokens=8192,
+            timeout=180,
         )
     except Exception as e:
-        raise RuntimeError(f"Eroare la apelul OpenAI: {e}")
-    
-    reply = response.choices[0].message.content.strip()
-    
-    # Curăță JSON (elimină markdown code fences)
-    if reply.startswith("```json"):
-        reply = reply[7:].strip()
-    elif reply.startswith("```"):
-        reply = reply[3:].strip()
-    
-    if reply.endswith("```"):
-        reply = reply[:-3].strip()
-    
-    try:
-        result = json.loads(reply)
-    except json.JSONDecodeError as e:
-        print("⚠️  Răspuns invalid de la GPT-4o:")
-        print(reply[:500])
-        raise ValueError(f"Nu pot parsa JSON-ul returnat de GPT-4o: {e}")
-    
-    # Validare structură răspuns
+        raise RuntimeError(f"Eroare la apelul Gemini: {e}") from e
+
+    if not isinstance(result, dict):
+        raise ValueError("Răspunsul Gemini nu este un obiect JSON")
+
     if "classifications" not in result:
-        raise ValueError("Răspunsul GPT-4o nu conține cheia 'classifications'")
-    
+        raise ValueError("Răspunsul Gemini nu conține cheia 'classifications'")
+
     print(f"  ✅ Clasificare completă: {len(result['classifications'])} planuri procesate")
-    
+
     return result
+
+
+classify_floors_with_gemini = classify_floors_with_openai

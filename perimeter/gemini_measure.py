@@ -1,13 +1,12 @@
 # new/runner/perimeter/gemini_measure.py
 from __future__ import annotations
 
-import base64
 import json
 import os
 import math
 from pathlib import Path
 
-from openai import OpenAI
+from common.gemini_rest import DEFAULT_GEMINI_MODEL, gemini_api_key, generate_json, image_part_from_path
 
 
 PERIMETER_PROMPT = """
@@ -95,7 +94,7 @@ def _fallback_estimation(meters_per_pixel: float, house_area_m2: float = 100.0) 
                 "interior_meters": interior_est,
                 "exterior_meters": exterior_est,
                 "total_perimeter_meters": perimeter_est,
-                "method_notes": "Fallback estimation (GPT-4o refused image analysis)"
+                "method_notes": "Fallback estimation (Gemini refused or failed image analysis)"
             },
             "by_proportion": {
                 "interior_meters": interior_est,
@@ -119,92 +118,56 @@ def measure_perimeter_with_gemini(
     scale_data: dict
 ) -> dict:
     """
-    Trimite planul la GPT-4o pentru măsurarea lungimilor pereților.
-    
+    Trimite planul la Gemini (vision) pentru măsurarea lungimilor pereților.
+
     Args:
         plan_image: Path către plan.jpg
         scale_data: Dict cu scale_result.json (conține meters_per_pixel)
-    
+
     Returns:
         Dict cu structura de estimări perimetru
     """
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = gemini_api_key()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY lipsește din environment")
-    
-    client = OpenAI(api_key=api_key)
-    
+        raise RuntimeError("GEMINI_API_KEY lipsește din environment")
+
     meters_per_pixel = float(scale_data.get("meters_per_pixel", 0.0))
     if meters_per_pixel <= 0:
         raise ValueError("Scara invalidă în scale_result.json")
-    
-    print(f"       📐 Măsurare pereți cu GPT-4o (scala: {meters_per_pixel:.6f} m/px)...")
-    
-    # Codificare imagine
-    with open(plan_image, "rb") as f:
-        image_base64 = base64.b64encode(f.read()).decode("utf-8")
-    
+
+    print(f"       📐 Măsurare pereți cu Gemini ({DEFAULT_GEMINI_MODEL}, scala: {meters_per_pixel:.6f} m/px)...")
+
+    parts = [
+        image_part_from_path(plan_image),
+        {"text": PERIMETER_PROMPT.format(meters_per_pixel=meters_per_pixel) + "\n\nReturn ONLY valid JSON as specified."},
+    ]
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert in precise measurements on 2D architectural plans. You MUST respond with valid JSON only."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text", 
-                            "text": PERIMETER_PROMPT.format(meters_per_pixel=meters_per_pixel)
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}",
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0,
-            max_tokens=2000,
-            response_format={"type": "json_object"}  # Forțează JSON
+        result = generate_json(
+            api_key,
+            parts,
+            system_instruction=(
+                "You are an expert in precise measurements on 2D architectural plans. "
+                "You MUST respond with valid JSON only."
+            ),
+            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+            temperature=0.0,
+            max_output_tokens=4096,
+            timeout=120,
         )
     except Exception as e:
-        print(f"       ⚠️  Eroare la apelul OpenAI: {e}")
-        print(f"       🔄 Folosesc fallback estimation...")
+        print(f"       ⚠️  Eroare la apelul Gemini: {e}")
+        print("       🔄 Folosesc fallback estimation...")
         return _fallback_estimation(meters_per_pixel)
-    
-    reply = response.choices[0].message.content.strip()
-    
-    # Verificare refuz explicit
-    if "unable to analyze" in reply.lower() or "cannot analyze" in reply.lower() or "i'm unable" in reply.lower():
-        print(f"       ⚠️  GPT-4o a refuzat analiza imagini")
-        print(f"       🔄 Folosesc fallback estimation...")
+
+    if not isinstance(result, dict):
+        print("       ⚠️  Răspuns Gemini invalid (non-object)")
+        print("       🔄 Folosesc fallback estimation...")
         return _fallback_estimation(meters_per_pixel)
-    
-    # Curăță JSON (elimină markdown dacă există)
-    if reply.startswith("```"):
-        lines = reply.split("\n")
-        # Elimină liniile cu ```
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        reply = "\n".join(lines).strip()
-    
-    try:
-        result = json.loads(reply)
-    except json.JSONDecodeError as e:
-        print(f"       ⚠️  Răspuns invalid de la GPT-4o:")
-        print(reply[:500])
-        print(f"       🔄 Folosesc fallback estimation...")
-        return _fallback_estimation(meters_per_pixel)
-    
+
     # Validare structură
     if "estimations" not in result:
-        print(f"       ⚠️  Răspunsul GPT-4o nu conține cheia 'estimations'")
-        print(f"       🔄 Folosesc fallback estimation...")
+        print("       ⚠️  Răspunsul Gemini nu conține cheia 'estimations'")
+        print("       🔄 Folosesc fallback estimation...")
         return _fallback_estimation(meters_per_pixel)
     
     avg = result["estimations"].get("average_result", {})
