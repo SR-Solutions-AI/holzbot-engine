@@ -233,6 +233,208 @@ def load_rooms_for_plan(out_root: Path, plan_id: str) -> list[dict[str, Any]]:
     return [r for r in raw if isinstance(r, dict)]
 
 
+def rooms_union_mask_walls_raster(
+    out_root: Path,
+    plan_id: str,
+    wall_h: int,
+    wall_w: int,
+    sx: float,
+    sy: float,
+) -> Any:
+    """
+    Reuniunea poligoanelor tuturor camerilor, scalate din spațiul editor la pixelii 01_walls (sx, sy).
+    Returnează mască uint8 0/255 de dimensiune (wall_h, wall_w).
+    """
+    import cv2
+    import numpy as np
+
+    rooms = load_rooms_for_plan(out_root, plan_id)
+    mask = np.zeros((wall_h, wall_w), dtype=np.uint8)
+    for room in rooms:
+        pts = room.get("points")
+        if not isinstance(pts, list) or len(pts) < 3:
+            continue
+        scaled: list[list[int]] = []
+        for p in pts:
+            if isinstance(p, list) and len(p) >= 2:
+                try:
+                    scaled.append(
+                        [
+                            int(round(float(p[0]) * float(sx))),
+                            int(round(float(p[1]) * float(sy))),
+                        ]
+                    )
+                except (TypeError, ValueError):
+                    continue
+        if len(scaled) < 3:
+            continue
+        rp = np.array(scaled, dtype=np.int32)
+        rp[:, 0] = np.clip(rp[:, 0], 0, wall_w - 1)
+        rp[:, 1] = np.clip(rp[:, 1], 0, wall_h - 1)
+        cv2.fillPoly(mask, [rp], 255)
+    return mask
+
+
+def enclosed_interior_mask_from_wall_gray(
+    wall_gray: np.ndarray,
+    *,
+    wall_thresh: int = 48,
+    dilate_ksize: int = 5,
+) -> Any:
+    """
+    Mască uint8 255 = spațiu liber neatinse de flood-fill din colțul (0,0) prin „aer” (non-perete).
+
+    Pereții = wall_gray > wall_thresh, dilatați. Marginea imaginii e forțată liberă ca exteriorul
+    să fie conectat: ce rămâne 255 după flood = „găuri” închise de contururi (camere / interior).
+    """
+    import cv2
+    import numpy as np
+
+    if wall_gray is None or wall_gray.size == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+    h, w = int(wall_gray.shape[0]), int(wall_gray.shape[1])
+    walls = (wall_gray > int(wall_thresh)).astype(np.uint8)
+    if dilate_ksize >= 3:
+        k = int(dilate_ksize) | 1
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        walls = cv2.dilate(walls, ker)
+    cells = np.where(walls > 0, 0, 255).astype(np.uint8)
+    cells[0, :] = 255
+    cells[-1, :] = 255
+    cells[:, 0] = 255
+    cells[:, -1] = 255
+    ff = cells.copy()
+    ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(
+        ff,
+        ff_mask,
+        (0, 0),
+        0,
+        loDiff=0,
+        upDiff=0,
+        flags=cv2.FLOODFILL_FIXED_RANGE | 4,
+    )
+    enclosed = ((cells > 0) & (ff > 0)).astype(np.uint8) * 255
+    return enclosed
+
+
+def split_mov_extra_roof_border_flood(
+    base_fp: np.ndarray,
+    rectangle_img: np.ndarray,
+    *,
+    wall_thr: int = 230,
+    black_thr: int = 30,
+    wall_dilate_ksize: int = 5,
+    bbox_pad: int = 48,
+    rng: Any | None = None,
+) -> tuple[Any, Any]:
+    """
+    Pentru masca acoperiș ``base_fp`` (0/255) și imaginea ``rectangle_SX``:
+
+    1) Detectează culoarea exactă mov din zona ``base_fp`` (nuanța curentă din rectangle_SX).
+    2) Consideră traversabil DOAR pixeli exact mov sau exact negri.
+       Orice altă culoare = perete/barieră.
+    3) Face flood-fill din marginea imaginii prin pixeli traversabili (spațiu exterior).
+    4) Elimină din mov toți pixelii conectați cu exteriorul.
+
+    Rezultat:
+    - ``extra`` = pixeli mov aflați în exteriorul formelor închise de alb.
+    - ``mov`` = pixeli mov rămași în interiorul formelor.
+
+    Fără fallback la ``mov = base_fp``: dacă tot mov-ul e conectat la exterior,
+    rezultatul corect este ``mov = 0`` și ``extra = base_fp``.
+    """
+    from collections import deque
+    import numpy as np
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if rectangle_img is None or base_fp is None:
+        z = np.zeros((1, 1), dtype=np.uint8)
+        return z, z
+
+    h, w = int(base_fp.shape[0]), int(base_fp.shape[1])
+    if rectangle_img.shape[:2] != (h, w):
+        z = np.zeros((h, w), dtype=np.uint8)
+        return z, z
+
+    P = (base_fp > 0).astype(bool)
+    if not np.any(P):
+        z = np.zeros((h, w), dtype=np.uint8)
+        return z, z
+
+    # Detectăm nuanța exactă mov din interiorul poligonului (majoritară pe P).
+    if rectangle_img.ndim == 2:
+        g = rectangle_img.astype(np.uint8)
+        vals = g[P]
+        if vals.size == 0:
+            z = np.zeros((h, w), dtype=np.uint8)
+            return z, z
+        uniq, cnt = np.unique(vals, return_counts=True)
+        mov_v = np.uint8(uniq[int(np.argmax(cnt))])
+        is_mov = g == mov_v
+        is_black = g == np.uint8(0)
+    else:
+        bgr = rectangle_img.astype(np.uint8)
+        vals = bgr[P]
+        if vals.size == 0:
+            z = np.zeros((h, w), dtype=np.uint8)
+            return z, z
+        uniq, cnt = np.unique(vals, axis=0, return_counts=True)
+        mov_c = uniq[int(np.argmax(cnt))]
+        is_mov = (
+            (bgr[..., 0] == mov_c[0])
+            & (bgr[..., 1] == mov_c[1])
+            & (bgr[..., 2] == mov_c[2])
+        )
+        is_black = (
+            (bgr[..., 0] == np.uint8(0))
+            & (bgr[..., 1] == np.uint8(0))
+            & (bgr[..., 2] == np.uint8(0))
+        )
+
+    # Traversabil doar pe mov exact + negru exact; restul sunt pereți.
+    free = is_mov | is_black
+    outside = np.zeros((h, w), dtype=bool)
+    dq: deque[tuple[int, int]] = deque()
+
+    # Seed-uri pe margine: doar pixeli free.
+    for x in range(w):
+        if free[0, x] and not outside[0, x]:
+            outside[0, x] = True
+            dq.append((0, x))
+        if free[h - 1, x] and not outside[h - 1, x]:
+            outside[h - 1, x] = True
+            dq.append((h - 1, x))
+    for y in range(h):
+        if free[y, 0] and not outside[y, 0]:
+            outside[y, 0] = True
+            dq.append((y, 0))
+        if free[y, w - 1] and not outside[y, w - 1]:
+            outside[y, w - 1] = True
+            dq.append((y, w - 1))
+
+    while dq:
+        y, x = dq.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+            if outside[ny, nx]:
+                continue
+            if not free[ny, nx]:
+                continue
+            outside[ny, nx] = True
+            dq.append((ny, nx))
+
+    extra_bool = P & outside
+    mov_bool = P & (~outside)
+    mov_out = (mov_bool.astype(np.uint8)) * np.uint8(255)
+    extra_out = (extra_bool.astype(np.uint8)) * np.uint8(255)
+
+    return mov_out, extra_out
+
+
 def _roof_rect_points_at_index(
     edited: dict[str, Any],
     run_id: str,
@@ -256,6 +458,33 @@ def _roof_rect_points_at_index(
     return None
 
 
+def collapse_negligible_roof_insulated_share(
+    roof_without_overhang_m2: float,
+    insulated_m2: float,
+    *,
+    min_dominant_ratio: float = 0.0,
+) -> float:
+    """
+    Clamp gedämmte Fläche auf [0, Dach ohne Überstand]. Frühere 5 %-Schwelle (kleine Anteile
+    auf 0 bzw. volle Fläche) ist entfernt — Rohwert aus Geometrie bleibt erhalten.
+    ``min_dominant_ratio`` bleibt nur aus API-Kompatibilität, wird ignoriert.
+    """
+    try:
+        wo = float(roof_without_overhang_m2)
+    except (TypeError, ValueError):
+        wo = 0.0
+    if wo <= 0:
+        try:
+            return max(0.0, float(insulated_m2))
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        ins = float(insulated_m2)
+    except (TypeError, ValueError):
+        ins = 0.0
+    return max(0.0, min(ins, wo))
+
+
 def apply_roof_insulated_m2_to_rows(
     out_root: Path,
     run_id: str,
@@ -263,10 +492,17 @@ def apply_roof_insulated_m2_to_rows(
     meters_per_pixel_by_floor: dict[str, Any] | None,
 ) -> None:
     """
-    Mutates each row: sets roof_area_insulated_m2 = max(0, roof_area_without_overhang_m2 - uninsulated_overlap_sloped).
+    Mutates each row: sets roof_area_insulated_m2 from overlap geometry
+    (max(0, roof_area_without_overhang_m2 - uninsulated_overlap_sloped)), clamped to
+    [0, ohne Überstand] via :func:`collapse_negligible_roof_insulated_share`.
     Falls back to ohne Überstand when geometry is missing or shapely fails.
     """
     from roof.roof_pricing import _load_mpp_by_floor_from_scale, _read_json
+
+    def _store_insulated_m2(row: dict[str, Any], wo_val: float, raw_insulated: float) -> float:
+        adj = collapse_negligible_roof_insulated_share(wo_val, raw_insulated)
+        row["roof_area_insulated_m2"] = round(adj, 4)
+        return adj
 
     edited = _read_json(out_root / "roof" / "roof_3d" / "roof_rectangles_edited.json")
     if not isinstance(edited, dict):
@@ -307,12 +543,12 @@ def apply_roof_insulated_m2_to_rows(
             fi = int(r.get("floor_idx", 0))
             ri = int(r.get("rectangle_idx", 0))
         except (TypeError, ValueError):
-            r["roof_area_insulated_m2"] = round(wo, 4)
+            _store_insulated_m2(r, wo, wo)
             continue
 
         plan_id = str(r.get("plan_id") or "").strip()
         if not plan_id or not run_id:
-            r["roof_area_insulated_m2"] = round(wo, 4)
+            _store_insulated_m2(r, wo, wo)
             continue
 
         try:
@@ -330,7 +566,7 @@ def apply_roof_insulated_m2_to_rows(
 
         pts = _roof_rect_points_at_index(edited, run_id, fi, ri)
         if pts is None:
-            r["roof_area_insulated_m2"] = round(wo, 4)
+            _store_insulated_m2(r, wo, wo)
             continue
 
         if plan_id not in rooms_cache:
@@ -351,7 +587,7 @@ def apply_roof_insulated_m2_to_rows(
             stats=st,
         )
         insulated = max(0.0, wo - overlap)
-        r["roof_area_insulated_m2"] = round(insulated, 4)
+        final_ins = _store_insulated_m2(r, wo, insulated)
 
         print(
             f"       [Dach gedämmt] plan={plan_id} floor_idx={fi} rectangle_idx={ri} | "
@@ -362,7 +598,7 @@ def apply_roof_insulated_m2_to_rows(
             f"oriz_m2={st.get('overlap_horizontal_m2', 0)} "
             f"(1/cos={st.get('slope_factor_1_over_cos', 1)}) → "
             f"scăzut_panta_m2={st.get('overlap_sloped_m2', overlap):.4f} | "
-            f"gedämmt_m2={insulated:.4f}",
+            f"gedämmt_m2={final_ins:.4f}",
             flush=True,
         )
 

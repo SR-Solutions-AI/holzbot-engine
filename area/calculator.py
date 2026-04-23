@@ -186,13 +186,22 @@ def calculate_areas_for_plan(
         
     ceiling_m2 = floor_m2
     
-    # B. FUNDAȚIE / ACOPERIȘ (Folosim GROSS Area)
+    # B. BAZĂ STRUCTURALĂ (camere + amprentă pereți): fundație / acoperiș / podea structură
+    # Se aplică pe baza lungimilor pereților (ext 30cm, int 12cm).
+    base_with_walls_m2 = max(
+        0.0,
+        float(area_net_m2)
+        + (float(exterior_length_m) * float(WALL_THICKNESS_EXTERIOR_M))
+        + (float(interior_length_m_structure) * float(WALL_THICKNESS_INTERIOR_M)),
+    )
+
+    # FUNDAȚIE / ACOPERIȘ: folosim baza structurală, nu aria brută.
     # Se aplică doar la nivelurile relevante
     has_foundation = (floor_type == "ground_floor") or is_single_plan
-    foundation_m2 = area_gross_m2 if has_foundation else 0.0
+    foundation_m2 = base_with_walls_m2 if has_foundation else 0.0
     
     has_roof = (floor_type == "top_floor") or is_single_plan
-    roof_m2 = area_gross_m2 if has_roof else 0.0
+    roof_m2 = base_with_walls_m2 if has_roof else 0.0
     
     # ==========================================
     # 4. REZULTAT
@@ -240,6 +249,7 @@ def calculate_areas_for_plan(
         
         "surfaces": {
             "foundation_m2": round(foundation_m2, 2) if foundation_m2 > 0 else None,
+            "floor_structure_m2": round(base_with_walls_m2, 2),
             "floor_m2": round(floor_m2, 2),
             "ceiling_m2": round(ceiling_m2, 2),
             "roof_m2": round(roof_m2, 2) if roof_m2 > 0 else None,

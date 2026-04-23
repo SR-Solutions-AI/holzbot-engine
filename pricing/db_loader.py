@@ -67,21 +67,19 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
     _heat_base = float(data_map.get("heating_base_price", 70.0))
 
-    _nutz = data_map.get("unit_price_keller_nutzkeller", 145)
-    _k_ausbau = data_map.get("unit_price_keller_ausbau", 185)
+    _placa = float(data_map.get("unit_price_placa", 120))
     out = {
         "_raw_params": data_map,
         "foundation": {
             "unit_price_per_m2": {
-                # Form: Untergeschoss / Fundament (neu + Legacy gespeicherte Angebote)
-                "Kein Keller (nur Bodenplatte)": data_map.get("unit_price_placa", 120),
-                "Keller (ohne Ausbau)": _nutz,
-                "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": _nutz,
-                "Keller (mit Ausbau)": _k_ausbau,
-                "Keller (unbeheizt / Nutzkeller)": _nutz,
-                "Keller (mit einfachem Ausbau)": _k_ausbau,
-                # Legacy / Pfahlgründung (când pilons=True se aplică în plus)
-                "Placă": data_map.get("unit_price_placa", 120),
+                # Ein Preis Bodenplatte (Preisdatenbank) für alle Keller-/Bodenplatten-Varianten im Formular
+                "Kein Keller (nur Bodenplatte)": _placa,
+                "Keller (ohne Ausbau)": _placa,
+                "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": _placa,
+                "Keller (mit Ausbau)": _placa,
+                "Keller (unbeheizt / Nutzkeller)": _placa,
+                "Keller (mit einfachem Ausbau)": _placa,
+                "Placă": _placa,
                 "Piloți": data_map.get("unit_price_piloti", 180),
                 "Soclu": data_map.get("unit_price_soclu", 95),
             }
@@ -409,5 +407,19 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                     out.setdefault("openings", {}).setdefault("door_height_m", {})[label] = val
     except Exception:
         pass
+
+    # Nach tenant_form_options: alle Standard-Keller-/Platten-Labels weiterhin ein Preis (unit_price_placa)
+    _fp = out.setdefault("foundation", {}).setdefault("unit_price_per_m2", {})
+    _slab_final = float(data_map.get("unit_price_placa", 120))
+    for _k in (
+        "Kein Keller (nur Bodenplatte)",
+        "Keller (ohne Ausbau)",
+        "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)",
+        "Keller (mit Ausbau)",
+        "Keller (unbeheizt / Nutzkeller)",
+        "Keller (mit einfachem Ausbau)",
+        "Placă",
+    ):
+        _fp[_k] = _slab_final
 
     return out

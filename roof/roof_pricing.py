@@ -28,6 +28,8 @@ DEFAULT_DACHDECKUNG = "Ziegel"
 DEFAULT_UNTERDACH = "Folie"
 DEFAULT_DACHSTUHL_TYP = "Sparrendach"
 DEFAULT_DECKEN_INNENAUSBAU = "Standard"
+EXTERIOR_WALL_STRIP_M = 0.30
+INTERIOR_WALL_STRIP_M = 0.12
 
 
 DACHFENSTER_TYP_TO_KEYS: dict[str, tuple[str, str]] = {
@@ -152,10 +154,19 @@ def _iter_edited_rectangles_roof_order(edited: dict[str, Any], run_id: str) -> l
     if not isinstance(edited, dict) or not run_id:
         return []
     try:
-        from roof.jobs import _edited_entries_as_roof_indices, resolve_plans_roof_order
+        from roof.jobs import (
+            _edited_entries_as_roof_indices,
+            manifest_tab_plan_ids_order,
+            resolve_plans_roof_order,
+        )
 
         plans_roof, _, plans_list = resolve_plans_roof_order(run_id)
-        pairs = _edited_entries_as_roof_indices(edited, plans_list, plans_roof)
+        pairs = _edited_entries_as_roof_indices(
+            edited,
+            plans_list,
+            plans_roof,
+            manifest_tab_plan_ids=manifest_tab_plan_ids_order(run_id),
+        )
         return sorted(pairs, key=lambda t: t[0])
     except Exception:
         pass
@@ -483,6 +494,86 @@ def _count_polygon_corner_types(pts: list[list[float]], eps: float = 1e-7) -> tu
     return ext, intr
 
 
+def _interior_footprint_mask_from_09_png_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    """Interior clădire din 09_interior.png — aceleași praguri ca pricing/jobs._compute_interior_mask_area_m2."""
+    lower_o = np.array([0, 120, 200], dtype=np.uint8)
+    upper_o = np.array([80, 210, 255], dtype=np.uint8)
+    m_orange = cv2.inRange(img_bgr, lower_o, upper_o)
+    lower_p = np.array([200, 0, 200], dtype=np.uint8)
+    upper_p = np.array([255, 60, 255], dtype=np.uint8)
+    m_purple = cv2.inRange(img_bgr, lower_p, upper_p)
+    lower_b = np.array([200, 0, 0], dtype=np.uint8)
+    upper_b = np.array([255, 50, 50], dtype=np.uint8)
+    m_blue = cv2.inRange(img_bgr, lower_b, upper_b)
+    lower_g = np.array([0, 200, 0], dtype=np.uint8)
+    upper_g = np.array([50, 255, 50], dtype=np.uint8)
+    m_green = cv2.inRange(img_bgr, lower_g, upper_g)
+    return cv2.bitwise_or(cv2.bitwise_or(m_orange, m_purple), cv2.bitwise_or(m_blue, m_green))
+
+
+def _roof_footprint_area_perimeter_px_walls(
+    out_root: Path,
+    plan_id: str,
+    wpts: list[Any],
+) -> tuple[float, float] | None:
+    """
+    Amprentă „mov”: după ``base_fp`` = poligon ∩ (09 dacă există), partiție flood mov+negru cu bariere
+    pereți; componente ce ating marginea imaginii → excluse (nu intră în mov).
+    Returnează (area_px, perimeter_px) sau None dacă nu se poate rasteriza (lipsă 01_walls).
+    """
+    walls_png = (
+        out_root
+        / "scale"
+        / plan_id
+        / "cubicasa_steps"
+        / "raster_processing"
+        / "walls_from_coords"
+        / "01_walls_from_coords.png"
+    )
+    interior_png = walls_png.parent / "09_interior.png"
+    if not walls_png.is_file():
+        return None
+    wall_g = cv2.imread(str(walls_png), cv2.IMREAD_GRAYSCALE)
+    if wall_g is None:
+        return None
+    h, w = wall_g.shape[:2]
+    from roof.insulated_area import split_mov_extra_roof_border_flood
+
+    interior_bin: np.ndarray | None = None
+    if interior_png.is_file():
+        im9 = cv2.imread(str(interior_png), cv2.IMREAD_COLOR)
+        if im9 is not None:
+            mh, mw = im9.shape[:2]
+            if mh != h or mw != w:
+                im9 = cv2.resize(im9, (w, h), interpolation=cv2.INTER_NEAREST)
+            interior_bin = _interior_footprint_mask_from_09_png_bgr(im9)
+            if int(np.count_nonzero(interior_bin)) <= 0:
+                interior_bin = None
+    arr_i: list[list[int]] = []
+    for p in wpts:
+        if isinstance(p, list) and len(p) >= 2:
+            arr_i.append([int(round(float(p[0]))), int(round(float(p[1])))])
+    if len(arr_i) < 3:
+        return None
+    poly = np.array(arr_i, dtype=np.int32)
+    poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+    poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+    poly_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(poly_mask, [poly], 255)
+    if interior_bin is not None:
+        base_fp = cv2.bitwise_and(poly_mask, interior_bin)
+    else:
+        base_fp = poly_mask
+    mov_u8, _extra_u8 = split_mov_extra_roof_border_flood(base_fp, wall_g)
+    eff = mov_u8
+    area_px = float(np.count_nonzero(eff))
+    if area_px <= 0:
+        return 0.0, 0.0
+    contours, _ = cv2.findContours(eff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    perim_px = float(sum(cv2.arcLength(c, True) for c in contours if len(c) >= 2))
+    return area_px, perim_px
+
+
 def _bbox_perimeter_px_from_points(pts: list[list[float]]) -> float:
     if not isinstance(pts, list) or len(pts) < 2:
         return 0.0
@@ -561,6 +652,7 @@ def _compute_rectangle_inputs_for_gemini(
         rect_json,
         run_id,
     )
+    floor_plan_map = _floor_idx_to_plan_id_map_from_run(out_root, run_id)
     for floor_idx, rects in _iter_edited_rectangles_roof_order(rect_json, run_id):
         if not isinstance(rects, list):
             continue
@@ -582,12 +674,19 @@ def _compute_rectangle_inputs_for_gemini(
                 ww = walls_floor[rect_idx].get("points")
                 if isinstance(ww, list) and len(ww) >= 3:
                     pts_walls = ww
-            mask_path = rect_root / f"floor_{floor_idx}" / f"rectangle_S{rect_idx}.png"
-            mask_img = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED) if mask_path.exists() else None
-            rect_mask = _extract_rectangle_color_mask(mask_img)
-            area_px = float(np.count_nonzero(rect_mask > 0))
-            # Requested method: flood fill + contour pixel counting on strict rectangle color.
-            perimeter_px = _flood_fill_contour_perimeter_px(rect_mask)
+            plan_id_g = floor_plan_map.get(int(floor_idx))
+            clip_mov = None
+            if plan_id_g and pts_walls is not None:
+                clip_mov = _roof_footprint_area_perimeter_px_walls(out_root, str(plan_id_g), pts_walls)
+            if clip_mov is not None and clip_mov[0] > 0:
+                area_px, perimeter_px = float(clip_mov[0]), float(clip_mov[1])
+            else:
+                mask_path = rect_root / f"floor_{floor_idx}" / f"rectangle_S{rect_idx}.png"
+                mask_img = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED) if mask_path.exists() else None
+                rect_mask = _extract_rectangle_color_mask(mask_img)
+                area_px = float(np.count_nonzero(rect_mask > 0))
+                # Requested method: flood fill + contour pixel counting on strict rectangle color.
+                perimeter_px = _flood_fill_contour_perimeter_px(rect_mask)
             if area_px <= 0:
                 continue
             # Coordinate alignment: editor polygons are often downscaled versus mask/walls space.
@@ -665,6 +764,24 @@ def _compute_rectangle_inputs_for_gemini(
                 "suprafata_geamuri_m2": round(sum_windows_m2, 4),
                 "windows": windows_for_rect,
             })
+    if out:
+        floor_totals: dict[int, float] = {}
+        floor_plan_map = _floor_idx_to_plan_id_map_from_run(out_root, run_id) if run_id else {}
+        floor_strips: dict[int, float] = {}
+        for row in out:
+            fi = int(row.get("floor_idx", 0))
+            area = max(0.0, float(row.get("amprenta_fara_overhang_m2") or 0.0))
+            floor_totals[fi] = floor_totals.get(fi, 0.0) + area
+            if fi not in floor_strips:
+                floor_strips[fi] = _wall_strip_area_m2_for_plan(out_root, floor_plan_map.get(fi))
+        for row in out:
+            fi = int(row.get("floor_idx", 0))
+            base_area = max(0.0, float(row.get("amprenta_fara_overhang_m2") or 0.0))
+            total_area = max(0.0, floor_totals.get(fi, 0.0))
+            strip_floor = max(0.0, floor_strips.get(fi, 0.0))
+            share = (strip_floor * (base_area / total_area)) if total_area > 1e-9 else 0.0
+            row["roof_wall_strip_m2"] = round(share, 4)
+            row["amprenta_fara_overhang_m2"] = round(base_area + share, 4)
     return out
 
 
@@ -783,6 +900,9 @@ def _extract_rectangle_measurements(
 ) -> list[dict[str, Any]]:
     """
     Build per-rectangle roof measurements from roof_rectangles_edited.json.
+    Cu roof_rectangles_edited_walls.json: amprenta „mov” = poligon ∩ (09 dacă există), apoi
+    partiție flood (mov+negru, barieră pereți; atinge marginea imaginii → extra), nu tot poligonul.
+
     Returns for each rectangle:
       - roof faces area without overhang (m²)
       - roof faces area with overhang (m²)
@@ -811,6 +931,9 @@ def _extract_rectangle_measurements(
                 continue
             floor_rect_pairs.append((fk, rects))
         floor_rect_pairs.sort(key=lambda t: t[0])
+    walls_raw = _read_json(out_root / "roof" / "roof_3d" / "roof_rectangles_edited_walls.json")
+    walls_by_floor: dict[str, Any] = walls_raw if isinstance(walls_raw, dict) else {}
+    floor_plan_map = _floor_idx_to_plan_id_map_from_run(out_root, run_id) if run_id else {}
     for floor_idx, rects in floor_rect_pairs:
         if not isinstance(rects, list):
             continue
@@ -819,44 +942,90 @@ def _extract_rectangle_measurements(
             mpp = 0.01
         for idx, rect in enumerate(rects):
             pts = rect.get("points") if isinstance(rect, dict) else None
-            if not isinstance(pts, list) or len(pts) < 4:
+            if not isinstance(pts, list) or len(pts) < 3:
                 continue
             try:
-                xs = [float(p[0]) for p in pts]
-                ys = [float(p[1]) for p in pts]
-                minx, maxx = min(xs), max(xs)
-                miny, maxy = min(ys), max(ys)
-                w_px = max(0.0, maxx - minx)
-                h_px = max(0.0, maxy - miny)
-                if w_px <= 0 or h_px <= 0:
-                    continue
                 angle_deg = float(rect.get("roofAngleDeg") or 0.0)
                 angle_deg = max(0.0, min(80.0, angle_deg))
                 cosv = math.cos(math.radians(angle_deg))
                 slope_factor = (1.0 / cosv) if cosv > 1e-6 else 1.0
-
-                base_area_m2 = (w_px * h_px) * (mpp ** 2)
-                area_without_overhang_m2 = base_area_m2 * slope_factor
-
                 oh_m = _rect_overhang_m(rect, overhang_m)
-                overhang_px = float(oh_m) / float(mpp)
-                w_ov_px = max(0.0, w_px + 2.0 * overhang_px)
-                h_ov_px = max(0.0, h_px + 2.0 * overhang_px)
-                base_area_with_ov_m2 = (w_ov_px * h_ov_px) * (mpp ** 2)
-                area_with_overhang_m2 = base_area_with_ov_m2 * slope_factor
 
-                perimeter_with_overhang_m = (2.0 * (w_ov_px + h_ov_px)) * mpp
+                wpts = None
+                wf = walls_by_floor.get(str(floor_idx))
+                if isinstance(wf, list) and idx < len(wf) and isinstance(wf[idx], dict):
+                    wp = wf[idx].get("points")
+                    if isinstance(wp, list) and len(wp) >= 3:
+                        wpts = wp
+                plan_id = floor_plan_map.get(int(floor_idx))
+                clip = None
+                if run_id and plan_id and wpts is not None:
+                    clip = _roof_footprint_area_perimeter_px_walls(out_root, str(plan_id), wpts)
+
+                if clip is not None:
+                    area_px_w, perim_px_w = clip
+                    if float(area_px_w) <= 0:
+                        continue
+                    amp_m2 = float(area_px_w) * (mpp ** 2)
+                    perim_m = float(perim_px_w) * mpp
+                    ext_amp_m2 = max(0.0, amp_m2 + perim_m * oh_m + math.pi * (oh_m ** 2))
+                    area_without_overhang_m2 = amp_m2 * slope_factor
+                    area_with_overhang_m2 = ext_amp_m2 * slope_factor
+                    perimeter_with_overhang_m = max(0.0, perim_m + 2.0 * math.pi * oh_m)
+                    out.append({
+                        "floor_idx": int(floor_idx),
+                        "rectangle_idx": idx,
+                        "roof_type": rect.get("roofType"),
+                        "roof_angle_deg": round(angle_deg, 2),
+                        "roof_wall_strip_m2": 0.0,
+                        "roof_area_without_overhang_m2": round(area_without_overhang_m2, 4),
+                        "roof_area_with_overhang_m2": round(area_with_overhang_m2, 4),
+                        "roof_perimeter_with_overhang_m": round(perimeter_with_overhang_m, 4),
+                    })
+                    continue
+
+                pts_xy: list[list[float]] = []
+                for p in pts:
+                    if isinstance(p, list) and len(p) >= 2:
+                        pts_xy.append([float(p[0]), float(p[1])])
+                if len(pts_xy) < 3:
+                    continue
+                if len(pts_xy) >= 2:
+                    a0, a1 = pts_xy[0], pts_xy[-1]
+                    if abs(a0[0] - a1[0]) < 1e-9 and abs(a0[1] - a1[1]) < 1e-9:
+                        pts_xy = pts_xy[:-1]
+                if len(pts_xy) < 3:
+                    continue
+                poly = np.asarray(pts_xy, dtype=np.float64).reshape((-1, 1, 2))
+                area_px = float(abs(cv2.contourArea(poly)))
+                if area_px <= 0:
+                    continue
+                perim_px = float(cv2.arcLength(poly, True))
+
+                amp_m2 = area_px * (mpp ** 2)
+                perim_m = perim_px * mpp
+                n_ext, n_int = _count_polygon_corner_types(pts_xy)
+                ext_amp_m2 = max(
+                    0.0,
+                    amp_m2 + perim_m * oh_m + float(n_ext - n_int) * (oh_m ** 2),
+                )
+                area_without_overhang_m2 = amp_m2 * slope_factor
+                area_with_overhang_m2 = ext_amp_m2 * slope_factor
+
+                perimeter_with_overhang_m = max(0.0, perim_m + 2.0 * oh_m * float(n_ext - n_int))
                 out.append({
                     "floor_idx": int(floor_idx),
                     "rectangle_idx": idx,
                     "roof_type": rect.get("roofType"),
                     "roof_angle_deg": round(angle_deg, 2),
+                    "roof_wall_strip_m2": 0.0,
                     "roof_area_without_overhang_m2": round(area_without_overhang_m2, 4),
                     "roof_area_with_overhang_m2": round(area_with_overhang_m2, 4),
                     "roof_perimeter_with_overhang_m": round(perimeter_with_overhang_m, 4),
                 })
             except Exception:
                 continue
+    _apply_wall_strip_distribution(out_root, run_id, out, "roof_area_without_overhang_m2")
     return out
 
 
@@ -939,6 +1108,7 @@ def _extract_rectangle_measurements_from_3d(
             # Perimeter requested "with overhang": roof + overhang outer contour from unfolded masks.
             perimeter_with_overhang_m = overhang_contour_px * mpp
             area_without_overhang_m2 = roof_area_px * (mpp ** 2)
+            wall_strip_m2 = 0.0
             area_with_overhang_m2 = (roof_area_px + overhang_area_px) * (mpp ** 2)
             if area_without_overhang_m2 <= 0 and area_with_overhang_m2 <= 0:
                 continue
@@ -947,10 +1117,12 @@ def _extract_rectangle_measurements_from_3d(
                 "rectangle_idx": rect_idx,
                 "roof_type": roof_type,
                 "roof_angle_deg": round(float(roof_angle), 2) if roof_angle is not None else None,
+                "roof_wall_strip_m2": round(wall_strip_m2, 4),
                 "roof_area_without_overhang_m2": round(area_without_overhang_m2, 4),
                 "roof_area_with_overhang_m2": round(area_with_overhang_m2, 4),
                 "roof_perimeter_with_overhang_m": round(perimeter_with_overhang_m, 4),
             })
+    _apply_wall_strip_distribution(out_root, run_id, out, "roof_area_without_overhang_m2")
     return out
 
 
@@ -997,6 +1169,65 @@ def _attach_plan_id_to_rectangle_rows(
         pid = m.get(fi)
         if pid:
             r["plan_id"] = str(pid)
+
+
+def _wall_strip_area_m2_for_plan(out_root: Path, plan_id: str | None) -> float:
+    if not plan_id:
+        return 0.0
+    p = out_root / "scale" / str(plan_id) / "cubicasa_steps" / "raster_processing" / "walls_from_coords" / "walls_measurements.json"
+    if not p.exists():
+        return 0.0
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    avg = raw.get("average_result") if isinstance(raw, dict) else {}
+    if not isinstance(avg, dict):
+        return 0.0
+    try:
+        ext_len = float(avg.get("exterior_meters") or 0.0)
+        int_len = float(avg.get("interior_meters_structure") or avg.get("interior_meters") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, (ext_len * EXTERIOR_WALL_STRIP_M) + (int_len * INTERIOR_WALL_STRIP_M))
+
+
+def _apply_wall_strip_distribution(
+    out_root: Path,
+    run_id: str,
+    rows: list[dict[str, Any]],
+    area_key: str,
+) -> None:
+    if not rows or not area_key:
+        return
+    floor_plan_map = _floor_idx_to_plan_id_map_from_run(out_root, run_id) if run_id else {}
+    floor_totals: dict[int, float] = {}
+    floor_strips: dict[int, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            fi = int(row.get("floor_idx", 0))
+        except (TypeError, ValueError):
+            fi = 0
+        area = float(row.get(area_key) or 0.0)
+        floor_totals[fi] = floor_totals.get(fi, 0.0) + max(0.0, area)
+        if fi not in floor_strips:
+            floor_strips[fi] = _wall_strip_area_m2_for_plan(out_root, floor_plan_map.get(fi))
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            fi = int(row.get("floor_idx", 0))
+        except (TypeError, ValueError):
+            fi = 0
+        base_area = max(0.0, float(row.get(area_key) or 0.0))
+        total_area = max(0.0, floor_totals.get(fi, 0.0))
+        strip_floor = max(0.0, floor_strips.get(fi, 0.0))
+        share = (strip_floor * (base_area / total_area)) if total_area > 1e-9 else 0.0
+        row["roof_wall_strip_m2"] = round(share, 4)
+        row["roof_area_without_overhang_m2"] = round(max(0.0, float(row.get("roof_area_without_overhang_m2") or 0.0) + share), 4)
+        row["roof_area_with_overhang_m2"] = round(max(0.0, float(row.get("roof_area_with_overhang_m2") or 0.0) + share), 4)
 
 
 def generate_roof_pricing(run_id: str, frontend_data: dict | None = None) -> Path | None:

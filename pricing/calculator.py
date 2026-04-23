@@ -85,8 +85,9 @@ def calculate_pricing_for_plan(
     
     surfaces = area_data.get("surfaces", {})
     foundation_area = float(surfaces.get("foundation_m2") or 0.0)
-    floor_area = float(surfaces.get("floor_m2") or 0.0)
-    ceiling_area = float(surfaces.get("ceiling_m2") or 0.0)
+    floor_area = float(surfaces.get("floor_m2") or 0.0)  # pardoseală (fără pereți)
+    ceiling_area = float(surfaces.get("ceiling_m2") or 0.0)  # tavan (fără pereți)
+    floor_structure_area = float(surfaces.get("floor_structure_m2") or floor_area)  # podea structură (cu pereți)
 
     # 3. PREFERINȚE UTILIZATOR (citite după tag când e cazul, pentru formulare diferite per client)
     values_by_tag = build_values_by_tag(frontend_input)
@@ -285,7 +286,7 @@ def calculate_pricing_for_plan(
             type_int_inner=finish_int_beci, type_int_outer=finish_int_beci, type_ext="Tencuială",
             floor_label="Beci"
         )
-        cost_floors_b = calculate_floors_details(area_coeffs, floor_area, ceiling_area)
+        cost_floors_b = calculate_floors_details(area_coeffs, floor_structure_area, ceiling_area)
         electricity_coeffs = pricing_coeffs["utilities"]["electricity"]
         heating_coeffs = pricing_coeffs["utilities"]["heating"]
         ventilation_coeffs = pricing_coeffs["utilities"]["ventilation"]
@@ -644,8 +645,8 @@ def calculate_pricing_for_plan(
                 opt_boden = (bdb_data.get(bodenaufbau_key) or "").strip()
                 if opt_boden:
                     price_b = float(bodenaufbau_map.get(opt_boden, 0))
-                    cost_floor_str = floor_area * price_b
-                    items.append({"category": "bodenaufbau", "name": f"Bodenaufbau ({opt_boden})", "area_m2": round(floor_area, 2), "unit_price": round(price_b, 2), "cost": round(cost_floor_str, 2)})
+                    cost_floor_str = floor_structure_area * price_b
+                    items.append({"category": "bodenaufbau", "name": f"Bodenaufbau ({opt_boden})", "area_m2": round(floor_structure_area, 2), "unit_price": round(price_b, 2), "cost": round(cost_floor_str, 2)})
             opt_belag_sel = (bdb_data.get(bodenbelag_key) or "").strip()
             if opt_belag_sel:
                 price_bl = float(bodenbelag_map.get(opt_belag_sel, 0))
@@ -658,10 +659,10 @@ def calculate_pricing_for_plan(
                 cost_ceil_str = ceiling_area * price_d
                 items.append({"category": "deckenaufbau", "name": f"Deckenaufbau ({opt_decken})", "area_m2": round(ceiling_area, 2), "unit_price": round(price_d, 2), "cost": round(cost_ceil_str, 2)})
         total_bdb = cost_floor_str + cost_ceil_str + cost_belag
-        cost_floors_ceilings = {"total_cost": round(total_bdb, 2), "detailed_items": items} if items else calculate_floors_details(area_coeffs, floor_area, ceiling_area)
+        cost_floors_ceilings = {"total_cost": round(total_bdb, 2), "detailed_items": items} if items else calculate_floors_details(area_coeffs, floor_structure_area, ceiling_area)
     else:
         cost_floors_ceilings = calculate_floors_details(
-            area_coeffs, floor_area, ceiling_area
+            area_coeffs, floor_structure_area, ceiling_area
         )
 
     if roof_data:
@@ -811,7 +812,7 @@ def calculate_pricing_for_plan(
         # Calculăm ariile pentru beci folosind coeficienții
         w_int_net_structure_basement = w_int_net_structure * coeff_walls
         w_int_net_finish_basement = w_int_net_finish * coeff_walls
-        floor_area_basement = floor_area * coeff_floors
+        floor_area_basement = floor_structure_area * coeff_floors
         ceiling_area_basement = ceiling_area * coeff_floors
         
         print(f"   📐 [BASEMENT] Coeficienți aplicați: pereți={coeff_walls:.0%}, podele={coeff_floors:.0%}")

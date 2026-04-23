@@ -3161,7 +3161,7 @@ def _project_overview(
         try:
             rm_ins = (roof_pricing or {}).get("roof_measurements") or {}
             roof_area_insulated = rm_ins.get("roof_area_insulated_m2")
-            if roof_area_insulated is not None and float(roof_area_insulated) >= 0:
+            if roof_area_insulated is not None and float(roof_area_insulated) > 0:
                 overview_items.append(f"<b>Dachfläche gedämmt:</b> <b>{float(roof_area_insulated):.1f} m²</b>")
         except Exception:
             pass

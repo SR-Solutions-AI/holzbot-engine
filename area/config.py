@@ -9,4 +9,4 @@ STANDARD_WINDOW_HEIGHT_M = 1.25
 
 # Grosimi standard pereți (pentru calcul amprentă)
 WALL_THICKNESS_EXTERIOR_M = 0.30  # 30 cm
-WALL_THICKNESS_INTERIOR_M = 0.15  # 15 cm
+WALL_THICKNESS_INTERIOR_M = 0.12  # 12 cm

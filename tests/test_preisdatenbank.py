@@ -17,16 +17,17 @@ def _build_coeffs_from_data_map(data_map: dict) -> dict:
     _elec_base = float(data_map.get("electricity_base_price", 60.0))
     _heat_base = float(data_map.get("heating_base_price", 70.0))
 
+    _placa = float(data_map.get("unit_price_placa", 120))
     out = {
         "foundation": {
             "unit_price_per_m2": {
-                "Kein Keller (nur Bodenplatte)": data_map.get("unit_price_placa", 120),
-                "Keller (ohne Ausbau)": data_map.get("unit_price_keller_nutzkeller", 145),
-                "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": data_map.get("unit_price_keller_nutzkeller", 145),
-                "Keller (mit Ausbau)": data_map.get("unit_price_keller_ausbau", 185),
-                "Keller (unbeheizt / Nutzkeller)": data_map.get("unit_price_keller_nutzkeller", 145),
-                "Keller (mit einfachem Ausbau)": data_map.get("unit_price_keller_ausbau", 185),
-                "Placă": data_map.get("unit_price_placa", 120),
+                "Kein Keller (nur Bodenplatte)": _placa,
+                "Keller (ohne Ausbau)": _placa,
+                "Keller (unbeheizt / Nutzkeller) (ohne Ausbau)": _placa,
+                "Keller (mit Ausbau)": _placa,
+                "Keller (unbeheizt / Nutzkeller)": _placa,
+                "Keller (mit einfachem Ausbau)": _placa,
+                "Placă": _placa,
                 "Piloți": data_map.get("unit_price_piloti", 180),
                 "Soclu": data_map.get("unit_price_soclu", 95),
             }
@@ -136,11 +137,11 @@ class TestPreisdatenbankMapping:
         out = _build_coeffs_from_data_map(data_map)
         f = out["foundation"]["unit_price_per_m2"]
         assert f["Kein Keller (nur Bodenplatte)"] == 125.0
-        assert f["Keller (ohne Ausbau)"] == 150.0
-        assert f["Keller (unbeheizt / Nutzkeller) (ohne Ausbau)"] == 150.0
-        assert f["Keller (mit Ausbau)"] == 190.0
-        assert f["Keller (unbeheizt / Nutzkeller)"] == 150.0
-        assert f["Keller (mit einfachem Ausbau)"] == 190.0
+        assert f["Keller (ohne Ausbau)"] == 125.0
+        assert f["Keller (unbeheizt / Nutzkeller) (ohne Ausbau)"] == 125.0
+        assert f["Keller (mit Ausbau)"] == 125.0
+        assert f["Keller (unbeheizt / Nutzkeller)"] == 125.0
+        assert f["Keller (mit einfachem Ausbau)"] == 125.0
         assert f["Placă"] == 125.0
         assert f["Piloți"] == 185.0
         assert f["Soclu"] == 98.0
@@ -149,6 +150,7 @@ class TestPreisdatenbankMapping:
         out = _build_coeffs_from_data_map({})
         f = out["foundation"]["unit_price_per_m2"]
         assert f["Kein Keller (nur Bodenplatte)"] == 120
+        assert f["Keller (mit Ausbau)"] == 120
         assert f["Piloți"] == 180
         assert f["Soclu"] == 95
 
@@ -294,6 +296,8 @@ class TestPreisdatenbankPricesApplied:
         )
         assert result["total_cost"] == round(95.0 * 118.50, 2)
         assert result["detailed_items"][0]["unit_price"] == 118.50
+        result_keller = calculate_foundation_details(coeffs["foundation"], 95.0, "Keller (mit Ausbau)")
+        assert result_keller["detailed_items"][0]["unit_price"] == 118.50
 
     def test_coeffs_from_data_map_used_in_stairs(self):
         from pricing.modules.stairs import calculate_stairs_details
