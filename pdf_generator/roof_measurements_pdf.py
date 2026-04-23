@@ -329,21 +329,21 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
         items_fc = fc.get("detailed_items", []) or fc.get("items", [])
         floor_structure_area = 0.0
         floor_finish_area = 0.0
-        foundation_area = 0.0
         ceiling_area = 0.0
         for it in items_fc:
             cat = str(it.get("category", "")).lower()
             a = float(it.get("area_m2", 0) or 0)
-            if cat == "floor_structure":
+            if cat in ("floor_structure", "bodenaufbau"):
                 floor_structure_area += a
             elif cat == "bodenbelag":
                 floor_finish_area += a
-            elif cat == "ceiling_structure":
+            elif cat in ("ceiling_structure", "deckenaufbau"):
                 ceiling_area += a
+        total_plan_m2 = float(pr.get("total_area_m2", 0) or 0)
         if floor_structure_area == 0 and items_fc:
-            floor_structure_area = float(pr.get("total_area_m2", 0) or 0)
+            floor_structure_area = total_plan_m2
         if floor_finish_area == 0:
-            floor_finish_area = float(pr.get("total_area_m2", 0) or 0)
+            floor_finish_area = total_plan_m2
         if ceiling_area == 0:
             ceiling_area = floor_finish_area
         op = bd.get("openings", {}) or {}
@@ -382,7 +382,6 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
                 fs_m = float(surf.get("floor_structure_m2") or 0)
                 f_m = float(surf.get("floor_m2") or 0)
                 c_m = float(surf.get("ceiling_m2") or 0)
-                fdn_m = float(surf.get("foundation_m2") or 0)
                 if fs_m > 0:
                     floor_structure_area = fs_m
                 if f_m > 0:
@@ -391,8 +390,6 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
                     ceiling_area = c_m
                 elif f_m > 0:
                     ceiling_area = f_m
-                if fdn_m > 0:
-                    foundation_area = fdn_m
                 op_mp = mp.get("openings")
                 if isinstance(op_mp, list) and op_mp:
                     nd = nw = 0
@@ -431,7 +428,6 @@ def _load_floor_data_from_pricing(out_root: Path) -> dict[str, dict[str, Any]]:
             "finish_ext_net_m2": round(fin_ext, 2),
             "floor_structure_area_m2": round(floor_structure_area, 2),
             "floor_finish_area_m2": round(floor_finish_area, 2),
-            "foundation_area_m2": round(foundation_area, 2),
             "ceiling_area_m2": round(ceiling_area, 2),
             "num_doors": int(num_doors),
             "num_windows": int(num_windows),
@@ -717,10 +713,9 @@ def _append_building_measurements_table(
         rows.append(["Außenfassade (netto)", f"{fd['finish_ext_net_m2']:.2f}", "m²"])
     rows.extend(
         [
-            ["Podea structură", f"{float(fd.get('floor_structure_area_m2', 0.0) or 0.0):.2f}", "m²"],
-            ["Pardoseală", f"{float(fd.get('floor_finish_area_m2', 0.0) or 0.0):.2f}", "m²"],
-            ["Fundație", f"{float(fd.get('foundation_area_m2', 0.0) or 0.0):.2f}", "m²"],
-            ["Deckenfläche", f"{fd['ceiling_area_m2']:.2f}", "m²"],
+            ["Deckenfläche", f"{float(fd.get('ceiling_area_m2', 0.0) or 0.0):.2f}", "m²"],
+            ["Bodenbelag", f"{float(fd.get('floor_finish_area_m2', 0.0) or 0.0):.2f}", "m²"],
+            ["Bodenfläche", f"{float(fd.get('floor_structure_area_m2', 0.0) or 0.0):.2f}", "m²"],
         ]
     )
     balkon_floor = max(0.0, float(fd.get("balkon_floor_m2", 0.0) or 0.0))
