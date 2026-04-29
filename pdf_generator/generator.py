@@ -2012,18 +2012,15 @@ def _first_page_canvas(offer_no: str, handler: str, assets: dict | None = None, 
     def _inner(canv: Canvas, doc):
         _draw_ribbon(canv)
         a = assets or {}
-        show_logos = a.get("show_offer_logos", True)
+        # Uniform preset: no extra left-strip logos unless explicitly enabled.
+        show_logos = bool(a.get("show_offer_logos", False))
         logos_file = a.get("offer_logos_image")
 
         identity_path = _identity_path_for_pdf(a)
         if identity_path and identity_path.exists():
             canv.drawImage(str(identity_path), A4[0]-18*mm-85*mm, A4[1]-53*mm, 85*mm, 22*mm, preserveAspectRatio=True, mask='auto')
 
-        # Holzbau / Eder / Betonbau: fără banda offer_logos (doar branding propriu / identity)
-        is_holzbau = tenant_slug and tenant_slug.lower() == "holzbau"
-        is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
-        is_betonbau = tenant_slug and tenant_slug.lower() == "betonbau"
-        if not is_holzbau and not is_eder and not is_betonbau and show_logos:
+        if show_logos:
             logos_path = _asset_path(logos_file) if logos_file else IMG_LOGOS
             if logos_path and logos_path.exists():
                 canv.drawImage(str(logos_path), 18*mm, A4[1]-55*mm, 80*mm, 26*mm, preserveAspectRatio=True, mask='auto', anchor='sw')
