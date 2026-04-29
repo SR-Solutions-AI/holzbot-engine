@@ -1608,26 +1608,6 @@ def _build_form_preisdatenbank_rows(frontend_data: dict, pricing_coeffs: dict, e
             _price(vent_base) if vent and vent_base is not None else "—"
         ))
 
-    # --- Semineu / Kamin ---
-    if _incl_pd.get("utilities"):
-        tip_sem = perf.get("tipSemineu") or (frontend_data or {}).get("incalzire", {}).get("tipSemineu")
-        fp = pc.get("fireplace", {})
-        fire_prices = fp.get("prices", {})
-        sem_price = fire_prices.get(tip_sem) if tip_sem else None
-        rows.append((
-            "Kamin / Ofen",
-            "Kaminart",
-            _fv("performantaEnergetica", "tipSemineu", "performanta", "tipSemineu", "incalzire", "tipSemineu", "—"),
-            _price(sem_price)
-        ))
-        horn_pf = fp.get("horn_per_floor")
-        rows.append((
-            "Kaminabzug",
-            "Horn pro Geschoss (€)",
-            "—",
-            _price(horn_pf)
-        ))
-
     # --- Scări ---
     if _incl_pd.get("floors_ceilings"):
         stair_c = pc.get("stairs", {})
@@ -2952,16 +2932,6 @@ def _project_overview(
     performanta_energetica = frontend_data.get("performantaEnergetica", {})
     incalzire = performanta.get("tipIncalzire") or performanta_energetica.get("tipIncalzire") or incalzire_data.get("tipIncalzire") or performanta.get("incalzire", "—")
     nivel_energetic = performanta.get("nivelEnergetic") or performanta_energetica.get("nivelEnergetic", "—")
-    # Citim tipul de semineu din performantaEnergetica (prioritate), apoi performanta, apoi incalzire
-    # Conform structurii din compute.utils.ts, tipSemineu poate fi în toate cele 3 locuri
-    tip_semineu = (
-        performanta_energetica.get("tipSemineu") or 
-        performanta.get("tipSemineu") or 
-        incalzire_data.get("tipSemineu") or 
-        "Kein Kamin"
-    )
-    print(f"🔍 [PDF] tip_semineu sources: performantaEnergetica={performanta_energetica.get('tipSemineu')}, performanta={performanta.get('tipSemineu')}, incalzire={incalzire_data.get('tipSemineu')}")
-    print(f"🔍 [PDF] Final tip_semineu: '{tip_semineu}'")
     tamplarie = materiale_finisaj.get("tamplarie", "—")
     nivel_finisare = _normalize_nivel_oferta(frontend_data)
     
@@ -3174,6 +3144,31 @@ def _project_overview(
     fd_overview = dict(frontend_data) if isinstance(frontend_data, dict) else {}
     fd_overview["wandaufbau"] = wa_ov
     fd_overview["bodenDeckeBelag"] = bd_ov
+    # Lift / Pilonen: semnale din pricing (editor), dacă nu sunt deja în job frontend_data.json
+    if plans_data:
+        vol_sum = 0.0
+        lift_any = False
+        for entry in plans_data:
+            bd_full = entry.get("pricing_breakdown_full")
+            if not isinstance(bd_full, dict):
+                bd_full = (entry.get("pricing") or {}).get("breakdown", {}) or {}
+            pil = bd_full.get("pillars") or {}
+            lift_bd = bd_full.get("lift") or {}
+            for it in pil.get("detailed_items", []) or []:
+                if isinstance(it, dict) and str(it.get("unit", "")).lower() in ("m3", "m³"):
+                    try:
+                        vol_sum += float(it.get("quantity", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                if float(lift_bd.get("total_cost", 0) or 0) > 0:
+                    lift_any = True
+            except (TypeError, ValueError):
+                pass
+        if vol_sum > 0 and fd_overview.get("_pillar_volume_m3") in (None, "", 0, "0"):
+            fd_overview["_pillar_volume_m3"] = round(vol_sum, 3)
+        if lift_any and not fd_overview.get("_lift_present"):
+            fd_overview["_lift_present"] = True
 
     overview_items.extend(
         build_selected_form_overview_items(
@@ -3190,7 +3185,6 @@ def _project_overview(
             incalzire_de=incalzire_de,
             nivel_energetic_de=nivel_energetic_de,
             nivel_finisare_de=nivel_finisare_de,
-            tip_semineu=tip_semineu,
             aufstockung_omit_floor_labels=aufstockung_omit,
         )
     )
@@ -3240,6 +3234,8 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
     utilities_total = 0.0
     fireplace_total = 0.0
     stairs_total = 0.0
+    lift_total = 0.0
+    pillars_total = 0.0
     aufstockung_phase1_total = 0.0
     
     for entry in plans_data:
@@ -3259,6 +3255,8 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
             floors_total += bd.get("floors_ceilings", {}).get("total_cost", 0.0)
             # Stairs sunt incluse în floors_ceilings dacă este inclus
             stairs_total += bd.get("stairs", {}).get("total_cost", 0.0)
+            lift_total += bd.get("lift", {}).get("total_cost", 0.0)
+            pillars_total += bd.get("pillars", {}).get("total_cost", 0.0)
             aufstockung_phase1_total += bd.get("aufstockung_phase1", {}).get("total_cost", 0.0)
         if inclusions.get("roof", False):
             roof_total += bd.get("roof", {}).get("total_cost", 0.0)
@@ -3279,7 +3277,7 @@ def _simplified_cost_structure(story, styles, plans_data: list, inclusions: dict
     structure_total += roof_total + floors_total
     
     # Calculează totalul final (fără tabel, doar pentru verificare)
-    total_cost = foundation_total + structure_total + openings_total + finishes_total + utilities_total + fireplace_total + stairs_total + aufstockung_phase1_total
+    total_cost = foundation_total + structure_total + openings_total + finishes_total + utilities_total + fireplace_total + stairs_total + lift_total + pillars_total + aufstockung_phase1_total
     
     story.append(Spacer(1, 3*mm))
 
@@ -3628,6 +3626,12 @@ def generate_complete_offer_pdf(run_id: str, output_path: Path | None = None, jo
                     
                     # Basement este inclus dacă foundation este inclus (basement face parte din fundație/structură)
                     if category_key == "basement" and inclusions.get("foundation", False):
+                        filtered_breakdown[category_key] = category_data
+                        filtered_total += category_data.get("total_cost", 0.0)
+                        continue
+                    
+                    # Aufzug / Pilonen: poziții structurale (același domeniu ca Tragwerk)
+                    if category_key in ("lift", "pillars") and inclusions.get("structure_walls", False):
                         filtered_breakdown[category_key] = category_data
                         filtered_total += category_data.get("total_cost", 0.0)
                         continue
@@ -4334,6 +4338,12 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                         filtered_total += category_data.get("total_cost", 0.0)
                         continue
                     
+                    # Aufzug / Pilonen: structură (Tragwerk)
+                    if category_key in ("lift", "pillars") and inclusions.get("structure_walls", False):
+                        filtered_breakdown[category_key] = category_data
+                        filtered_total += category_data.get("total_cost", 0.0)
+                        continue
+                    
                     # Wintergärten & Balkone: doar când oferta include finisaje (Altbau-Logik); nu pentru Rohbau-only
                     if (
                         category_key == "wintergaerten_balkone"
@@ -4503,6 +4513,10 @@ def generate_admin_offer_pdf(run_id: str, output_path: Path | None = None, job_r
                         story.append(Spacer(1, 3*mm))
                 except Exception as e:
                     print(f"⚠️ [PDF ADMIN] Could not load area_data for {plan.plan_id}: {e}")
+            if bd.get("lift") and float(bd.get("lift", {}).get("total_cost", 0) or 0) > 0:
+                _table_standard(story, styles, "Aufzug", bd.get("lift", {}), enforcer, show_mod_column=False)
+            if bd.get("pillars") and float(bd.get("pillars", {}).get("total_cost", 0) or 0) > 0:
+                _table_standard(story, styles, "Pilonen / Stützen", bd.get("pillars", {}), enforcer, show_mod_column=False)
             
             if bd.get("floors_ceilings"): 
                 _table_standard(story, styles, "Geschossdecken & Balken", bd.get("floors_ceilings", {}), enforcer, show_mod_column=False)
@@ -4679,6 +4693,11 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                     filtered_total += category_data.get("total_cost", 0.0)
                     continue
                 
+                if category_key in ("lift", "pillars") and inclusions.get("structure_walls", False):
+                    filtered_breakdown[category_key] = category_data
+                    filtered_total += category_data.get("total_cost", 0.0)
+                    continue
+                
                 # Verificăm dacă categoria este în inclusions
                 if inclusions.get(category_key, False):
                     filtered_breakdown[category_key] = category_data
@@ -4847,8 +4866,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
     nivel_energetic = performanta.get("nivelEnergetic") or performanta_energetica.get("nivelEnergetic")
     tip_incalzire = performanta.get("tipIncalzire") or performanta_energetica.get("tipIncalzire")
     ventilatie = performanta.get("ventilatie", False) or performanta_energetica.get("ventilatie", False)
-    tip_semineu = performanta_energetica.get("tipSemineu") or performanta.get("tipSemineu") or incalzire.get("tipSemineu")
-    semineu = tip_semineu and str(tip_semineu) != "Kein Kamin"
     material_acoperis = materiale_finisaj.get("materialAcoperis")
     
     story.append(Paragraph("User Selections for This Project (by form step)", styles["H2"]))
@@ -4892,7 +4909,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
         story.append(Paragraph(f"Energy level: {_en(nivel_energetic)}", styles["Body"]))
         story.append(Paragraph(f"Heating type: {_en(tip_incalzire)}", styles["Body"]))
         story.append(Paragraph(f"Ventilation / heat recovery: {'Yes' if ventilatie else 'No'}", styles["Body"]))
-        story.append(Paragraph(f"Fireplace: {_en(tip_semineu) if tip_semineu else 'No'}", styles["Body"]))
     
     story.append(Spacer(1, 6*mm))
     
@@ -5496,35 +5512,6 @@ def generate_admin_calculation_method_pdf(run_id: str, output_path: Path | None 
                 ))
                 story.append(Paragraph(
                     f"  {area:.2f} m² × {final_price:.2f} EUR/m² = <b>{cost:.2f} EUR</b>",
-                    styles["Body"]
-                ))
-            
-            story.append(Spacer(1, 4*mm))
-    
-        # 7. FIREPLACE & CHIMNEY CALCULATION FOR THIS PLAN (only for ground floor)
-        fireplace = breakdown.get("fireplace", {})
-        if fireplace and fireplace.get("total_cost", 0) > 0:
-            story.append(Paragraph("7. Fireplace & Chimney Calculation", styles["H2"]))
-            story.append(Paragraph(
-                "<b>Formula:</b> Fireplace cost = price from Preisdatenbank for selected type (Kamin/Ofen). "
-                "Chimney (Kaminabzug/Horn) = horn_price_per_floor × number of floors (no fixed base).",
-                styles["Body"]
-            ))
-            
-            story.append(Paragraph(
-                f"<b>Fireplace Selected:</b> {'Yes' if semineu else 'No'}",
-                styles["Body"]
-            ))
-            
-            items = fireplace.get("detailed_items", [])
-            for item in items:
-                name = item.get("name", "")
-                unit_price = item.get("unit_price", 0)
-                quantity = item.get("quantity", 1)
-                cost = item.get("total_cost", 0)
-                
-                story.append(Paragraph(
-                    f"<b>Calculation:</b> {name}: {quantity} × {unit_price:.2f} EUR = <b>{cost:.2f} EUR</b>",
                     styles["Body"]
                 ))
             

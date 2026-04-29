@@ -366,6 +366,14 @@ def build_selected_form_overview_items(
             field_tag="floor_height",
         )
     _append_overview_value("Treppentyp", frontend_data.get("structuraCladirii", {}).get("treppeTyp"), field_tag="stairs_type")
+    try:
+        pv = frontend_data.get("_pillar_volume_m3")
+        if pv is not None and inclusions_ov.get("structure_walls", False):
+            pvf = float(str(pv).replace(",", "."))
+            if pvf > 0:
+                overview_items.append(f"<b>Pilonen (Gesamtvolumen):</b> <b>{pvf:.3f} m³</b>")
+    except (TypeError, ValueError):
+        pass
     overview_items.append(f"<b>{enforcer.get('Dachtyp')}:</b> <b>{tip_acoperis_de}</b>")
     if inclusions_ov.get("finishes", False) and material_acoperis_de != "—":
         overview_items.append(f"<b>{enforcer.get('Dachmaterial')}:</b> <b>{material_acoperis_de}</b>")
@@ -396,15 +404,17 @@ def build_selected_form_overview_items(
                 roof_window_value = f"Ja ({enforcer.get(roof_window_type) or roof_window_type})"
             overview_items.append(f"<b>Dachfenster:</b> <b>{roof_window_value}</b>")
 
-    tip_semineu_str = str(tip_semineu).strip() if tip_semineu else ""
     if inclusions_ov.get("utilities"):
-        if tip_semineu_str:
-            semineu_de = _resolve_display_value(tip_semineu_str, "fireplace_type")
-            overview_items.append(f"<b>{enforcer.get('Kamin')}:</b> <b>{semineu_de}</b>")
-            if tip_semineu_str.lower() != "kein kamin":
-                overview_items.append(f"<b>{enforcer.get('Kaminabzug')}:</b> <b>für {num_floors} Geschosse</b>")
         if incalzire_de != "—":
             overview_items.append(f"<b>{enforcer.get('Heizsystem')}:</b> <b>{_resolve_display_value(incalzire_de, 'heating_type')}</b>")
+    lift_detected = bool(frontend_data.get("_lift_present"))
+    aufzug = sc_ov.get("aufzugVorhanden")
+    if inclusions_ov.get("utilities") or inclusions_ov.get("structure_walls", False):
+        if aufzug is not None or lift_detected:
+            av = lift_detected or (
+                aufzug is True or str(aufzug).strip().lower() in ("true", "1", "ja", "yes")
+            )
+            overview_items.append(f"<b>Aufzug vorhanden:</b> <b>{'Ja' if av else 'Nein'}</b>")
     if inclusions_ov.get("finishes"):
         overview_items.append(f"<b>{enforcer.get('Fertigstellungsgrad')}:</b> <b>{nivel_finisare_de}</b>")
 

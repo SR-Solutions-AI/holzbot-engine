@@ -146,6 +146,155 @@ def _count_stairs_from_detections_review(run_id: str, plans: List[PlanInfo]) -> 
     return total if found_any else None
 
 
+def _is_lift_type(v: object) -> bool:
+    t = str(v or "").strip().lower()
+    return t in {"lift", "aufzug", "elevator"}
+
+
+def _has_lift_from_detections_review(run_id: str, plans: List[PlanInfo]) -> bool | None:
+    """True if any plan has a lift door in editor saves (detections_edited) or review JSON."""
+    run_dir = get_run_dir(run_id)
+    found_any = False
+    for plan in plans:
+        base = run_dir / "scale" / plan.plan_id / "cubicasa_steps" / "raster"
+        p = base / "detections_edited.json"
+        if not p.exists():
+            p = base / "detections_review_data.json"
+        if not p.exists():
+            continue
+        found_any = True
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        doors = data.get("doors") if isinstance(data, dict) else []
+        if not isinstance(doors, list):
+            continue
+        for d in doors:
+            if isinstance(d, dict) and _is_lift_type(d.get("type")):
+                return True
+    return False if found_any else None
+
+
+def _polygon_area_px(points: list) -> float:
+    if not isinstance(points, list) or len(points) < 3:
+        return 0.0
+    acc = 0.0
+    for i in range(len(points)):
+        a = points[i]
+        b = points[(i + 1) % len(points)]
+        try:
+            ax, ay = float(a[0]), float(a[1])
+            bx, by = float(b[0]), float(b[1])
+        except Exception:
+            continue
+        acc += ax * by - bx * ay
+    return abs(acc) * 0.5
+
+
+def _resolve_height_by_floor_pos(frontend_data: dict, total_positions: int) -> dict[int, float]:
+    sc = frontend_data.get("structuraCladirii", {}) if isinstance(frontend_data, dict) else {}
+    lista = sc.get("listaEtaje") if isinstance(sc, dict) else []
+    lista = lista if isinstance(lista, list) else []
+    rh = sc.get("roomHeightsCm") if isinstance(sc, dict) else []
+    rh = rh if isinstance(rh, list) else []
+    tip = str(sc.get("tipFundatieBeci", "")) if isinstance(sc, dict) else ""
+    has_basement = ("Keller" in tip) and ("Kein Keller" not in tip)
+    def _cm(v: object) -> float | None:
+        try:
+            n = float(v)
+        except Exception:
+            return None
+        if n < 200 or n > 400:
+            return None
+        return n / 100.0
+    default_ground = _cm(sc.get("raumhoeheCm")) or 2.7
+    out: dict[int, float] = {}
+    idx = 0
+    rh_idx = 0
+    if has_basement and idx < total_positions:
+        h0 = _cm(rh[rh_idx] if rh_idx < len(rh) else None)
+        if h0 is not None:
+            out[idx] = h0
+        rh_idx += 1
+        idx += 1
+    if idx < total_positions:
+        out[idx] = default_ground
+        idx += 1
+    for floor in lista:
+        if idx >= total_positions:
+            break
+        f = str(floor).lower()
+        if f == "intermediar" or f.startswith("mansarda"):
+            hv = _cm(rh[rh_idx] if rh_idx < len(rh) else None)
+            if hv is not None:
+                out[idx] = hv
+            rh_idx += 1
+        idx += 1
+    for i in range(total_positions):
+        if i not in out:
+            out[i] = default_ground
+    return out
+
+
+def _pillar_volume_from_review(run_id: str, plans: List[PlanInfo], frontend_data: dict) -> float | None:
+    run_dir = get_run_dir(run_id)
+    floor_order_path = run_dir / "floor_order.json"
+    order_from_bottom: list[int] | None = None
+    try:
+        if floor_order_path.exists():
+            data = json.loads(floor_order_path.read_text(encoding="utf-8"))
+            arr = data.get("order_from_bottom")
+            if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
+                order_from_bottom = [int(x) for x in arr]
+    except Exception:
+        order_from_bottom = None
+    pos_by_plan: dict[int, int] = {}
+    if order_from_bottom:
+        for pos, pi in enumerate(order_from_bottom):
+            pos_by_plan[pi] = pos
+    else:
+        for i in range(len(plans)):
+            pos_by_plan[i] = i
+    heights = _resolve_height_by_floor_pos(frontend_data, len(plans))
+    total = 0.0
+    found_any = False
+    for i, plan in enumerate(plans):
+        pos = pos_by_plan.get(i, i)
+        h_m = heights.get(pos)
+        if h_m is None:
+            continue
+        p = run_dir / "scale" / plan.plan_id / "cubicasa_steps" / "raster" / "detections_edited.json"
+        if not p.exists():
+            p = run_dir / "scale" / plan.plan_id / "cubicasa_steps" / "raster" / "detections_review_data.json"
+            if not p.exists():
+                continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pillars = data.get("pillars") if isinstance(data, dict) else []
+        if not isinstance(pillars, list) or len(pillars) == 0:
+            continue
+        found_any = True
+        mpp = _read_meters_per_pixel(run_dir / "scale" / plan.plan_id / "scale_result.json")
+        for pl in pillars:
+            if not isinstance(pl, dict):
+                continue
+            area_m2 = pl.get("area_m2")
+            try:
+                a = float(area_m2) if area_m2 is not None else 0.0
+            except Exception:
+                a = 0.0
+            if a <= 0 and mpp and isinstance(pl.get("points"), list):
+                a = _polygon_area_px(pl.get("points")) * float(mpp) * float(mpp)
+            if a > 0:
+                total += a * h_m
+    if not found_any:
+        return None
+    return round(total, 3)
+
+
 def _apply_allowed_categories(result: dict, allowed: list[str] | None) -> dict:
     """
     Filters pricing breakdown based on allowed categories coming from offer_types.allowed_pricing_categories.
@@ -172,6 +321,9 @@ def _apply_allowed_categories(result: dict, allowed: list[str] | None) -> dict:
 
     keep_keys = {map_to_breakdown_key.get(a) for a in allowed}
     keep_keys.discard(None)
+    if "structure" in allowed:
+        keep_keys.add("lift")
+        keep_keys.add("pillars")
 
     new_bd: dict = {}
     total = 0.0
@@ -560,6 +712,12 @@ def run_pricing_for_run(run_id: str, max_parallel: int | None = None, frontend_d
     stairs_from_review = _count_stairs_from_detections_review(run_id, plans)
     if stairs_from_review is not None:
         frontend_data["_stairs_total_count"] = stairs_from_review
+    lift_present = _has_lift_from_detections_review(run_id, plans)
+    if lift_present is not None:
+        frontend_data["_lift_present"] = bool(lift_present)
+    pillar_volume = _pillar_volume_from_review(run_id, plans, frontend_data)
+    if pillar_volume is not None:
+        frontend_data["_pillar_volume_m3"] = float(pillar_volume)
     basement_plan_index = None
     try:
         run_dir = get_run_dir(run_id)

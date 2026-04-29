@@ -8,7 +8,7 @@ from .modules.openings import calculate_openings_details
 from .modules.walls import calculate_walls_details
 from .modules.floors import calculate_floors_details
 from .modules.roof import calculate_roof_details
-from .modules.utilities import calculate_utilities_details, calculate_fireplace_details
+from .modules.utilities import calculate_utilities_details
 from .modules.stairs import calculate_stairs_details
 from area.config import WALL_HEIGHT_EXTRA_STRUCTURE_AND_EXT_FINISH_M
 from pricing.height_resolve import resolve_room_height_m
@@ -532,14 +532,7 @@ def calculate_pricing_for_plan(
     # Citim tipul de încălzire din pasul "performanta" (mutat acolo) sau din pasul "incalzire" (fallback)
     heating_type = _fv("heating_type") or performanta.get("tipIncalzire") or frontend_input.get("incalzire", {}).get("tipIncalzire") or performanta.get("incalzire", "Gaz")
     
-    # Citim tipul de semineu din pasul "performantaEnergetica" (nou) sau "incalzire" (fallback)
-    tip_semineu = _fv("fireplace_type") or performanta.get("tipSemineu") or frontend_input.get("incalzire", {}).get("tipSemineu") or frontend_input.get("performantaEnergetica", {}).get("tipSemineu")
-    # Fallback pentru vechiul câmp boolean "semineu"
-    if not tip_semineu:
-        incalzire_data = frontend_input.get("incalzire", {})
-        has_semineu_old = incalzire_data.get("semineu", False) or False
-        if has_semineu_old:
-            tip_semineu = "Klassischer Holzofen"  # Default pentru vechiul câmp boolean
+    tip_semineu = None
     
     # 4. CALCULE COMPONENTE – pereți: Wandaufbau per etaj dacă există, altfel system_constructie (legacy)
     wandaufbau_coeffs = pricing_coeffs.get("wandaufbau", {})
@@ -707,13 +700,52 @@ def calculate_pricing_for_plan(
         )
     else:
         cost_stairs = {"total_cost": 0.0, "detailed_items": []}
-    
-    # Calculăm costurile pentru semineu și horn (doar o dată, la ground floor); prețuri din DB
-    fireplace_coeffs = pricing_coeffs.get("fireplace", {})
-    if is_ground_floor:
-        cost_fireplace = calculate_fireplace_details(tip_semineu, total_floors, fireplace_coeffs)
+
+    sc_lift = (frontend_input.get("structuraCladirii", {}) or {})
+    editor_lift = bool(frontend_input.get("_lift_present"))
+    form_lift = bool(
+        _as_bool(_fv("lift_present"), _as_bool(sc_lift.get("aufzugVorhanden"), False))
+    )
+    lift_present = editor_lift or form_lift
+    lift_type_selected = str(_fv("lift_type") or (frontend_input.get("structuraCladirii", {}) or {}).get("aufzugTyp") or "Hydraulikaufzug").strip()
+    lift_price_map = stairs_coeffs.get("lift_type_price_map") or {}
+    if is_ground_floor and lift_present:
+        lift_unit = float(lift_price_map.get(lift_type_selected, 0) or 0)
+        cost_lift = {
+            "total_cost": round(lift_unit, 2),
+            "detailed_items": [{
+                "category": "lift",
+                "name": f"Aufzug ({lift_type_selected})",
+                "quantity": 1,
+                "unit": "Stück",
+                "unit_price": round(lift_unit, 2),
+                "cost": round(lift_unit, 2),
+            }],
+        }
     else:
-        cost_fireplace = {"total_cost": 0.0, "detailed_items": []}
+        cost_lift = {"total_cost": 0.0, "detailed_items": []}
+
+    pillar_volume_m3 = float(frontend_input.get("_pillar_volume_m3") or 0.0)
+    pillar_type = str(_fv("pillar_type") or (frontend_input.get("structuraCladirii", {}) or {}).get("pilonType") or "Stahlbeton").strip()
+    pillar_price_map = area_coeffs.get("pillar_type_price_per_m3") or {}
+    if is_ground_floor and pillar_volume_m3 > 0:
+        pillar_unit = float(pillar_price_map.get(pillar_type, 0) or 0)
+        cost_pillars = {
+            "total_cost": round(pillar_volume_m3 * pillar_unit, 2),
+            "detailed_items": [{
+                "category": "pillars",
+                "name": f"Pilonen ({pillar_type})",
+                "quantity": round(pillar_volume_m3, 3),
+                "unit": "m3",
+                "unit_price": round(pillar_unit, 2),
+                "cost": round(pillar_volume_m3 * pillar_unit, 2),
+            }],
+        }
+    else:
+        cost_pillars = {"total_cost": 0.0, "detailed_items": []}
+    
+    # Fireplace/Kamin is deprecated and excluded from pricing.
+    cost_fireplace = {"total_cost": 0.0, "detailed_items": []}
 
     # 5. TOTAL – Nivel ofertă (tag: offer_scope) decide CE includem, nu coeficient
     nivel_oferta_raw = (str(_fv("offer_scope") or sist_constr.get("nivelOferta") or mat_finisaj.get("nivelOferta") or "").strip())
@@ -738,7 +770,10 @@ def calculate_pricing_for_plan(
     include_finishes = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
     include_utilities = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
     include_stairs = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
-    include_fireplace = nivel_oferta not in ("Rohbau/Tragwerk", "Tragwerk + Fenster")
+    include_pillars = True
+    # Lift is structural (like pillars); include in Rohbau/Tragwerk when detection/form says so.
+    include_lift = include_pillars
+    include_fireplace = False
 
     # 5. Structură totală (fundație + pereți + planșeu + acoperiș) × acces șantier × teren
     sist_coeffs = pricing_coeffs.get("sistem_constructiv", {})
@@ -777,6 +812,8 @@ def calculate_pricing_for_plan(
         (cost_finishes["total_cost"] if include_finishes else 0.0) +
         (cost_utilities["total_cost"] if include_utilities else 0.0) +
         (cost_stairs["total_cost"] if include_stairs else 0.0) +
+        (cost_lift["total_cost"] if include_lift else 0.0) +
+        (cost_pillars["total_cost"] if include_pillars else 0.0) +
         (cost_fireplace["total_cost"] if include_fireplace else 0.0)
     )
     total_plan_cost = round(total_plan_cost + float(cost_zubau_wall_demolition_extra or 0.0), 2)
@@ -1216,6 +1253,8 @@ def calculate_pricing_for_plan(
             "finishes": _zero_if_excluded(cost_finishes, include_finishes),
             "utilities": _zero_if_excluded(cost_utilities, include_utilities),
             "stairs": _zero_if_excluded(cost_stairs, include_stairs),
+            "lift": _zero_if_excluded(cost_lift, include_lift),
+            "pillars": _zero_if_excluded(cost_pillars, include_pillars),
             "fireplace": _zero_if_excluded(cost_fireplace, include_fireplace),
             "basement": cost_basement,
             "wintergaerten_balkone": _zero_if_excluded(cost_wintergaerten_balkone, include_finishes),

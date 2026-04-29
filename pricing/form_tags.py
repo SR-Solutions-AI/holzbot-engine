@@ -21,6 +21,9 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
     ("structuraCladirii", "pilons"): "pilings_required",
     ("structuraCladirii", "raumhoeheCm"): "room_height_cm",
     ("structuraCladirii", "balkonBoden"): "balkon_boden",
+    ("structuraCladirii", "aufzugVorhanden"): "lift_present",
+    ("structuraCladirii", "aufzugTyp"): "lift_type",
+    ("structuraCladirii", "pilonType"): "pillar_type",
     ("daemmungDachdeckung", "daemmung"): "roof_insulation",
     ("daemmungDachdeckung", "unterdach"): "under_roof",
     ("daemmungDachdeckung", "dachstuhlTyp"): "roof_structure_type",
@@ -37,12 +40,10 @@ BUILTIN_FIELD_TAG_MAP: dict[tuple[str, str], str] = {
     ("ferestreUsi", "garagentorGewuenscht"): "garage_door_desired",
     ("ferestreUsi", "treppeTyp"): "stairs_type",
     ("performantaEnergetica", "tipIncalzire"): "heating_type",
-    ("performantaEnergetica", "tipSemineu"): "fireplace_type",
     ("performantaEnergetica", "includeElectricity"): "include_electricity",
     ("performantaEnergetica", "includeSewage"): "include_sewage",
     # Alias-uri pentru payload-uri care folosesc step keys diferite
     ("performanta", "tipIncalzire"): "heating_type",
-    ("performanta", "tipSemineu"): "fireplace_type",
     ("performanta", "includeElectricity"): "include_electricity",
     ("performanta", "includeSewage"): "include_sewage",
 }

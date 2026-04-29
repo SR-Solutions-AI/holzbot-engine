@@ -266,6 +266,12 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
         "area": {
             "floor_coefficient_per_m2": data_map.get("floor_coeff_per_m2", 0),
             "ceiling_coefficient_per_m2": data_map.get("ceiling_coeff_per_m2", 0),
+            "pillar_type_price_per_m3": {
+                "Stahlbeton": data_map.get("pillar_type_stahlbeton_m3_price", 0),
+                "Stahl": data_map.get("pillar_type_stahl_m3_price", 0),
+                "Holz": data_map.get("pillar_type_holz_m3_price", 0),
+                "Verbund": data_map.get("pillar_type_verbund_m3_price", 0),
+            },
             # Raumhöhe (floor_height): înălțimi (m) per opțiune – folosite la calculul ariilor pereți, nu la preț
             "floor_height_m": {
                 "Standard (2,50 m)": float(data_map.get("inaltime_etaje_standard_m", 2.5)),
@@ -282,6 +288,12 @@ def fetch_pricing_parameters(tenant_slug: str, calc_mode: str | None = None) -> 
                 "Beton": data_map.get("stairs_type_beton_piece_price", data_map.get("price_per_stair_unit", 0)),
                 "Metall": data_map.get("stairs_type_metall_piece_price", data_map.get("price_per_stair_unit", 0)),
                 "Sonder": data_map.get("stairs_type_sonder_piece_price", data_map.get("price_per_stair_unit", 0)),
+            },
+            "lift_type_price_map": {
+                "Hydraulikaufzug": data_map.get("lift_type_hydraulikaufzug_piece_price", 0),
+                "Seilaufzug": data_map.get("lift_type_seilaufzug_piece_price", 0),
+                "Panoramaaufzug": data_map.get("lift_type_panoramaaufzug_piece_price", 0),
+                "Lastenaufzug": data_map.get("lift_type_lastenaufzug_piece_price", 0),
             },
         },
         "aufstockung_phase1": {
