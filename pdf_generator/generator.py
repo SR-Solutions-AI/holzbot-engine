@@ -2041,7 +2041,8 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
     
     # Verifică dacă există iconițe (logo din Preisdatenbank sau identity_image din branding, offer_logos)
     a = assets or {}
-    show_logos = a.get("show_offer_logos", True)
+    # Keep behavior aligned with canvas: extra left-strip logos are opt-in.
+    show_logos = bool(a.get("show_offer_logos", False))
     logos_file = a.get("offer_logos_image")
 
     has_identity = False
@@ -2059,14 +2060,12 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
 
     effective_has_logos = bool(has_logos and show_logos)
 
-    # Compact first page when extra logo strip is disabled.
-    # Keep only minimal breathing space for the top-right identity/right-box area.
+    # Keep first text block aligned high (same visual row as logo/right header),
+    # and avoid reserving old space from the removed extra-logo strip.
     if effective_has_logos:
-        story.append(Spacer(1, 36 * mm))
-    elif has_identity:
-        story.append(Spacer(1, 8 * mm))
+        story.append(Spacer(1, 4 * mm))
     else:
-        story.append(Spacer(1, 2 * mm))
+        story.append(Spacer(1, 0 * mm))
     
     story.append(tbl)
     story.append(Spacer(1, 6*mm))
