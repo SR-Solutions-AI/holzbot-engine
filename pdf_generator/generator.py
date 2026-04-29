@@ -2057,19 +2057,16 @@ def _header_block(story, styles, offer_no: str, client: dict, enforcer, assets: 
         else:
             has_logos = IMG_LOGOS.exists()
 
-    # Pentru holzbau / eder / betonbau banda offer_logos nu se desenează pe canvas → nu rezervăm înălțime pentru ea.
-    is_holzbau = tenant_slug and tenant_slug.lower() == "holzbau"
-    is_eder = tenant_slug and tenant_slug.lower() in ("eder", "ederholzbau")
-    is_betonbau = tenant_slug and tenant_slug.lower() == "betonbau"
-    skip_left_offer_logos_strip = bool(is_holzbau or is_eder or is_betonbau)
-    effective_has_logos = bool(has_logos and not skip_left_offer_logos_strip)
+    effective_has_logos = bool(has_logos and show_logos)
 
-    # Fără identity + fără bandă logos în layout: spațiu mic; altfel spațiu pentru dreapta (identity) / logos.
-    if (not has_identity and not effective_has_logos) or skip_left_offer_logos_strip:
-        # După eliminarea benzii offer_logos, textul companiei poate urca (fără banda de ~26 mm „rezervată” în flow).
-        story.append(Spacer(1, 0 if skip_left_offer_logos_strip else 5 * mm))
-    else:
+    # Compact first page when extra logo strip is disabled.
+    # Keep only minimal breathing space for the top-right identity/right-box area.
+    if effective_has_logos:
         story.append(Spacer(1, 36 * mm))
+    elif has_identity:
+        story.append(Spacer(1, 8 * mm))
+    else:
+        story.append(Spacer(1, 2 * mm))
     
     story.append(tbl)
     story.append(Spacer(1, 6*mm))
