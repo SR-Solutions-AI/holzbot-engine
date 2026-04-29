@@ -1204,6 +1204,14 @@ def _asset_path(filename: str | None) -> Path | None:
     p = PROJECT_ROOT / filename
     return p if p.exists() else None
 
+def _is_valid_image_bytes(data: bytes) -> bool:
+    try:
+        with PILImage.open(io.BytesIO(data)) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
 
 def _logo_path_from_assets(assets: dict | None) -> Path | None:
     """
@@ -1218,6 +1226,11 @@ def _logo_path_from_assets(assets: dict | None) -> Path | None:
     if logo_b64 and isinstance(logo_b64, str):
         try:
             data = base64.b64decode(logo_b64)
+            if not _is_valid_image_bytes(data):
+                print("⚠️ [PDF] Ignoring invalid tenant logo_base64 (not an image)", flush=True)
+                data = b""
+            if not data:
+                raise ValueError("decoded logo_base64 is not a valid image")
             ext = ".png"
             mime = (assets.get("logo_mime") or "").lower()
             if "jpeg" in mime or "jpg" in mime:
@@ -1235,6 +1248,8 @@ def _logo_path_from_assets(assets: dict | None) -> Path | None:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
                 ctype = (resp.headers.get("Content-Type") or "").lower()
+            if not _is_valid_image_bytes(data):
+                raise ValueError("downloaded logo_url payload is not a valid image")
             ext = ".png"
             if "image/jpeg" in ctype or logo_url.lower().endswith((".jpg", ".jpeg")):
                 ext = ".jpg"
